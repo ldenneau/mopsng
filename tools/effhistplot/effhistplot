@@ -1,0 +1,139 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Efficiency;
+
+# Start program here.
+my $inst;
+my $instance_name;
+my $category = 'D';
+my $epoch_mjd;
+my $binsize = 0.1;
+my $terminal = '';
+my $xrange = 0.5;
+my $xsize = 1024;
+my $ysize = 768;
+my $title;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'category=s' => \$category,
+    'epoch_mjd=f' => \$epoch_mjd,
+    'binsize=f' => \$binsize,
+    'terminal=s' => \$terminal,
+    'title=s' => \$title,
+    'xrange=f' => \$xrange,
+    'xsize=s' => \$xsize,
+    'ysize=s' => \$ysize,
+    help => \$help,
+) or pod2usage(2);
+
+# Scrub opts.
+$terminal = 'postscript solid' 
+    if ($terminal eq 'postsscript' or $terminal eq 'eps');
+$terminal = 'postscript enhanced color solid' 
+    if ($terminal eq 'postscriptc' or $terminal eq 'epsc');
+
+my $size_str = '';
+if ($terminal eq 'png') {
+    $size_str = "size $xsize, $ysize font arial 12"
+}
+
+my $title_str;
+if ($title) {
+    $title_str = "$title, Night $epoch_mjd ";
+}
+else {
+    $title_str = '';
+}
+
+
+print <<"EOF" if $terminal;
+set fontpath "/usr/lib/X11/fonts/TTF"
+set terminal $terminal $size_str
+EOF
+
+my $buf = '';
+my $numclean = 0;
+my $numunfound = 0;
+my $numnonsynthetic = 0;
+my $x0;
+my $n;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $stuff = modce_retrieve($inst, category => $category, dResids => 1, epoch_mjd => $epoch_mjd);
+my $clean_hist = mopslib_histogram(data => $stuff->{CLEAN}, binsize => $binsize, hmax => 10);
+#my $unfound_hist = mopslib_histogram(data => $stuff->{UNFOUND}, binsize => 0.1);
+my $unfound_hist = mopslib_histogram(data => $stuff->{UNFOUND}, binsize => $clean_hist->{binsize}, hmax => 10);
+my $nonsynthetic_hist = mopslib_histogram(data => $stuff->{NONSYNTHETIC}, binsize => $clean_hist->{binsize}, hmax => 10);
+
+
+# Set up GNUPLOT text for each data list.
+$x0 = $nonsynthetic_hist->{min};
+$n = 0;
+foreach my $x (@{$nonsynthetic_hist->{hist}}) {
+    $buf .= join(" ", $x0 + $n * $nonsynthetic_hist->{binsize}, $x) . "\n";
+    $n++;
+}
+$numnonsynthetic = scalar @{$stuff->{NONSYNTHETIC}};
+$buf .= "e\n";
+
+
+$x0 = $clean_hist->{min};
+$n = 0;
+foreach my $x (@{$clean_hist->{hist}}) {
+    $buf .= join(" ", $x0 + $n * $clean_hist->{binsize}, $x) . "\n";
+    $n++;
+}
+$numclean = scalar @{$stuff->{CLEAN}};
+$buf .= "e\n";
+
+
+$x0 = $unfound_hist->{min};
+$n = 0;
+foreach my $x (@{$unfound_hist->{hist}}) {
+    $buf .= join(" ", $x0 + $n * $unfound_hist->{binsize}, $x) . "\n";
+    $n++;
+}
+$numunfound = scalar @{$stuff->{UNFOUND}};
+$buf .= "e\n";
+
+
+#set terminal postscript enhanced color solid
+    print <<"EOF";
+set title '${title_str}RMS Residual Distribution, Derivations'
+set xrange [0:$xrange]
+set xlabel 'RMS Residual, arcseconds'
+set ylabel 'Number'
+plot \\
+"-" using 1:2 title 'Nonynthetic ($numnonsynthetic objects)' with boxes,\\
+"-" using 1:2 title 'Synthetic ($numclean objects)' with boxes,\\
+"-" using 1:2 title 'Fail Differential Correction ($numunfound objects)' with boxes
+EOF
+
+print $buf;
+
+
+=head1 NAME
+
+effhistplot - Plot historgrams of orbit residuals from a specified
+period of efficiency data
+
+=head1 SYNOPSIS
+
+effhistplot [options]
+
+  category C : select D/A/P/I/R data, default D (derivations)
+  epoch_mjd EPOCH : use only data from night of EPOCH_MJD, otherwise all
+
+=head1 DESCRIPTION
+
+Obtains residual data for specified category and period of efficiency
+data, and plots simultaneous histograms.
+
+=cut

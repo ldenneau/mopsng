@@ -1,0 +1,177 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+
+use File::Slurp;
+use PS::MOPS::MITI;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::History;
+use PS::MOPS::DC::History::Derivation;
+
+
+use subs qw(
+    make_table
+    _dump
+);
+
+my $inst;
+my $instance_name;
+my $nn;
+my $avail_file;
+my $nodb;
+my $debug;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=f' => \$nn,
+    'avail_file=s' => \$avail_file,
+    nodb => \$nodb,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbh = $inst->dbh;
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+
+my $max_link_days = $mops_config->{linkod}->{max_link_days} 
+    or $mops_logger->logdie("Can't get max_link_days");
+my $min_nights = $mops_config->{linkod}->{min_nights} 
+    or $mops_logger->logdie("Can't get min_nights");
+my $gmt_offset_hours = defined($mops_config->{site}->{gmt_offset_hours}) ? 
+    $mops_config->{site}->{gmt_offset_hours} : -10;
+
+$mops_logger->logdie("Can't get min_nights") unless defined($min_nights);
+$mops_logger->logdie("can't read avail file $avail_file") unless -r $avail_file;
+
+# Convert local night number to MJD range.
+my $epoch_mjd = mopslib_nn2mjd($nn, $gmt_offset_hours);
+
+# Read avail file and tabulate all previously available tracks from
+# linkTracklets runs.
+my %avail_lt;
+my $objname;
+my @lines = read_file($avail_file);
+
+foreach $objname (@lines) {
+    chomp $objname;
+    $avail_lt{$objname} = 1;
+}
+
+my $lost = make_table(\%avail_lt);
+$mops_logger->info(sprintf "Found %d lost objects.", scalar @{$lost});
+
+foreach $objname (@{$lost}) {
+    my @tracklet_ids;
+    my $aref = $dbh->selectcol_arrayref(<<"SQL", undef, $objname, $epoch_mjd - $max_link_days, $epoch_mjd + 1);
+select t.tracklet_id
+from tracklets t, ssm s
+where t.ssm_id=s.ssm_id
+and s.object_name=?
+and t.classification <> '$MOPS_EFF_UNFOUND'
+and t.status='$TRACKLET_STATUS_UNATTRIBUTED'
+and t.ext_epoch >= ? and t.ext_epoch < ?
+SQL
+    foreach my $tid (@{$aref}) {
+        push @tracklet_ids, $tid;
+    }
+
+    # Build list of tracklet objects from IDs.
+    my @tracklets;
+    push @tracklets, $_ foreach map { modct_retrieve($inst, trackletId => $_) } @tracklet_ids;
+    my $last_field_id = modct_getLastFieldId($inst, @tracklets);       # last field_id is ID "of record"
+
+    # Check if we already inserted an unfound DO for this linkage.
+    my $ssmId = modcs_objectName2ssmId($inst, $objname);
+    if (!in_history($ssmId, $last_field_id)) {
+        # Add new unfound derived object without orbit.  Still need to
+        my $hist = PS::MOPS::DC::History::Derivation->new(
+            $inst,
+            derivedobjectId => undef,
+            fieldId => $last_field_id,
+            orbitId => undef,
+            orbitCode => $MOPS_EFF_ORBIT_FAIL,
+            classification => $MOPS_EFF_UNFOUND,  # by definition
+            ssmId => modcs_objectName2ssmId($inst, $objname),
+            trackletIds => [
+                map { $_->trackletId } @tracklets,
+            ],
+        );
+        $hist->record unless $nodb;
+    }
+    else {
+        $mops_logger->info(sprintf "Found existing event for lost track: %s %d", $objname, $nn);
+    }
+}
+
+#$inst->dbh->commit;            # commit chgs to DB
+#$inst->popAutocommit;     # restore previous state
+exit;
+
+
+sub in_history {
+    # Return true if the specified SSM object and 
+    # field ID combination is present in the history database.  If so
+    # we will assume that this linkage was already seen by the efficiency
+    # code, so we won't re-enter it.
+    #if (!in_history($ssm_name, $last_field_id)) {
+    my ($ssmId, $last_field_id) = @_;
+    return modch_retrieve($inst, ssmId => $ssmId, fieldId => $last_field_id);
+}
+
+
+sub make_table {
+    # Perform a database query to find linkable objects that may have been lost
+    # for any reason, usually linking velocity cuts.
+    my ($input_href) = @_;
+    my @lost_objects;           # lost objects
+    my @sql_args = ($epoch_mjd - $max_link_days, $epoch_mjd + 1, $min_nights);
+
+    my $dbh = $inst->dbh;
+    my $aref = $dbh->selectcol_arrayref(<<"SQL", undef, @sql_args) or $mops_logger->logdie($dbh->errstr);
+select s.object_name
+from tracklets t, ssm s
+where t.ssm_id=s.ssm_id
+and t.classification <> '$MOPS_EFF_UNFOUND'
+and t.status='U'
+and t.ext_epoch >= ? and t.ext_epoch < ?
+group by t.ssm_id
+having count(distinct floor(t.ext_epoch - 0.5 - $gmt_offset_hours / 24)) >= ?
+SQL
+    foreach my $objname (@{$aref}) {
+        if (!exists(${$input_href}{$objname})) {
+            push @lost_objects, $objname;      # push object name
+        }
+    }
+
+    return \@lost_objects;
+}
+
+
+=head1 DESCRIPTION
+
+Analyze the available track object names from a night's worth of LinkTracklet
+runs and attempt to find "lost" tracks, or tracks that escaped efficiency counting
+due to velocity cuts in the linking breakdown.
+
+=head1 SYNOPSIS
+
+effFindLostTracks [--options] 
+
+  --avail_file FILE1 : available object names from .avail files
+  --nn NN : local night number
+  --nodb : don't insert history objects
+  --help : show man page
+
+=cut

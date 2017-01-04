@@ -1,0 +1,119 @@
+#!/usr/bin/env python
+
+# Given an object name and MJD, compute the true anomaly using OORB and
+# some other stuff.
+
+import sys
+import os
+import slalib
+import math
+import subprocess
+import tempfile
+
+
+# !!OID FORMAT q e i Omega argperi t_p H t_0 INDEX N_PAR MOID COMPCODE
+# 00001 COM 2.55343183265952 0.0777898 10.58785 80.35052 72.14554 56549.5166307897 3.34 56000 1 6 -1 MOPS
+
+orb_in = sys.argv[1]
+if orb_in == '-':
+    lines = sys.stdin.readlines()
+else:
+    lines = file(orb_in).readlines()
+
+header_line = None
+for line in lines:
+    print line,
+    if line[0] == '#' or line[0] == '!':
+        header_line = line
+        continue
+    (id, fmt, q_au, e, i_deg, node_deg, arg_peri_deg, time_peri_mjd, h_v, epoch_mjd, dummy1, dummy2, dummy3, dummy4) = line.split()
+    q_au = float(q_au)
+    e = float(e)
+    i_deg = float(i_deg)
+    node_deg = float(node_deg)
+    arg_peri_deg = float(arg_peri_deg)
+    time_peri_mjd = float(time_peri_mjd)
+    h_v = float(h_v)
+    epoch_mjd = float(epoch_mjd)
+
+    orb_line = line
+# <- for
+
+#tmpdir = tempfile.mkdtemp()
+#os.chdir(tmpdir)
+f = file('orbit.des', 'w')
+if header_line: f.write(header_line)
+f.write(orb_line)
+f.close()
+
+
+test_epoch_mjd = float(sys.argv[2])
+proc = subprocess.Popen(['./oorbephem', 'orbit.des', '--epoch_mjd', str(test_epoch_mjd), '--obscode', 'F51'], stdout=subprocess.PIPE)
+(out, err) = proc.communicate()
+
+
+# Scan output for heliocentric X, Y, Z. (28, 29, 30)
+lines = out.split('\n')
+for line in lines:
+    if not line or line[0] == '#' or lines[0] == '!':
+        continue
+    stuff = line.split()
+    x = float(stuff[28])
+    y = float(stuff[29])
+    z = float(stuff[30])
+
+
+# info
+print 'node     ', node_deg, 'deg'
+print 'incl     ', i_deg, 'deg'
+print 'arg_peri ', arg_peri_deg, 'deg'
+period_d = math.sqrt((q_au / (1 - e)) ** 3) * 365.25
+print 'period   ', period_d, 'd'
+# vector to object position
+a = (x, y, z)
+print 'a', a
+
+# vector to ascending node
+b = (q_au * math.cos(math.radians(node_deg)), q_au * math.sin(math.radians(node_deg)), 0)
+print 'b', b
+
+# vector to periapsis.  start with a pt at (q, 0, 0) and rotate by arg_peri about z-axis
+p1 = (q_au * math.cos(math.radians(arg_peri_deg)), q_au * math.sin(math.radians(arg_peri_deg)), 0)
+print '  p1 (arg_peri)         ', p1
+# rotate by incl about x-axis
+p2 = (p1[0], q_au * math.cos(math.radians(i_deg)), q_au * math.sin(math.radians(i_deg)))
+print '  p2 (arg_peri+incl)    ', p2
+# rotate by node about z-axis
+p = (
+    p2[0] * math.cos(math.radians(node_deg)) - p2[1] * math.sin(math.radians(node_deg)),
+    p2[0] * math.sin(math.radians(node_deg)) + p2[1] * math.cos(math.radians(node_deg)),
+    p2[2]
+)
+print '  p (arg_peri+incl+node)', p
+
+
+# Separation.  True anomaly is angle between periapsis direction (p) and
+# current position (a).
+t = math.degrees(slalib.sla_dsepv(a, p))
+
+
+# Finally, since the separation is computed between 0 and 180 degrees,
+# we have to know if we're per- or post-periapsis and adjust the angle
+# so that it represents 0-360.
+if test_epoch_mjd > time_peri_mjd:
+    # find nearest time of periapsis before our test epoch
+    delta_d = test_epoch_mjd - time_peri_mjd - int((test_epoch_mjd - time_peri_mjd) / period_d) * period_d
+else:
+    # find nearest time of periapsis before our test epoch by finding nearest after and subtracting
+    # one period
+    delta_d = test_epoch_mjd - (time_peri_mjd - (1 + int((time_peri_mjd - test_epoch_mjd) / period_d)) * period_d)
+print 'delta ', delta_d, 'd'
+
+if delta_d > period_d / 2:
+    true_anomaly = 360 - t
+else:
+    true_anomaly = t
+    
+
+print "True anomaly (theta): %.2f" % true_anomaly, 'deg'
+#os.rmdir(tmpdir)

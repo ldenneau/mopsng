@@ -1,0 +1,408 @@
+#!/usr/bin/env perl
+# $Id: insertSyntheticOrbits 3948 2010-03-15 22:18:22Z denneau $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Slurp;
+
+use Astro::Time;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DX;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::Instance;
+
+
+# Globals.
+my $num_inserted = 0;
+
+
+# Options.
+my $inst;
+my $instance_name;      # user-specified MOPS instance name
+my $epoch = 52860.0;    # all Rob's simulations use this epoch
+my $rjneos = 0;         # input is RJ NEOS format
+my $grav = 0;           # input is Tommy Grav's SSM
+my $dump;               # don't insert, just dump
+my $help = 0;
+my $ntwiddle = 0;
+my $known = 0;          # synthetics are from known obj catalog, twiddle name appropriately
+my $quiet = 0;
+my $b62;                # enable auto-designation, specifying template
+
+
+# Astronomical constants; ref http://ssd.jpl.nasa.gov/astro_constants.html
+##my $m_per_AU = 1.49597870691e11;     # m
+##my $GM = 1.32712440018e20;           # m3/s2
+##my $PI = atan2(1, 0) * 2;            # pi
+
+# Auto-designation globals.
+my $auto_prefix = '';
+my $auto_index = 0;
+my $auto_length = 6;
+
+# Various Grav population formats.
+my $format_SL;
+my $format_SH;
+my $format_SG;
+my $format_ST;
+my $format_MOPS;
+my $format_COM;
+
+
+# Start program here.
+GetOptions(
+    'instance=s' => \$instance_name,
+    'epoch=i' => \$epoch,
+    rjneos => \$rjneos,
+    known => \$known,
+    grav => \$grav,
+    'dump' => \$dump,
+    SL => \$format_SL,
+    SG => \$format_SG,
+    SH => \$format_SH,
+    ST => \$format_ST,
+    MOPS => \$format_MOPS,
+    COM => \$format_COM,
+    ntwiddle => \$ntwiddle,
+    'b62=s' => \$b62,
+    quiet => \$quiet,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(2) if not @ARGV;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_logger = $inst->getLogger;
+
+
+sub b62 {
+    my ($n, $len) = @_;
+    my $m = '';
+    my $base = 62;
+    while ($n) {
+        $m .= substr('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ', $n % $base, 1);
+        $n = int($n / $base);
+    };
+
+    return ('0' x ($len - length($m))) . (scalar reverse $m);
+}
+
+
+sub snag_fields {
+    # Given a line from orbit file, extract fields into a hash.  Return 
+    # a reference to the hash.
+    my $line = $_[0];
+    my $fields = {};
+    my ($start, $len);
+    my @vals;
+    my $orbdata;
+
+# Need to provide the following for process_fields().
+#        q => $fields->{q},
+#        e => $fields->{e},
+#        i => $fields->{i},
+#        node => $fields->{O},
+#        argPeri => $fields->{w},
+#        timePeri => $fields->{tau},
+#        epoch => $fields->{epoch},
+#        hV => $fields->{H},
+#        objectName => $fields->{objectName},
+
+    if ($format_MOPS) {
+        @{$fields}{qw(
+            q e i O w tau H epoch objectName
+        )} = split /\s+/, $line;
+    }
+    elsif ($format_COM) {
+        $orbdata = modx_fromORBIT($line);
+        @{$fields}{qw(
+            q e i O w tau H epoch objectName moid1
+        )} = @{$orbdata}{qw(
+            q e i Omega argperi t_p H t_0 OID MOID
+        )};
+    }
+    elsif ($format_SL or $format_SH) {
+        $line =~ s|^\s+||;  # strip leading whitespace
+        @vals = split /\s+/, $line;
+        @{$fields}{qw(
+            q e i O w tau H g epoch objectName
+        )} = @vals;
+
+        # tau and epoch are in JD; convert to MJD.
+        $fields->{tau} -= $MJD2JD_OFFSET;
+        $fields->{epoch} -= $MJD2JD_OFFSET;
+        return $fields;
+    }
+    else {
+        if ($rjneos) {
+            # Cols are
+            # 0-4   Asteroid #
+            # 7-29  Designation/name
+            # 30+   Orbital elements a (AU), e, i (deg), Om (deg), w (deg), M (deg), whitespace-separated
+            my $dummy = substr($line, 0, 7, '');        # toss leading asteroid number (for now)
+            my $objectName = substr($line, 0, 23, '');  # extract name/designation
+            $objectName =~ s/\s+//g;                    # clean up
+
+            $line =~ s|^\s+||;  # strip leading whitespace from rest of line
+            @vals = split /\s+/, $line;
+            @{$fields}{qw(
+                a e i O w M epoch H objectName
+            )} = (@vals[0..7], $objectName);
+    ##        $fields->{epoch} = $epoch; # get from each line
+        }
+        elsif ($format_SG or $format_ST) {
+            $line =~ s|^\s+||;  # strip leading whitespace
+            @vals = split /\s+/, $line;
+            @{$fields}{qw(
+                a e i O w M H g epoch objectName
+            )} = @vals;
+
+            # Epoch is in JD; convert to MJD.
+            $fields->{epoch} -= $MJD2JD_OFFSET;
+        }
+        elsif ($grav) {
+            $line =~ s|^\s+||;  # strip leading whitespace
+            @vals = split /\s+/, $line;
+            @{$fields}{qw(
+                objectName a e i O w M H MOID POpik epoch mdd
+            )} = @vals;
+
+            # Tommy's epochs are a calendar date; need to convert to JD.
+            my ($y, $m, $d);
+            if ($fields->{epoch} =~ /(\d\d\d\d)(\d\d)(\d\d)/) {
+                ($y, $m, $d) = ($1, $2, $3);
+                $fields->{epoch} = cal2mjd(int($d), $m, $y, $d - int($d));
+            }
+            else {
+                warn "can't parse date from object: " . $fields->{objectName};
+            }
+        }
+        else  {
+            # This is the old Jedicke format.  Don't support this any longer.
+            $line =~ s|^\s+||;  # strip leading whitespace
+            @vals = split /\s+/, $line, 10;
+            @{$fields}{qw(
+                objectName a e i O w M H MOID POpik
+            )} = @vals;
+            $fields->{epoch} = $epoch;
+        }
+
+        # Sanity check stuff.  If there are any bogus elements return undef.
+        if ($fields->{a} <= 0) {
+            warn "Bogus semimajor axis (a) for " . $fields->{objectName};
+            return undef;
+        }
+
+        # Do some conversions.  RJ provides a, not q; and M, not tau.
+        my $a_au = $fields->{a};   # semi-major axis in AU
+        my $a_m = $a_au * $METERS_PER_AU;
+        my $n = sqrt($GM / ($a_m * $a_m * $a_m));  # mean motion, rad/sec
+        $n *= 180.0 / $PI * $SECONDS_PER_DAY;                 # convert rad/sec to deg/day
+
+        if ($ntwiddle) {
+    #        print $fields->{objectName}, " n1 = ", $n, " deg/day\n";
+            # Hack to re-calculate n using different method:
+            # use n = 2pi/T, where T=sqrt(a^3), T years, A AU, n rad/year
+            my $T_y = sqrt($a_au * $a_au * $a_au);
+            $n = 360 / $T_y;    # deg/year
+            $n /= 365.25;           # / 365days/year
+    #        print $fields->{objectName}, "n2 = ", $n, " deg/day\n";
+        }
+
+        if ($a_au == 0) {
+            $mops_logger->warn("zero semi-major axis for objectName $fields->{objectName}");
+            return;
+        }
+
+        $fields->{q} = $a_au * (1 - $fields->{e});   # convert semi-major axis to perihelion distance
+        if ($fields->{M} > 180) {
+            $fields->{tau} = $fields->{epoch} - ($fields->{M} - 360) / $n;  # tau = epoch - M / n
+        }
+        else {
+            $fields->{tau} = $fields->{epoch} - $fields->{M} / $n;  # tau = epoch - M / n
+        }
+    }   # else
+    return $fields;
+}
+
+
+sub dump_fields {
+    my $fields = $_[0];
+
+    # See if we have to rewrite the objectName using auto-designator.
+    if ($b62) {
+        $fields->{objectName} = $auto_prefix . b62($auto_index, $auto_length);
+        $auto_index++;
+    }
+
+    # Dump.
+    printf join "\t", (
+        $fields->{q},
+        $fields->{e},
+        $fields->{i},
+        $fields->{O},
+        $fields->{w},
+        $fields->{tau},
+        $fields->{epoch},
+        $fields->{H},
+        $fields->{objectName},
+    );
+    print "\n";
+}
+
+
+sub process_orbit {
+    my $fields = $_[0];
+
+    # See if we have to rewrite the objectName using auto-designator.
+    if ($b62) {
+        $fields->{objectName} = $auto_prefix . b62($auto_index, $auto_length);
+        $auto_index++;
+    }
+
+    if ($known) {
+        # The given object name is a numbered or multiopp asteroid designation
+        # like "(18374)" or "1979OK9".
+        my $name = $fields->{objectName};
+        $name =~ s/[\s-]//g;        # remove dashes
+        if ($name =~ /^\((\d+)\)$/) {
+            if ($1 == '1' or $1 == '2' or $1 == '3') {  
+                # Skip Ceres, Pallas, Vesta; they're perturbers.
+                print STDERR "Skipping perturber ($1).\n";
+                return;
+            }
+
+            $fields->{objectName} = "SK$1";
+        }
+        elsif ($name =~ /^(\d+\w+)$/) {
+            $fields->{objectName} = "SK$1";
+        }
+        else {
+            print STDERR "Skipping object $name.\n";
+            return;
+        }
+    }
+
+    # Insert into DB.
+    my $orb;
+    my $id;
+
+    $id = modcs_insertByValue(
+        $inst,
+        q => $fields->{q},
+        e => $fields->{e},
+        i => $fields->{i},
+        node => $fields->{O},
+        argPeri => $fields->{w},
+        timePeri => $fields->{tau},
+        epoch => $fields->{epoch},
+        hV => $fields->{H},
+        g => $fields->{g},
+        objectName => $fields->{objectName},
+        moid_1 => $fields->{moid1},
+    );
+    if ($id) {
+        unless ($quiet) {
+            ##print STDERR "created new orbit ID $id for orbit ", $fields->{objectName}, "\n";
+            if ($num_inserted % 100 == 0) {
+                print STDERR "\rInserted $num_inserted new orbits...";
+            }
+        }
+        $num_inserted++;
+    }
+    else {
+        warn "could not insert orbit for ", $fields->{objectName}, "\n";
+    }
+}
+
+my @files = @ARGV;	# copy list of filenames
+my $orbfh;    # orbit file handle
+
+# Handle auto-designation stuff.
+if ($b62 && $b62 =~ /^([^0]*)(0+)$/) {
+    $auto_prefix = $1;
+    $auto_length = length($2);
+}
+
+$inst->pushAutocommit(0) unless $dump; # disable DC autocommit
+print STDERR "Using epoch $epoch.\n";
+
+foreach my $filename (@files) {
+    print STDERR "Reading $filename.\n";
+    open $orbfh, $filename or warn "can't open $filename";
+    my @lines = <$orbfh>;
+    
+    # Check to see if the file is empty...
+    if(scalar(@lines) == 0) {
+	# Yup: file is empty: skip it.
+	print STDERR "$filename is empty. Skipped.\n";
+	next;
+    }
+    
+    if ($lines[0] =~ /^!!OID/) {
+        # Looks like DES cometary format.
+        $format_COM = 1;
+        shift @lines;   # discard comment line
+    }
+
+    #chomp @lines;  # lines end in \r\n, alas
+    close $orbfh;
+
+    my $line;       # complete line
+    my $fhash;
+
+    foreach $line (@lines) {
+        next if $line =~ /^(#|!)/;      # ditch comment line
+
+        $line =~ s/[\r\n]+$//;      # toss line terminator
+        $fhash = snag_fields($line);
+
+        if ($fhash) {
+            if ($dump) {
+                dump_fields($fhash);
+            }
+            else {
+                process_orbit($fhash);
+            }
+        }
+    }
+    print STDERR "\rInserted $num_inserted new orbits...";
+    print STDERR "\nFile ", $filename, " processed.\n";
+    print STDERR "Committing...";
+    $inst->dbh->commit unless $dump;
+    print STDERR "done.\n";
+}
+
+$inst->dbh->commit unless $dump;
+
+=head1 NAME
+
+insertSynthticOrbits - Program to insert RJ's synthetic orbits into PSMOPS
+
+=head1 SYNOPSIS
+
+insertSyntheticOrbits [options] file1 file2 ...
+
+  --epoch EPOCH : override default epoch of 52860.0 with EPOCH (MJD)
+  --rjneos : data is in RJ's NEOS format
+  --grav : data is Tommy Grav's SSM
+  --known : synthetic catalog contains known object names, map appropriately
+  --b62 TEMPLATE : generate base-62 names using template (e.g. "ST00000")
+  --MOPS : orbits are in MOPS MITI orbit format (q e i node argPeri timePeri hV epoch objectName)
+  --COM : orbits are in Milani DES COMetary format
+  --dump : don't insert into PSMOPS, just dump final orbital elements
+  --help : show usage
+  file1 file2 : input files
+
+=head1 DESCRIPTION
+
+Coming.
+
+=head1 NOTES
+
+Default epoch is 52860.0.  If --grav is specified, epoch is read from penultimate
+field in object description.
+
+=cut

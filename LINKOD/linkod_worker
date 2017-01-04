@@ -1,0 +1,216 @@
+#!/usr/bin/env perl
+# $Id$
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+
+
+# Forward sub declarations.
+use subs qw(
+    run
+);
+
+
+my $inst;
+my $instance_name;
+my $target_field_id;
+my $job_label;
+my $link_opts;
+my $minv_degperday;
+my $maxv_degperday;
+my $done_status;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'target_field_id=n' => \$target_field_id,
+    'job_label=s' => \$job_label,
+    'link_opts=s' => \$link_opts,
+    'minv_degperday=f' => \$minv_degperday,
+    'maxv_degperday=f' => \$maxv_degperday,
+    'done_status=s' => \$done_status,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+$mops_logger->logdie("--target_field_id not specified") unless $target_field_id;
+$mops_logger->logdie("--job_label not specified") unless $job_label;
+$mops_logger->logdie("--link_opts not specified") unless $link_opts;
+$mops_logger->logdie("--minv_degperday not specified") unless defined($minv_degperday); # might be zero
+$mops_logger->logdie("--maxv_degperday not specified") unless $maxv_degperday;
+
+
+# Look for hakey to skip linking.
+if ($mops_config->{debug}->{disable_linking}) {
+    $mops_logger->info("linking job $job_label: linking disabled; skipping");
+    exit 0;     # 1 => nothing to do
+}
+
+
+# Configuration.
+my $linkod_config = $mops_config->{linkod};
+my $gmt_offset_hours = defined($mops_config->{site}->{gmt_offset_hours}) ?
+    $mops_config->{site}->{gmt_offset_hours} : -10;                 # -10 default (Mauna Kea)
+
+my $disable_orbit_determination = $mops_config->{debug}->{disable_orbit_determination} || '';
+
+my $iod_threshold_arcsec = $linkod_config->{iod_threshold_arcsec}
+    or die "can't get iod_threshold_arcsec";
+
+my $diffcor_threshold_arcsec = $linkod_config->{diffcor_threshold_arcsec}
+    or die "can't get diffcor_threshold_arcsec";
+
+my $min_nights = $linkod_config->{min_nights} || 3;
+
+my $end_t_range_days = defined($linkod_config->{end_t_range_days}) ? $linkod_config->{end_t_range_days} : 0.8;
+my $plate_width_days = defined($linkod_config->{plate_width_days}) ? $linkod_config->{plate_width_days} : 0.0001;
+
+my $fallback_iod = $linkod_config->{fallback_iod};
+my $fallback_iod_str = $fallback_iod ? "--fallback_iod $fallback_iod" : '';
+
+# IOD and diffcor programs.  Allow the linkod section to override the global.
+my $iod_program = $linkod_config->{iod_program} 
+    || $mops_config->{orbit_determination}->{iod_program}
+    || die "can't get iod_program";
+
+my $diffcor_program = $linkod_config->{diffcor_program} 
+    || $mops_config->{orbit_determination}->{diffcor_program}
+    || die "can't get diffcor_program";
+
+eval {
+    my $target_field = modcf_retrieve($inst, fieldId => $target_field_id);
+    my $nn = mopslib_mjd2nn($target_field->epoch, $mops_config->{site}->{gmt_offset_hours});
+
+    # Generate the tracklet retrieval section.
+    my $get_tracklets_section = <<"EOF";
+selectDetracklets --format=DES --minv_degperday=$minv_degperday --maxv_degperday=$maxv_degperday --target_field_id=$target_field_id > $job_label.tracklets
+EOF
+
+    my $fake_od_str = '';
+    $fake_od_str = <<"FAKE" if $disable_orbit_determination eq 'sum2orb';
+sum2orb --trackids < $job_label.trackids > $job_label.orbits
+FAKE
+    
+    my $od_disabled_str = <<"OD_DISABLED_TMPL";
+# these go after touch
+# Orbit determination disabled by debug configuration
+touch $job_label.tracks $job_label.iods $job_label.orbits
+$fake_od_str
+OD_DISABLED_TMPL
+
+    my $od_enabled_str = <<"OD_TMPL";
+# Generate orbits.
+trackids2iodreq --tracklets_file=$job_label.tracklets --trackids_file=$job_label.trackids --out_fileroot=$job_label
+$iod_program $job_label > $job_label.iods 
+timing --subsys=LINKOD --subsubsys=IOD --nn=$nn --t0=\$T0
+
+$diffcor_program --covariance $fallback_iod_str --threshold_arcseconds $diffcor_threshold_arcsec $job_label.iods $job_label.tracks $job_label.orbits $job_label.resids > /dev/null 2>&1
+timing --subsys=LINKOD --subsubsys=DIFFCOR --nn=$nn --t0=\$T0
+OD_TMPL
+
+    my $od_str = $disable_orbit_determination ? $od_disabled_str : $od_enabled_str;
+
+    my $min_sup = $min_nights;
+    my $min_obs = $min_sup * 2;     # 2 obs/night
+
+    # Write out a shell script to execute everything.
+    my $fh = new FileHandle ">$job_label.sh";
+    print $fh <<"TMPL";
+#!/bin/sh
+
+# Exit script on any error.
+set -e
+
+# Set up timing info.
+env
+T0=`timing --get`
+
+# Get tracklets.
+$get_tracklets_section
+timing --subsys=LINKOD --subsubsys=FETCH --nn=$nn --t0=\$T0
+
+# Link them.
+# disabled for LT 3.0
+#    lin_thresh \$LIN_THRESH quad_thresh \$QUAD_THRESH \\
+
+# Hack until LT fixedt to write empty sum file when no results.
+touch $job_label.trackids
+
+linkTracklets \\
+    fileout false \\
+    desfile $job_label.tracklets \\
+    trackidsfile $job_label.trackids \\
+    min_obs $min_obs \\
+    min_sup $min_sup \\
+    $link_opts \\
+    end_t_range $end_t_range_days \\
+    plate_width $plate_width_days minv $minv_degperday maxv $maxv_degperday | tee $job_label.lt
+timing --subsys=LINKOD --subsubsys=LINK --nn=$nn --t0=\$T0
+trackids2des --tracklets_file=$job_label.tracklets --trackids_file=$job_label.trackids > $job_label.tracks
+
+# Create JPL diffcor input from track IDs and *.in.tracklet.  For now this is a MITI file,
+# but eventually we should be able to omit this step and just read the IOD manifest.
+
+# Orbit determination.
+echo 'Performing orbit determination'
+$od_str
+
+# Efficiency tabulation and prep for insert.
+echo 'Computing linking efficiency'
+effLinkTracklets --nn $nn --tracklets $job_label.tracklets --tracks $job_label.tracks --iods $job_label.iods --orbits $job_label.orbits > $job_label.mif0
+timing --subsys=LINKOD --subsubsys=EFF --nn=$nn --t0=\$T0
+
+# Reject orbits if tracklet postfit resids are out of range.
+analyze_tracklet_resids $job_label.mif0 > $job_label.mif
+timing --subsys=LINKOD --subsubsys=RESIDS --nn=$nn --t0=\$T0
+TMPL
+
+    # Execute the job.
+    system('/bin/sh', "$job_label.sh") == 0 or $mops_logger->logdie("job $job_label failed: $?");
+
+# Cluster workers should not write anything to the DB, so don't do this any longer.
+#    # Mark the field as done.
+#    $target_field->status($done_status);
+};
+
+$mops_logger->logdie($@) if $@;
+exit 0;
+
+=pod
+
+=head1 NAME
+
+linkod_worker - linking and orbit determination worker process
+
+=head1 SYNOPSIS
+
+linkod_worker [--end_mjd MJD] [--help]
+
+  --target_field_id : target field ID for linking pass
+  --job_label NAME : file prefix for job runtime files
+  --link_opts 'OPTIONS' : command-line opts for LinkTracklets
+  --minv_degperday MINVAL : link only tracklets faster than MINVAL degrees/day
+  --maxv_degperday MAXVAL : link only tracklets slower than MINVAL degrees/day
+  --done_status CODE : mark completed field jobs with field status CODE
+  --help : show man page
+
+=head1 DESCRIPTION
+
+Given a target field ID, find all tracks in a MOPS database that produce
+a linkage terminating in the field.  Then perform orbit determination on
+all linkages.  Return a .tracks file containing all linkages that pass orbit
+determination and all synthetic unfound linkages.
+
+=cut

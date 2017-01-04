@@ -1,0 +1,811 @@
+#!/usr/bin/env perl
+
+# $Id: mopper 5410 2013-10-08 19:10:38Z schastel $
+# Separate support code stub for testing.
+
+=head1 NAME
+
+mopper - Execute MOPS pipline
+ 
+=head1 SYNOPSIS
+
+mopper [options] [INSTANCE_NAME]
+
+  INSTANCE_NAME : name of simulation to run
+  --mops_home DIR : use DIR as MOPS home directory; otherwise $ENV{MOPS_HOME} or /usr/local/MOPS
+  --bg : run in background
+  --once : run one night then stop
+  --nn NIGHT_NUMBER : run specified night only
+  --tjd TJD : run specified TJD only
+  --no_ingest : skip ingest, just run pipeline
+  --no_synth : skip SYNTH stage
+  --no_env : don't set environment
+  --set_env : don't run; just setup env and quit
+  --no_run : don't record fields processed in runs table. If this parameter is 
+             not specified then fields processed will automatically be recorded
+             in the runs table.
+  --email ADDR : email notifications to ADDR
+  --stage STAGE : execute mopper up to the specified stage. Stages in order are:
+                  SYNTH, TRACKLET, POSTTRACKLET, ATTRIB, LINKOD, EON.
+                  If not specified then defaults to EON.
+  --quiet : less output
+  --help : show usage
+
+=head1 DESCRIPTION
+
+Runs a MOPS instance unattended by establishing MOPS environment then
+calling SYNTH, TRACKLET, ATTRIB, LINKOD, and EON repeatedly until there
+is no more data to process.
+
+It is expected that jobs invoked by MOPPER conform to simple exit
+code conventions, as follows:
+
+  0 - successfully processed some data
+  1 - no data to process
+  2 - other MOPS failure 
+  99 - internal error in job
+
+MOPPER can be terminated in two ways via a signal.  For graceful termination,
+send a SIGUSR1, which will set an internal flag to terminate MOPPER following
+the completion of the current job.  Send SIGINT to attempt to shutdown MOPPER
+immediately (currently unsupported).  The consistency of a simulation is not
+guaranteed (yet) if it is terminated via SIGKILL.
+
+=head1 INVOCATION RULES
+
+1. Fetch the earliest night for which there is unfinished work.  If so,
+execute the pipeline for that night.
+
+2. If there is a datastore, then execute INGEST, then go to 1.
+
+3. If there is no further work to do, stop.
+
+=head1 ENVIRONMENT
+
+MOPS execution requires the following environment variables to
+be set up, so MOPPER sets them to appropriate values.
+
+        MOPS_DBINSTANCE 
+        MOPS_HOME (/usr/local/MOPS)
+        PERL5LIB ($MOPS_HOME/lib/perl5)
+        PATH ($MOPS_HOME/bin)
+        CAET_DATA ($MOPS_HOME/data/caet_data)
+        OORB_DATA ($MOPS_HOME/data/oorb)
+        ORBFIT_DATA ($MOPS_HOME/data/orbfit)
+        LD_LIBRARY_PATH ($MOPS_HOME/lib)
+
+The PATH, CAET_DATA and LD_LIBRARY_PATH environment variables
+are manipulated in PATH-fashion:  they new value is prepended to the
+old one, separated by a colon ':'.  If the new value is found in the
+old value, the environment variable is not modified.
+
+=cut
+
+use strict;
+use warnings;
+
+use Proc::Daemon;
+use Pod::Usage;
+use Sys::Hostname;
+use Getopt::Long;
+use Fcntl qw(:flock);
+use Data::Dumper;
+use Params::Validate;
+use POSIX qw(strftime);      # for strftime, sigh
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(mopslib_nn2mjd mopslib_mjd2ocnum);
+use PS::MOPS::DC::Field;
+use PS::MOPS::Admin qw(get_run_id list_processed_chunks);
+
+use subs qw(
+    setup_env
+    run_stage
+    write_pid
+    catch_SIGUSR1
+    clean_up_and_exit
+    _setenv
+    _addenv
+);
+
+
+# Globals.
+my $PID_FILENAME;
+my $inst;
+my $mops_logger;
+my $mops_config;
+my $have_datastore;
+my @envkeys = qw(
+    MOPS_HOME
+    MOPS_DBINSTANCE 
+    PERL5LIB
+    PYTHONPATH
+    PATH 
+    CAET_DATA 
+    OORB_DATA 
+    ORBFIT_DATA 
+    LD_LIBRARY_PATH 
+);
+
+
+# Job exit codes:
+#  0 - successfully processed some data
+#  1 - MOPS failure 
+#  2 - exit via stop request
+my $EXIT_SUCCESS = 0;
+my $EXIT_ERROR = 1;
+my $EXIT_STOP = 2;
+my $exit_code = $EXIT_SUCCESS;
+
+
+# Options.
+my $instance_name;
+my $mops_home;
+my $bg;
+my $no_update_config;
+my $no_ingest;
+my $no_synth;
+my $no_env;
+my $set_env;
+my $no_run;
+my $stage;
+
+my $run_nn;
+my $run_tjd;
+
+my $status;
+my $start;
+my $stop;
+my $abort;
+my $email;
+my $admin_email;
+my $once;
+my $reply_to = 'mopsczar@ifa.hawaii.edu';   # XXX config it later
+
+my $quiet;
+my $help;
+GetOptions(
+    instance => \$instance_name,    # specify instance, or use $ENV{MOPS_DBINSTANCE}
+    'mops_home=s' => \$mops_home,   # specify MOPS_HOME, otherwise $ENV{MOPS_HOME} || /usr/local/MOPS
+    bg => \$bg,                 	# run in background as daemon
+    no_update_config => \$no_update_config,   # DON'T auto-update config
+    no_ingest => \$no_ingest,       # skip initial ingest phase
+    no_synth => \$no_synth,         # skip synth stage
+    no_env => \$no_env,             # DON'T set environment
+    set_env => \$set_env,           # DON'T run, just setup env and quit (debugging)
+    no_run => \$no_run,             # DON'T record this mopper run in runs table
+    'stage=s' => \$stage,		    # execute up to specified stage
+
+    'nn=i' => \$run_nn,             # run only specified night
+    'tjd=i' => \$run_tjd,           # run only specified TJD
+
+    # Control options.
+    status => \$status,
+    start => \$start,
+    stop => \$stop,
+    abort => \$abort,
+    once => \$once,
+
+    # Notification options.
+    'email=s' => \$email,
+    'admin_email=s' => \$admin_email,
+    quiet => \$quiet,
+
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+$instance_name ||= shift || $ENV{MOPS_DBINSTANCE};
+pod2usage(3) unless $instance_name;
+pod2usage(-message => '--abort is not supported yet.') if $abort;
+
+# If a night number is specified then automatically define once so that Mopper
+# will only process the night specified and no additional nights.
+if (defined($run_nn)) {
+	$once = 1;
+}
+
+# If the stage option is used verify that a valid stage was specified.
+my $stagenum = 1;
+my $SYNTH = $stagenum++;
+my $TRACKLET = $stagenum++;
+my $POSTTRACKLET = $stagenum++;
+my $ATTRIB = $stagenum++;
+my $LINKOD = $stagenum++;
+my $EON = $stagenum++;
+if (defined($stage)) {
+	$stage = uc($stage);
+	$once = 1;
+	
+	if ($stage eq "SYNTH") {
+		$stage = $SYNTH;
+	} 
+	elsif ($stage eq "TRACKLET"){
+		$stage = $TRACKLET;
+	}
+	elsif ($stage eq "POSTTRACKLET"){
+		$stage = $POSTTRACKLET;
+	}
+	elsif ($stage eq "ATTRIB"){
+		$stage = $ATTRIB;
+	}
+	elsif ($stage eq "LINKOD"){
+		$stage = $LINKOD;
+	}
+	elsif ($stage eq "EON"){
+		$stage = $EON;
+	}
+	else {
+		pod2usage("\n\n$stage is not a recognized stage.
+Specify SYNTH, TRACKLET, POSTTRACKLET, ATTRIB, LINKOD, or EON for --stage\n");
+	}
+}
+else {
+	$stage = $EON; #Set stage to EON if not explicitly specified.
+}
+
+# Set up our stage data.
+my %stage_config = (
+    INGEST => {
+        CMD => 'ingest',
+    },
+    SYNTH => {
+        SKIP_STATUS => { 
+            $FIELD_STATUS_TRACKLETS_DONE => 1,
+            $FIELD_STATUS_POSTTRACKLET  => 1,
+            $FIELD_STATUS_ATTRIBUTIONS => 1,
+            $FIELD_STATUS_LINK1 => 1,
+            $FIELD_STATUS_SKIP => 1,
+        },
+        CMD => 'synth',
+        NN => 1,
+        RUN => 1,
+    },
+    TRACKLET => {
+	PRENOTIFY => 1,
+        SKIP_STATUS => { 
+            $FIELD_STATUS_TRACKLETS_DONE => 1,
+            $FIELD_STATUS_POSTTRACKLET  => 1,
+            $FIELD_STATUS_ATTRIBUTIONS => 1,
+            $FIELD_STATUS_LINK1 => 1,
+            $FIELD_STATUS_SKIP => 1,
+        },
+        CMD => ($no_synth?'tracklet --no_synth':'tracklet'),
+        NN => 1,
+        RUN => 1,
+    },
+    POSTTRACKLET => {
+        NOTIFY => 1,        # send email notification
+        SKIP_STATUS => { 
+            $FIELD_STATUS_POSTTRACKLET  => 1,
+            $FIELD_STATUS_ATTRIBUTIONS => 1,
+            $FIELD_STATUS_LINK1 => 1,
+            $FIELD_STATUS_SKIP => 1,
+        },
+        CMD => 'posttracklet',
+        NN => 1,
+        RUN => 1,
+    },
+    ATTRIB => {
+        SKIP_STATUS => { 
+            $FIELD_STATUS_ATTRIBUTIONS => 1,
+            $FIELD_STATUS_LINK1 => 1,
+            $FIELD_STATUS_SKIP => 1,
+        },
+        CMD => 'panda --attrib',
+        NN => 1,
+        RUN => 1,
+    },
+    LINKOD => {
+        SKIP_STATUS => { 
+            $FIELD_STATUS_SKIP => 1,
+        },
+        CMD => 'linkod',
+        NN => 1,
+        RUN => 1,
+    },
+    EON => {
+        SKIP_STATUS => { 
+            $FIELD_STATUS_SKIP => 1,
+        },
+        CMD => 'eon',
+        NN => 1,
+    },
+);
+
+
+# Set up MOPS environment.
+unless ($no_env) {
+    setup_env($instance_name);
+}
+
+
+# Interrogate whether there's an already running mopper.
+unshift @INC, "$ENV{MOPS_HOME}/lib/perl5"; # yech
+require PS::MOPS::DC::Instance;     # now load, after %ENV set up
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+$mops_logger = $inst->getLogger;
+$PID_FILENAME = sprintf "%s/run/mopper.pid", $inst->getEnvironment('VARDIR');
+
+
+if ($status) {  
+    # Just report where we left off, or what there is to do.
+    my $field = $inst->getOldestUnfinishedField();
+    if ($field) {
+        printf STDERR "%s: oldest unprocessed field ID: %d(%s) NN/OCNUM %d/%d \n", 
+            $inst->dbname, $field->fieldId, $field->status, $field->nn, $field->ocnum;
+    }
+    else {
+        print STDERR "%s: no fields to process.\n", $inst->dbname;
+    }
+    exit;
+}
+
+
+# Query the lock file to find out if mopper is already running for this instance.
+if (get_lock($inst)) {
+    # Fetch PID.
+    my $pid_fh = new FileHandle $PID_FILENAME or 
+        $mops_logger->logdie("Can't find PID file for " . $inst->dbname . ".\n");
+    my $pid = <$pid_fh>;
+    chomp $pid;
+    $mops_logger->logdie("Bogus PID in PID file $PID_FILENAME.") unless $pid =~ /^\d+$/;
+
+    print STDERR "Found a running mopper for " . $inst->dbname . " with PID $pid.\n";
+
+
+    # Handle a stop/abort request.
+    if ($stop) {
+        print STDERR "Sending stop notification (SIGUSR1) to running mopper...";
+#        my $num = kill(-10, $pid);        # -10 = -USR1 => entire process group
+        my $num = kill('USR1', $pid);        # -10 = -USR1 => entire process group
+        print STDERR "sent.\n";
+        if ($num != 1) {
+            print STDERR "Seems to be dead.\n";
+        }
+    }
+    exit;
+}
+
+
+# Dump the environment variables.
+unless ($quiet) {
+    print STDERR "MOPS environment set up.\n";
+    print STDERR "  $_=$ENV{$_}\n" foreach @envkeys;
+}
+
+
+# Update the config from the master config if it's changed.
+unless ($no_update_config) {
+    system("editConfig --install") == 0 or die "can't update config";
+}
+
+
+# Now re-load instance to get updated config.
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+$mops_logger = $inst->getLogger();
+$mops_config = $inst->getConfig();
+
+# Processing notifications (for MOPS czars).
+$email ||= $mops_config->{main}->{notify};
+$email = '' if (!$email or $email =~ /^none$/i);
+
+# Admin notifications (mopper done, error, etc.)
+$admin_email = defined $mops_config->{main}->{admin} ? $mops_config->{main}->{admin} : "mopsadmin\@ifa.hawaii.edu";
+
+# See if we have a datastore.  If no, bypass all ingest processing.
+$have_datastore = ($mops_config->{ingest}->{root_url} or $mops_config->{ingest}->{index_url});
+$have_datastore = undef if $no_ingest;      # don't ingest if asked
+
+
+if ($set_env) {
+    # Debugging.
+#    print Dumper($inst);
+    exit;
+}
+
+
+# Daemon setup.
+print STDERR "Ready to run simulation '$instance_name'.  Have a great day.\n";
+Proc::Daemon::Init if $bg;          # daemonize if specified
+$SIG{USR1} = \&catch_SIGUSR1;       # set up SIGUSR1 handler
+write_pid($inst);
+
+
+# Main processing loop.  See POD above for details.
+my $quit;               # asked to quit via SIGUSR1
+my $field;              # oldest field with work to do
+my $nn;
+
+# First see if there's any work to do.
+eval {
+    $field = $inst->getOldestUnfinishedField($run_nn);
+    if (!$field) {
+        # We didn't find anything to do, so try INGEST.
+        if ($have_datastore) {
+            run_stage('INGEST');
+            $field = $inst->getOldestUnfinishedField($run_nn);
+        }
+    }
+    my $run_id = undef;
+    while ($field) {
+        # Run the pipeline. 
+        $nn = $field->nn;
+        
+        # Generate a run_id for this mopper run.
+        $run_id = get_run_id($inst) unless $no_run;
+
+        # We check the status of the last processed field, as reported by
+        # getOldestUnfinishedField().  This allows us to continue where we left
+        # off -- the first time through the while() loop, we skip everything
+        # until we reach the stage after $last_status.
+        my $last_status = $field->status; 
+
+        if (!$no_synth) {
+          run_stage('SYNTH', $nn, $last_status, $run_id) if ($stage >= $SYNTH);
+	    } else {
+          print STDERR "Skipping SYNTH stage\n";
+        }
+        run_stage('TRACKLET', $nn, $last_status, $run_id) if ($stage >= $TRACKLET);
+        run_stage('POSTTRACKLET', $nn, $last_status, $run_id) if ($stage >= $POSTTRACKLET);
+        run_stage('ATTRIB', $nn, $last_status, $run_id) if ($stage >= $ATTRIB);
+        run_stage('LINKOD', $nn, $last_status, $run_id) if ($stage >= $LINKOD);
+        run_stage('EON', $nn, $run_id) if ($stage >= $EON);
+
+        last if $once;
+        if ($have_datastore) {
+            run_stage('INGEST');
+        }
+        $field = $inst->getOldestUnfinishedField($run_nn);
+    }
+};
+
+if ($@) {
+    notify_error($admin_email, $inst, $@);
+    $mops_logger->logwarn($@);
+    $exit_code = $EXIT_ERROR;
+}
+else {
+    notify_terminated($admin_email, $inst, @ARGV ? (join ' ', 'mopper', @ARGV) : 'Processing completed');
+    $mops_logger->info('done');
+}
+
+clean_up_and_exit($exit_code);
+
+
+sub clean_up_and_exit {
+    my ($rv) = @_;
+    unlink $PID_FILENAME or $mops_logger->warn("Could not unlink pid file $PID_FILENAME.");
+    exit($rv or 0);
+}
+
+
+sub catch_SIGUSR1 {
+    # Just set the quit flag when SIGUSR1 received.
+    $quit = 1;
+}
+
+
+sub run_stage {
+    # Run program in job_str.  Return the job's exit value, where 0 usually means
+    # something was processed successfully.  We now are always executing run_stage()
+    # under eval{}, so just die if there's a problem, and it will be handled upstream.
+    my ($stage, $nn, $last_status, $run_id) = @_;
+    my $rv;
+    my $exit_code;
+
+    
+    # Decide, based on $last_status, whether we need to run this stage.
+    # $last_status allows us to complete interrupted lunations where we left
+    # off mid-lunation.  If our stage does not specify a START_STATUS, or
+    # $last_status was not specified, we fall out of the if{} block and simply
+    # continue.
+    my $skip_map = $stage_config{$stage}->{SKIP_STATUS};
+    if ($skip_map and $skip_map->{$last_status}) {
+        $mops_logger->info("Skipping $stage $nn.");
+        return $EXIT_SUCCESS;
+    }
+
+    if($stage_config{$stage}->{PRENOTIFY}) {
+	notify_stage($stage, $email, $inst, $nn, 1);
+    }
+
+    # Build our command string.
+    my $job_str = $stage_config{$stage}->{CMD}
+        or $mops_logger->logdie("can't get job command for $stage");
+
+    if ($stage_config{$stage}->{NN}) {
+        $mops_logger->logdie("--nn in job command but nn is undef") unless $nn;
+        $job_str .= " --nn $nn";
+    }
+    
+    # --run parameter is optional. Add it if it is specified.
+    if ($stage_config{$stage}->{RUN}) {
+        $job_str .= " --run $run_id" if $run_id;
+    }
+    
+
+    eval {
+        $0 = "MOPPER $instance_name : $stage" . ($nn ? " $nn" : ''); 
+#        print STDERR "Executing $job_str\n";
+        $mops_logger->info("mopper: executing $job_str");
+        $rv = system($job_str);
+        $exit_code = $rv ? ($? >> 8) : 0;
+        if ($exit_code != $EXIT_SUCCESS) {
+            $mops_logger->logdie("$job_str failed: $?");
+        }
+    };
+
+    # Perl/Unix exit value handling.  Need to extract process exit code from
+    # system return value.
+    die($@) if $@;           # Perl error
+    if ($? == -1) {         # exec failed
+        die "exec failed: $!";
+    }
+    elsif ($? & 127) {
+        die "child failed: $!";
+    }
+    else {
+        if($stage_config{$stage}->{NOTIFY}) {
+            notify_stage($stage, $email, $inst, $nn, 0);
+        }
+
+        # Non-fatal exit codes (should be 0 and 1).
+        $rv = $? >> 8;          # process exit code
+        if ($quit) {
+            $mops_logger->info("STOP was requested.\n");
+            clean_up_and_exit($EXIT_STOP);
+        }
+        return $rv;
+    }
+}
+
+
+sub setup_env {
+    # Set up our environment for running MOPS simulations.
+    my $inst_name = shift;
+
+    my $MOPS_VAR = "$ENV{MOPS_HOME}/var/$ENV{MOPS_DBINSTANCE}";        # home dir for simulation
+    _setenv('MOPS_DBINSTANCE', $inst_name);
+    _setenv('MOPS_HOME', $mops_home || $ENV{MOPS_HOME} || '/usr/local/MOPS');
+
+    _setenv('PERL5LIB', $ENV{PERL5LIB} || "$ENV{MOPS_HOME}/lib/perl5");
+    _addenv('PERL5LIB', "$MOPS_VAR/lib/perl5");
+
+    _setenv('PYTHONPATH', $ENV{PYTHONPATH} || "$ENV{MOPS_HOME}/lib/python");
+    _addenv('PYTHONPATH', "$MOPS_VAR/lib/python");
+
+    _addenv('PATH', "$ENV{MOPS_HOME}/bin");
+    _addenv('PATH', "/usr/local/condor/bin");
+    _addenv('PATH', "$ENV{MOPS_HOME}/var/$ENV{MOPS_DBINSTANCE}/bin");
+
+    _addenv('LD_LIBRARY_PATH', "$ENV{MOPS_HOME}/lib");
+    _addenv('LD_LIBRARY_PATH', "$MOPS_VAR/lib");
+
+    _setenv('CAET_DATA', $ENV{CAET_DATA} || "$ENV{MOPS_HOME}/data/caet_data");
+    _setenv('OORB_DATA', $ENV{OORB_DATA} || "$ENV{MOPS_HOME}/data/oorb");
+    _setenv('ORBFIT_DATA', $ENV{ORBFIT_DATA} || "$ENV{MOPS_HOME}/data/orbfit");
+}
+
+
+sub get_lock {
+    # Set an advisory lock to indicate mopper is running.  Return the flock return
+    # code, where zero indicates we were able to obtain the lock, and non-zero
+    # means a mopper is probably running.
+    my ($inst) = @_;
+    my $lock_filename = sprintf "%s/run/mopper.lock", $inst->getEnvironment('VARDIR');
+    open LOCKFILE, "+>$lock_filename" or $mops_logger->logdie("can't open lockfile $lock_filename");
+    my $rv = flock(LOCKFILE, LOCK_EX | LOCK_NB);
+    return !$rv;
+}
+
+
+sub write_pid {
+    # Write our process's pid to the runtime directory.  Note we have to do this
+    # after we are daemonized so that we write the correct PID.
+    my ($inst) = @_;
+    my $pid_fh = new FileHandle ">$PID_FILENAME" or $mops_logger->logdie("can't open file $PID_FILENAME");
+    print $pid_fh "$$\n";
+    $pid_fh->close();
+}
+
+
+sub notify_stage {
+    use Mail::Send;
+    my ($stage, $addr, $inst, $nn, $prenotify) = @_;
+    my $mjd = mopslib_nn2mjd($nn, 0);   # 0 => UT
+    my $ocnum = mopslib_mjd2ocnum($mjd);
+
+    # +1 is to convert MOPS night number to TJD, ugh
+    my $tjd = int($mjd - 50000 + 1);
+    return unless $addr and $inst;
+    my $date_str = make_nice_date_str($mjd + 1);
+    my $msg = "Night $tjd [$date_str] completed";
+
+    my $dbname = $field->{_inst}->dbname();
+    my $hostname = hostname();          # from Sys::Hostname
+
+    my $mail = new Mail::Send;
+    $mail->to(split /\s+/, $addr);      # handle multiple addresses
+    $mail->add('Reply-To', $reply_to) if $reply_to;
+    if ($prenotify == 1) {
+	$mail->subject("$stage for $dbname $ocnum/$tjd [$date_str] started");
+    } else {
+	$mail->subject("$stage for $dbname $ocnum/$tjd [$date_str] completed");
+    }
+
+    my $fh = $mail->open();
+    my $extra = '';
+
+    if ($stage eq 'POSTTRACKLET') {
+        my @quads = get_quads($inst, $nn);
+        my $quads_str = scalar @quads ? (join("\n", 'Quads: ', '', map {"  $_"} @quads)."\n") : '';
+        my @pairs = get_pairs($inst, $nn);
+        my $pairs_str = scalar @quads ? (join("\n", 'Pairs: ', '', map {"  $_"} @pairs)."\n") : '';
+        $extra = "$quads_str\n$pairs_str\n";
+    }
+    
+    # Get list of chunks that were processed for the night, grouped by run id 
+    # and get the chunks processed on the last run.
+    my $chunks_ref = list_processed_chunks($dbname, $nn);
+    my @tmp = sort({$b <=> $a} keys %{$chunks_ref});    # Temporary array containing sorted run_ids in descending order.
+    my $run_id = $tmp[0];                               # Get id of last run.
+    my $run_ref = $chunks_ref->{$run_id};               # Get array reference to all chunks processed during run
+    my $chunks = "\n\n";
+    my $c;
+    foreach $c (@{$run_ref}) {
+        $chunks .= " $c->[0]\n"
+    }
+    print $fh <<"EOM";
+$msg
+
+Hostname: $hostname
+MOPS Instance: $dbname
+Night: $ocnum/$tjd
+Stage: $stage
+
+Chunks Processed: $chunks
+$extra 
+Internal link:  http://mopshq2.ifa.hawaii.edu/model/$dbname/index.html
+External link:  http://localhost:8080/model/$dbname/index.html
+
+Aloha,
+MOPS
+EOM
+    $fh->close();       # send it
+
+    twitterize($stage, $inst, $msg) if $mops_config->{main}->{notify_twitter};
+    $mops_logger->info("Sent $stage notification to $addr");
+}
+
+
+sub notify_error {
+    use Mail::Send;
+    my ($addr, $inst, $msg) = @_;
+    return unless $addr and $inst and $msg;
+
+    my $dbname = $inst->dbname();
+    my $mail = new Mail::Send;
+    $mail->to(split /\s+/, $addr);      # handle multiple addresses
+    $mail->add('Reply-To', $reply_to) if $reply_to;
+    $mail->subject("MOPS error termination for $dbname");
+
+    my $fh = $mail->open();
+    print $fh <<"EOM";
+$msg
+
+MOPS Instance: $dbname
+
+Aloha,
+MOPS
+EOM
+    $fh->close();       # send it
+
+    # Twitterize it.
+    twitterize('Error', $inst, $msg) if $mops_config->{main}->{notify_twitter};
+    $mops_logger->info("Sent error notification to $addr");
+}
+
+
+sub notify_terminated {
+    use Mail::Send;
+    my ($addr, $inst, $msg) = @_;
+    return unless $addr and $inst and $msg;
+
+    my $dbname = $inst->dbname();
+    my $mail = new Mail::Send;
+    $mail->to(split /\s+/, $addr);      # handle multiple addresses
+    $mail->add('Reply-To', $reply_to) if $reply_to;
+    $mail->subject("MOPS processing terminated for $dbname");
+
+    my $fh = $mail->open();
+    print $fh <<"EOM";
+$msg
+
+MOPS Instance: $dbname
+
+Internal link:  http://mopshq2.ifa.hawaii.edu/model/$dbname/index.html
+External link:  http://localhost:8080/model/$dbname/index.html
+
+Aloha,
+MOPS
+EOM
+    $fh->close();       # send it
+
+    twitterize('Terminated', $inst, $msg) if $mops_config->{main}->{notify_twitter};
+    $mops_logger->info("Sent termination notification to $addr");
+}
+
+
+sub _setenv {
+    my ($k, $v) = @_;
+    $ENV{$k} = $v;
+}
+
+
+sub _addenv {
+    # Add the specified item to the environment PATH-style.
+    # First check to see if the thing we're adding is already there; if so, don't
+    # do anything.
+    my ($k, $v) = @_;
+    my $re = qr/$v/;            # save regexp
+
+    if (!$ENV{$k}) {
+        $ENV{$k} = $v;          # wasn't set, so set it
+    }
+    else {
+        my @stuff = split /:/, $ENV{$k};
+        foreach my $item (@stuff) {
+            return if $item =~ $re;     # found it, so bail
+        }
+        $ENV{$k} = join ':', $v, @stuff;
+    }
+}
+
+
+sub twitterize {
+    my ($head, $inst, $msg) = @_;
+    my $twitter_prog = 'panstarrsmops-alert';
+    my $dbname = $inst->dbname();
+    my $fh = new FileHandle "|$twitter_prog" or die "can't open $twitter_prog";
+    print $fh <<"EOF";
+$dbname $head: $msg
+EOF
+    $fh->close();
+}
+
+
+sub get_quads {
+    my ($inst, $nn) = @_;
+    my $dbh = $inst->dbh;
+    my $foo = $dbh->selectcol_arrayref(<<"SQL") or die $dbh->errstr;
+select distinct group_concat(distinct survey_mode order by epoch_mjd) 
+from fields 
+where nn=$nn 
+group by if(parent_id is null, field_id, parent_id) 
+having count(*) > 2
+order by max(epoch_mjd)
+SQL
+    return @{$foo};
+}
+
+
+sub get_pairs {
+    my ($inst, $nn) = @_;
+    my $dbh = $inst->dbh;
+    my $foo = $dbh->selectcol_arrayref(<<"SQL") or die $dbh->errstr;
+select distinct group_concat(distinct survey_mode order by epoch_mjd) 
+from fields 
+where nn=$nn 
+group by if(parent_id is null, field_id, parent_id) 
+having count(*) = 2
+order by max(epoch_mjd)
+SQL
+    return @{$foo};
+}
+
+
+sub make_nice_date_str {
+    my ($mjd) = @_;
+    my $unixtime = ($mjd - 40587) * 86400;  # seconds since Unix epoch (40587 => Unix epoch Jan 1 1970)
+    return uc strftime("%a %d %b %Y UT", gmtime($unixtime));    
+}

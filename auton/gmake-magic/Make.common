@@ -1,0 +1,1376 @@
+# Welcome to Make.common
+
+
+
+
+# If we are running recursive make, then archdir (and many other
+# things) have been exported to us already. Don't recompute!
+
+ifeq ($(MAKELEVEL),0)      # true if toplevel make
+
+
+define usage
+
+
+Auton makefile help
+===================
+Options:
+ t=
+   description  : The type of compilation.
+   default      : $(default_t_standard)
+   ASL default  : $(default_t_asl)
+   legal values : $(legal_compile_values)
+
+ mem=
+   description  : The memory allocator to use.
+   default      : $(default_mem_standard)
+   ASL default  : $(default_mem_asl)
+   legal values : $(legal_mem_values)
+
+ draw=
+   description  : Enable draw code? [boolean]
+   default      : $(default_draw_standard)
+   ASL default  : $(default_draw_asl)
+   legal values : $(legal_boolean_values)
+
+ thread=
+   description  : Enable thread code? [boolean]
+   default      : $(default_thread_standard)
+   ASL default  : $(default_thread_asl)
+   legal values : $(legal_boolean_values)
+
+ asl=
+   description  : Compile for ASL? This changes other defaults to "ASL default"! [boolean]
+   default      : $(default_asl)
+   legal values : $(legal_boolean_values)
+endef
+
+
+
+#####################
+# CONFIGURATION DATA
+###################
+legalhosts = [alpha] [i386] [i486] [i586] [i686] [sun4m] [IP35]
+x86list    = [i386] [i486] [i586] [i686]
+
+legal_compilers = [gcc] [ccc] [cc]
+legal_compilerscc = [ccc] [g++] [cxx] [CC]
+legal_compilersf77 = [g77] [fort] [f77]
+
+legal_compile_values = [debug] [verycareful] [fast] [fastdebug] [profile] [whine]
+
+legal_mem_values = [amma] [amma-track] [noamma] [boehmgc]
+
+legal_boolean_values = [0] [1]
+
+
+###################################
+# CMDLINE CHOICES AND MACHINE INFO
+#################################
+# get compiler choice, default is "gcc"
+# NOTE: compc might be a c++ compiler, if "c=..." is specified
+compc = gcc
+compcc = g++
+compf77 = g77
+ifneq (,$(findstring [$(c)], $(legal_compilers)))
+  compc := $(c)
+endif
+ifneq (,$(findstring [$(cc)], $(legal_compilerscc)))
+  compcc := $(cc)
+endif
+ifneq (,$(findstring [$(f77)], $(legal_compilersf77)))
+  compf77 := $(f77)
+endif
+
+
+# DEFAULTS
+
+# set defaults for compiling with both asl=0 and asl=1
+default_t_standard := debug
+default_t_asl := debug
+
+default_mem_standard := amma
+default_mem_asl := amma-track
+
+default_draw_standard := 1
+default_draw_asl := 1
+
+default_thread_standard := 0
+default_thread_asl := 1
+
+# special default for ASL itself
+default_asl := 0
+
+
+# now, determine if we are doing ASL
+ifeq ($(strip $(asl)),)
+  asl := $(default_asl)
+endif
+
+# then, create computed defaults based on ASL selection
+ifeq ($(asl),1)
+  default_t      := $(default_t_asl)
+  default_mem    := $(default_mem_asl)
+  default_draw   := $(default_draw_asl)
+  default_thread := $(default_thread_asl)
+else
+  default_t      := $(default_t_standard)
+  default_mem    := $(default_mem_standard)
+  default_draw   := $(default_draw_standard)
+  default_thread := $(default_thread_standard)
+endif
+
+
+# finally, apply these defaults if not given by user
+ifeq ($(strip $(t)),)
+  t := $(default_t)
+endif
+ifeq ($(strip $(mem)),)
+  mem := $(default_mem)
+endif
+ifeq ($(strip $(draw)),)
+  draw := $(default_draw)
+endif
+ifeq ($(strip $(thread)),)
+  thread := $(default_thread)
+endif
+
+
+# check args
+ifeq (,$(findstring [$(t)], $(legal_compile_values)))
+  $(error t must be one of $(legal_compile_values). (Given "$(t)"))
+endif
+
+ifeq (,$(findstring [$(mem)], $(legal_mem_values)))
+  $(error mem must be one of $(legal_mem_values). (Given "$(mem)"))
+endif
+
+ifeq (,$(findstring [$(draw)], $(legal_boolean_values)))
+  $(error draw must be one of $(legal_boolean_values). (Given "$(draw)"))
+endif
+
+ifeq (,$(findstring [$(thread)], $(legal_boolean_values)))
+  $(error thread must be one of $(legal_boolean_values). (Given "$(thread)"))
+endif
+
+ifeq (,$(findstring [$(asl)], $(legal_boolean_values)))
+  $(error asl must be one of $(legal_boolean_values). (Given "$(asl)"))
+endif
+
+
+# Paul Komarek 2002 12 18 -- added code to remove spaces.
+# Get machine information, removing spaces (*cough*OSX*cough*).
+# We could replace spaces with underscores, but that is the character
+# sed to join these variables together for the archdir.
+hosttype := $(shell uname -m | sed -e 's/ //g')
+ostype := $(shell uname -s | sed -e 's/ //g')
+osver := $(shell uname -r | sed -e 's/ //g')
+
+# get gcc version
+gccver1 = 0
+gccver2 = 0
+gccver3 = 0
+compcisgcc := $(shell $(compc) 2>&1 | head -n1 | sed -ne 's:.*\(gcc\).*:\1:p')
+ifneq (,$(compcisgcc))
+  gccver1 := $(shell $(compc) --version | head -n1 \
+                    | sed -ne 's:^gcc (GCC) \([0-9]\).*$$:\1:p')
+  gccver2 := $(shell $(compc) --version | head -n1 \
+                    | sed -ne 's:^gcc (GCC) [0-9]\.\([0-9]\).*$$:\1:p')
+  gccver3 := $(shell $(compc) --version | head -n1 \
+                    | sed -ne 's:^gcc (GCC) [0-9]\.[0-9]\.\([0-9]\).*$$:\1:p')
+
+  # XXX: not fully implemented (only for gcc and sun cc)
+  opt_flags    := -g -O2
+  no_opt_flags := -g -O0
+endif
+
+
+
+####################
+# Get C lib version
+##################
+cver =
+
+ifneq (,$(findstring CYGWIN,$(ostype)))
+  cver := win32
+endif
+
+ifneq (,$(findstring MINGW,$(ostype)))
+  cver := win32
+endif
+
+# Try getting glibc version on Linux-based systems.
+ifeq ($(ostype),Linux)
+  glibcldd := $(shell which ldd 2>/dev/null)
+  ifneq (,$(glibcldd))
+    # Linux-based systems typically use glibc.
+    glibcver := $(shell \
+	$(glibcldd) --version \
+		| sed -ne '/ldd/ s:.* \([0-9.]\{1,\}\).*:\1:p')
+    cver := glibc-$(glibcver)
+  endif
+endif
+# Use generic method of finding libc for other systems.
+ifeq (,$(cver))
+    cver := $(shell \
+           if [ -x "/usr/bin/ldd" ]; then \
+             base="/tmp/clibver.${here}"; \
+             echo "int main(void){return 0;}" > "$$base.c"; \
+             $(compc) -o "$$base" "$$base.c"; \
+             ldd "$$base" | sed -ne "s/.*\(libc\.so\..*\) =>.*/\1/p"; \
+             rm -f "$$base" "$$base.c"; \
+           fi \
+          )
+endif
+
+# Paul Komarek 2002 12 18: removed "libc_unknown" to allow shorter
+# directory names in some cases:
+#   Darwin_PowerMacintosh_libc-unknown_gcc.fast versus
+#   Darwin_PowerMacintosh__gcc.fast
+# If the generic method failed, set cver to ""
+ifeq (,$(cver))
+  # This causes no change to cver.  I left this here to make it easy to
+  # see code flow and branching options.  Don't put cver = "", because
+  # the quotes are taken literally.
+  cver = 
+endif
+
+# Must be :=, or else there is a recursive definition of cver.
+cver := $(shell echo $(cver) | sed -e "s/ //")
+
+#############################################################
+# MISCELLANEOUS DEFINITIONS (some are changed further below)
+###########################################################
+# set CC and CXX for error checking -- use compc or compcc instead
+CC		:= FOO
+CXX             := BAR
+F77             := BAZ
+#warn_flags      := -Wall -Wmissing-prototypes -D__USE_FIXED_PROTOTYPES__ -Werror-implicit-function-declaration
+
+ifneq (,$(compcisgcc))
+  warn_flags      := -Wall -D__USE_FIXED_PROTOTYPES__ -Werror-implicit-function-declaration
+  cxx_warn_flags  := -Wall -D__USE_FIXED_PROTOTYPES__
+  f77_warn_flags  := -Wall -D__USE_FIXED_PROTOTYPES__
+endif
+
+ar_command      := ar rv
+# ar_command      := gcc -dynamiclib
+#group_root      := /afs/cs.cmu.edu/project/learn/group         # XXX: no more AFS
+
+##########
+# ARCHDIR
+########
+# check that we can handle hosttype
+ifeq (,$(findstring [$(hosttype)], $(legalhosts)))
+	echo "We need to update our Make.common for \"uname -m\"==$(hosttype)"
+endif
+# combine all x86 hosts into one
+ifneq (,$(findstring [$(hosttype)], $(x86list)))
+	hosttype=x86
+endif
+
+# Check that cpu is Athlon MP, which we assume only happens on Linux and
+# FreeBSD.  With more exploration, we might open this up to other cpus.
+cpustr = "bogus"
+ifeq ($(ostype),FreeBSD)
+  cpustr := $(shell sysctl hw.model)
+endif
+ifeq ($(ostype),Linux)
+  cpustr := $(shell \
+             grep -i "model name" /proc/cpuinfo | head -n1; \
+             echo "$$?" \
+            )
+endif
+athcpu := $(shell \
+           echo "$(cpustr)" | grep -i athlon | grep -i mp > /dev/null 2>&1; \
+           echo $$? \
+          )
+ifeq ($(athcpu),0)
+  hosttype = athlonmp
+endif
+
+
+# create name for target directory
+archdir := $(ostype)_$(hosttype)_$(cver)_$(compc)
+
+
+
+################
+# COMPILER- AND PLATFORM-SPECIFIC FLAGS
+##############
+
+# NOTES:
+#
+# * This is the section that is meant to maintained on a case-by-case basis
+#   and correctness is soley determined by whether we DTRT.
+# * The following sections do not need to be exclusive, though it will be
+#   very difficult to understand if they overlap in arbitrary ways.
+
+# Prevent C compilation mishaps.
+# compc=gcc, or cc on FreeBSD and GNU/Linux (uname -s == Linux).
+
+# pedantic?
+pedflag=
+ifneq (,$(compcisgcc))
+  pedflag = 
+  ifeq ($(gccver1),3)
+    ifeq ($(shell if [ $(gccver2) -ge 3 ]; then echo "1"; fi), 1)
+      pedflag = -pedantic
+    endif
+  endif
+endif
+
+ifneq ($(cver),win32)
+  type_c_compile_flags += $(pedflag)
+endif
+
+
+# http://gcc.gnu.org/wiki/Visibility (for gcc >= 4)
+ifneq (,$(compcisgcc))
+  ifeq ($(/bin/bash if [ $(gccver1) -ge 4 ]; then echo "1"; fi), 1)
+    #type_c_compile_flags += -fvisibility=hidden
+    #type_cxx_compile_flags += -fvisibility=hidden -fvisibility-inlines-hidden
+    #type_cxx_compile_flags += -fvisibility=hidden
+    #type_f77_compile_flags += -fvisibility=hidden
+  endif
+endif
+
+
+
+# platform specific affixes
+exec_suffix :=
+lib_prefix  := lib
+lib_suffix  := .a
+dynlib_prefix  := lib
+dynlib_suffix  := .so
+obj_suffix  := .o
+
+# win32
+ifeq ($(cver),win32) 
+  extra_link_flags += -mno-cygwin
+  type_c_compile_flags += -mno-cygwin
+  type_cxx_compile_flags += -mno-cygwin
+  type_f77_compile_flags += -mno-cygwin
+  arch_libs += -lwsock32
+  draw_libs += -lgdi32
+
+  exec_suffix := .exe
+  dynlib_prefix  := 
+  dynlib_suffix  := .dll
+
+  thread_compile_flags += -I../pthreads-win32/include -D_REENTRANT
+  thread_link_flags += -L../pthreads-win32/lib -L../../pthreads-win32/lib
+
+  ifeq ($(compc),gcc)
+    dynlib_link_flags += -shared -Wl,--out-implib,$(notdir $(library))
+    dynlib_ok := 1
+    thread_libs += -lpthreadGC2
+  else
+    lib_prefix :=
+    lib_suffix := .lib
+    obj_suffix := .obj
+    thread_libs += -lpthreadVC2
+  endif
+else
+  # POSIX
+  thread_compile_flags += -D_REENTRANT
+  thread_libs += -lpthread
+endif
+
+# freebsd
+ifeq ($(ostype),FreeBSD)
+  # FreeBSD's stdlib.h uses the long long type, and we can't really
+  # ignore FreeBSD entirely ;-).  Therefore we ignore long long problems.
+  type_c_compile_flags += -Wno-long-long
+endif
+
+# NEEDS MORE WORK: 2002 12 18
+ifeq ($(ostype),Darwin)
+  # Apple has chosen to copy FreeBSD's trouble-making long long mess.
+  type_c_compile_flags += -Wno-long-long -fPIC -fno-common
+  dynlib_link_flags += -dynamiclib
+  dynlib_suffix := .dylib
+  dynlib_ok := 1
+endif
+
+# Check whether to set the athlon-mp flags.
+ifeq ($(hosttype),athlonmp)
+  ifeq ($(t),fast)
+    athflags = -march=athlon-mp -fprefetch-loop-arrays
+
+    # Check that compiler supports athflags.
+    athpre := $(shell \
+              fname="/tmp/athpre.$(here)"; \
+              echo "int main(void) { return 0; }" > "$$fname.c"; \
+              $(compc) $(athflags) -o "$$fname" "$$fname.c" > /dev/null 2>&1; \
+              rc=$$?; \
+              if [ "$$rc" -eq 0 ]; then "$$fname"; rc=$$?; fi; \
+              rm -f "$$fname" "$$fname.c"; \
+              echo $$rc \
+             )
+
+    # If everything went well, adjust the compile flags and archdir.
+    ifeq ($(athpre),0)
+      type_c_compile_flags += $(athflags)
+    endif
+  endif
+  ifeq ($(t),profile)
+    athflags = -march=athlon-mp -fprefetch-loop-arrays
+
+    # Check that compiler supports athflags.
+    athpre := $(shell \
+              fname="/tmp/athpre.$(here)"; \
+              echo "int main(void) { return 0; }" > "$$fname.c"; \
+              $(compc) $(athflags) -o "$$fname" "$$fname.c" > /dev/null 2>&1; \
+              rc=$$?; \
+              if [ "$$rc" -eq 0 ]; then "$$fname"; rc=$$?; fi; \
+              rm -f "$$fname" "$$fname.c"; \
+              echo $$rc \
+             )
+
+    # If everything went well, adjust the compile flags and archdir.
+    ifeq ($(athpre),0)
+      type_c_compile_flags += $(athflags)
+    endif
+  endif
+endif
+
+# compc=gcc, hosttype=, ostype=Linux, osver=
+# I'd like to check linkcc, but it is set further below.
+ifeq ($(compc),gcc)
+  ifeq ($(ostype),Linux)
+    # Whether we're running fast or slow, BTDEBUG is recommended.  It
+    # has no performance impact.
+    type_c_compile_flags += -DBTDEBUG -fPIC -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64
+    type_f77_compile_flags += -DBTDEBUG -fPIC -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64
+    type_cxx_compile_flags += -DBTDEBUG -fPIC -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64
+    extra_link_flags += -rdynamic -fPIC
+
+    dynlib_link_flags += -shared
+    dynlib_ok := 1
+  endif
+endif
+
+# compc=gcc, hosttype=, ostype=SunOS, osver=
+ifeq ($(compc), gcc)
+  ifeq ($(ostype), SunOS)
+    type_c_compile_flags += -fPIC -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64
+    type_f77_compile_flags += -fPIC -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64
+    type_cxx_compile_flags += -fPIC -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64
+    extra_link_flags += -fPIC
+
+    dynlib_link_flags += -shared
+    dynlib_ok :=1
+  endif
+endif
+ 
+# c=, hosttype=, ostype=Linux, osver=
+ifeq ($(ostype), Linux)
+  draw_include_dirs += -I/usr/X11R6/include
+  draw_link_flags += -L/usr/X11R6/lib -L/usr/X11R6/lib64
+  draw_libs += -lX11
+endif
+
+# c=, hosttype=, ostype=SunOS, osver=
+ifeq ($(ostype), SunOS)
+ draw_include_dirs += -I/usr/include/X11
+ draw_link_flags += -L/usr/lib/X11
+ draw_libs += -lX11
+endif 
+
+# ostype=IRIX64 => no -Wall
+ifeq ($(compcc),CC)
+  ifeq ($(ostype), IRIX64)
+    warn_flags      := -D__USE_FIXED_PROTOTYPES__
+    f77_warn_flags  := -D__USE_FIXED_PROTOTYPES__
+    cxx_warn_flags  := -D__USE_FIXED_PROTOTYPES__
+  endif
+endif
+
+
+ifeq ($(compc),cc)
+  ifeq ($(ostype), SunOS)
+    # XXX: for compiling to Java JNI on Solaris
+    opt_flags       := -xregs=no%frameptr -xO2
+    no_opt_flags    := -g
+
+    warn_flags      := -Xa -v -xstrconst -xc99=%none -errwarn=%all -D__USE_FIXED_PROTOTYPES__
+    cxx_warn_flags  := -errwarn=%all -D__USE_FIXED_PROTOTYPES__
+  endif
+endif
+
+
+# c=ccc or c=cxx or c=cc(and using Tru64), hosttype=alpha, ostype=, osver=
+# or f77=fort or f77=f77(and using Tru64), hosttype=alpha, ostype=, osver=
+ifeq ($(hosttype),alpha)
+  ifeq ($(ostype),Linux)
+    compaq_compilers = [ccc] [cxx] [fort]
+  else
+    compaq_compilers = [cc] [cxx] [fort] [f77]
+  endif
+
+  ifneq (,$(findstring [$(compc)],$(compaq_compilers)))
+    arch_compile_flags += -ieee -D__HAS_ISINF__=0 -D__USE_FIXED_PROTOTYPES_
+    warn_flags      += -msg_enable level4 -D__USE_FIXED_PROTOTYPES__ -msg_disable unusedtop,nomainieee
+  else
+    arch_compile_flags += -mieee
+  endif
+
+  ifneq (,$(findstring [$(compcc)],$(compaq_compilers)))
+     cxx_warn_flags  += -msg_enable level4 -D__USE_FIXED_PROTOTYPES__ -msg_disable unusedtop,nomainieee
+  endif
+
+  ifneq (,$(findstring [$(compf77)],$(compaq_compilers)))
+     f77_warn_flags  += -msg_enable level4 -D__USE_FIXED_PROTOTYPES__ -msg_disable unusedtop,nomainieee
+     extra_link_flags += -nofor_main
+  endif
+
+endif
+
+# c=, hosttype=, ostype=SunOS, osver=[4.1.4] would be old SunOS, 5.X is Solaris
+# c=, hosttype=, ostype=SunOS, osver=[5.7]
+ifeq ($(ostype),SunOS)
+  ifneq (,$(shell echo $(osver) | grep "^[5-9]\."))
+    ar_command = /usr/xpg4/bin/ar -rv
+  endif
+endif
+
+# c=, hosttype in pmax_list, ostype=, osver=  (though ostype is more relevant)
+pmax_list += [pmax_mach] [pmax_ul43a]
+ifneq (,$(findstring [$(hosttype)], $(pmax_list)))
+  draw_include_dirs += -I/usr/misc/.X11/include
+  draw_link_flags += -L/usr/misc/.X11/lib
+  draw_libs += -lX11
+endif
+
+# c=, hosttype in sgi_list, ostype=, osver= (though ostype is more relevant)
+sgi_list = [iris4d] [sgi_53] [sgi_62]
+ifneq (,$(findstring [$(hosttype)], $(sgi_list)))
+  arch_compile_flags += -DSGI_COMPILE
+endif
+
+# c=, hosttype=, ostype=FreeBSD, osver= (though ostype is more relevant)
+freebsd_list = [FreeBSD]
+ifneq (,$(findstring [$(ostype)], $(freebsd_list)))
+  draw_include_dirs += -I/usr/X11R6/include
+  draw_link_flags += -L/usr/X11R6/lib
+  draw_libs += -lX11
+endif
+
+# c=, hosttype=, ostype=Darwin, osver= (though ostype is more relevant)
+darwin_list = [Darwin]
+ifneq (,$(findstring [$(ostype)], $(darwin_list)))
+  draw_include_dirs += -I/usr/X11R6/include
+  draw_link_flags += -L/usr/X11R6/lib
+  draw_libs += -lX11
+  post_lib_build := ranlib
+endif
+
+
+# here is our chance to disable drawing code
+ifeq ($(draw),0)
+  draw_include_dirs =
+  draw_link_flags =
+  draw_compile_flags = -DNOGRAPHICS -DWIN32_NOGRAPHICS
+  draw_libs =
+endif
+
+
+################
+# GENERAL COMPILER FLAGS
+##############
+
+# Options are now cumulative, because I've switched := to +=
+
+# t
+ifeq ($(t),debug)
+  debug = 1
+  type_c_compile_flags += $(no_opt_flags) $(debug_flags)
+  type_f77_compile_flags += $(no_opt_flags) $(debug_flags)
+  type_cxx_compile_flags += $(no_opt_flags) $(debug_flags)
+endif
+
+ifeq ($(t),verycareful)
+  debug = 1
+  type_c_compile_flags += -DVERY_CAREFUL_CHECKING $(no_opt_flags) $(debug_flags)
+  type_f77_compile_flags += -DVERY_CAREFUL_CHECKING $(no_opt_flags) $(debug_flags)
+  type_cxx_compile_flags += -DVERY_CAREFUL_CHECKING $(no_opt_flags) $(debug_flags)
+endif
+
+ifeq ($(t),fast)
+  type_c_compile_flags += -DAMFAST $(opt_flags) $(fast_flags)
+  type_f77_compile_flags += -DAMFAST $(opt_flags) $(fast_flags)
+  type_cxx_compile_flags += -DAMFAST $(opt_flags) $(fast_flags)
+endif
+
+ifeq ($(t),whine)
+  # dubious
+  pedflag = ""
+  ifeq ($(gccver1),3)
+    ifeq ($(shell if [ $(gccver2) -ge 3 ]; then echo "high"; fi), high)
+      pedflag = -pedantic
+    endif
+  endif
+
+  type_c_compile_flags += -O1 -Wall -D__USE_FIXED_PROTOTYPES__ $(pedflag) \
+    -W -Wpointer-arith -Wbad-function-cast -Wsign-compare -Wstrict-prototypes \
+    -Wmissing-format-attribute -Wpadded -Winline -Wdisabled-optimization 
+  type_f77_compile_flags += -O1 -Wall
+  type_cxx_compile_flags += -O1 -Wall -D__USE_FIXED_PROTOTYPES__ $(pedflag) \
+    -W -Wpointer-arith -Wbad-function-cast -Wsign-compare -Wstrict-prototypes \
+    -Wmissing-prototypes -Wmissing-declarations -Wmissing-format-attribute \
+    -Wpadded -Wredundant-decls -Winline -Wdisabled-optimization
+endif
+
+ifeq ($(t),profile)
+  type_c_compile_flags += -DAMFAST $(opt_flags) -pg
+  type_f77_compile_flags += -DAMFAST $(opt_flags) -pg
+  type_cxx_compile_flags += -DAMFAST $(opt_flags) -pg
+  type_link_flags += -pg
+endif
+
+ifeq ($(t),fastdebug)
+  # dubious
+  debug = 1
+  type_c_compile_flags += -DAMFAST $(no_opt_flags)
+  type_f77_compile_flags += -DAMFAST $(no_opt_flags)
+  type_cxx_compile_flags += -DAMFAST $(no_opt_flags)
+endif
+
+
+#ifeq ($(t),matlab)
+#  # XXX broken
+#  $(warning Matlab compilation is likely completely broken)
+#  type_c_compile_flags += -DMATLAB_COMPILE -O2 -g
+#  type_f77_compile_flags += -DMATLAB_COMPILE -O2 -g
+#  type_cxx_compile_flags += -DMATLAB_COMPILE -O2 -g
+#  build_executable = cmex -o $(group_root)/bin/$(here) CC=$(compc) LD_CCLIBS=$(LIBS) MEXLIBS='-lm /afs/cs.cmu.edu/misc/matlab/sun4c_411/omega/extern/lib/sun4/libmex.a' $(mainobjs) $(libraries)
+#endif
+
+#ifeq ($(t),purify)
+#  # XXX broken
+#  # use debugging object directories, just write the binary using purify.
+#  $(warning Purify compilation is likely completely broken)
+#  override t += debug
+#  type_c_compile_flags += -g
+#  type_f77_compile_flags += -g
+#  type_cxx_compile_flags += -g
+#  build_executable = purify -cache-dir=../PURIFY -chain-length=12  $(standard_build_executable)
+#endif
+
+# mem
+ifeq ($(mem),noamma)
+  type_c_compile_flags += -DUSE_OS_MEMORY_MANAGEMENT
+  type_f77_compile_flags += -DUSE_OS_MEMORY_MANAGEMENT
+  type_cxx_compile_flags += -DUSE_OS_MEMORY_MANAGEMENT
+endif
+
+ifeq ($(mem),boehmgc)
+  type_c_compile_flags += -DUSE_BOEHM_GC
+  type_f77_compile_flags += -DUSE_BOEHM_GC
+  type_cxx_compile_flags += -DUSE_BOEHM_GC
+  type_libs += -lgc
+endif
+
+#ifeq ($(mem),talloc)
+#  type_c_compile_flags += -DUSE_TALLOC -I../talloc
+#  type_f77_compile_flags += -DUSE_TALLOC -I../talloc
+#  type_cxx_compile_flags += -DUSE_TALLOC -I../talloc
+#ifneq ($(strip $(here)),talloc)
+#  type_libs += -ltalloc
+#  type_link_flags += -L../talloc -L../../talloc
+#endif
+#endif
+
+
+# asl and wx
+asl_debug =
+ifneq ($(strip $(debug)),)  # this can be set in "t" configurations above
+  wx_debug_flag = --debug=yes
+else
+  wx_debug_flag = --debug=no
+endif
+
+ifeq ($(asl),1)
+  type_c_compile_flags += -DASL_BUILD -fexceptions $(asl_debug)
+  type_f77_compile_flags += -DASL_BUILD  $(asl_debug)
+  type_cxx_compile_flags += -DASL_BUILD -fexceptions $(asl_debug)
+
+  ifneq ($(cver),win32)
+    type_libs += -ldl
+  endif
+endif
+
+
+# threads
+ifeq ($(thread),1)
+  type_c_compile_flags += -DUSE_PTHREADS $(thread_compile_flags)
+  type_f77_compile_flags += -DUSE_PTHREADS $(thread_compile_flags)
+  type_cxx_compile_flags += -DUSE_PTHREADS $(thread_compile_flags)
+  extra_link_flags += $(thread_link_flags)
+  extra_libs += $(thread_libs)
+endif
+
+
+# recursive sibs
+define recsibserror
+Recursive sibling discovery failed. Error message follows:
+$(recsibs)
+endef
+
+recsibs := $(shell /bin/bash -c 'MAKE=$(MAKE); . ../gmake-magic/get_recursive_sibs.sh')
+ifneq (,$(findstring ERROR,$(recsibs)))
+ $(error $(recsibserror))
+endif
+
+
+# OBJDIR is used for a few things, especially as suffix on the program symlink
+OBJDIR        := $(archdir).$(t)
+
+# change the OBJDIR here if different from default,
+# so we only link compatible options together
+#
+# note that t is always included in OBJDIR
+ifneq ($(asl),$(default_asl))
+  ifeq ($(asl),1)
+     OBJDIR     := $(OBJDIR)_asl
+  else
+     OBJDIR     := $(OBJDIR)_noasl
+  endif
+endif
+
+# add extra text for non-default options
+# XXX: too tricky?
+ifneq ($(mem),$(default_mem))
+   OBJDIR     := $(OBJDIR)_$(mem)
+endif
+
+ifneq ($(draw),$(default_draw))
+  ifeq ($(draw),1)
+     OBJDIR     := $(OBJDIR)_draw
+  else
+     OBJDIR     := $(OBJDIR)_nodraw
+  endif
+endif
+
+ifneq ($(thread),$(default_thread))
+  ifeq ($(thread),1)
+     OBJDIR     := $(OBJDIR)_thread
+  else
+     OBJDIR     := $(OBJDIR)_nothread
+  endif
+endif
+
+
+endif   # end of conditional on MAKELEVEL == 0
+
+
+# export to recursive make 
+# (very important to update this if you add a new command line parameter!)
+export compc
+export compcc
+export compf77
+export hosttype
+export ostype
+export osver
+export compcisgcc
+export gccver1
+export gccver2
+export gccver3
+export cver
+
+export t
+export mem
+export draw
+export thread
+export asl
+
+export type_c_compile_flags
+export type_cxx_compile_flags
+export type_f77_compile_flags
+export type_link_flags
+export type_libs
+
+export extra_link_flags
+export extra_libs
+
+export arch_compile_flags
+export arch_include_dirs
+export arch_link_flags
+export arch_libs
+
+export draw_compile_flags
+export draw_include_dirs
+export draw_link_flags
+export draw_libs
+
+export post_lib_build
+
+export warn_flags
+export cxx_warn_flags
+export f77_warn_flags
+
+export user_flags
+export user_link_flags
+export user_libs
+
+export exec_suffix
+export lib_prefix
+export lib_suffix
+export dynlib_prefix
+export dynlib_suffix
+export obj_suffix
+
+export dynlib_link_flags
+export dynlib_ok
+
+export wx_debug_flag
+
+export CC
+export CXX
+export F77
+export ar_command
+
+export archdir
+export OBJDIR
+export recsibs
+
+
+
+### SECTION 3.  FINAL VARIABLE ASSIGNMENTS FOR RULES
+make_objdir   := $(shell test -d $(OBJDIR) || mkdir $(OBJDIR) 1>&2 )
+
+include_dirs	:= -I. -I.. $(foreach sib,$(recsibs),-I../$(sib))
+CFLAGS		:= $(type_c_compile_flags) $(arch_compile_flags) $(draw_compile_flags) $(warn_flags) $(user_flags) $(include_dirs) $(arch_include_dirs) $(draw_include_dirs)
+
+F77FLAGS	:= $(type_f77_compile_flags) $(arch_compile_flags) $(draw_compile_flags) $(f77_warn_flags) $(user_flags) $(include_dirs) $(arch_include_dirs) $(draw_include_dirs)
+
+CXXFLAGS	:= $(type_cxx_compile_flags) $(arch_compile_flags) $(draw_compile_flags) $(cxx_warn_flags) $(user_flags) $(include_dirs) $(arch_include_dirs) $(draw_include_dirs)
+
+LIBS		+= -lm $(arch_libs) $(type_libs) $(draw_libs) $(extra_libs)
+LFLAGS		:= $(type_link_flags) $(arch_link_flags) $(draw_link_flags) $(extra_link_flags) $(user_link_flags)
+
+#mains		:= main.c $(private_sources)
+#mainobjs	:= $(patsubst %.c,$(OBJDIR)/%$(obj_suffix),$(mains))
+#libobjs		:= $(patsubst %.c,$(OBJDIR)/%$(obj_suffix),$(sources))
+
+mains		:= $(filter %.c %.f %.cc %.cpp,$(wildcard main.*))
+maincsources	:= $(filter %.c,$(mains))
+mainf77sources	:= $(filter %.f,$(mains))
+mainccsources	:= $(filter %.cc,$(mains))
+maincppsources	:= $(filter %.cpp,$(mains))
+maincobjs	:= $(patsubst %.c,$(OBJDIR)/%$(obj_suffix),$(maincsources))
+mainf77objs	:= $(patsubst %.f, $(OBJDIR)/%$(obj_suffix),$(mainf77sources))
+mainccobjs	:= $(patsubst %.cc, $(OBJDIR)/%$(obj_suffix),$(mainccsources))
+maincppobjs	:= $(patsubst %.cpp, $(OBJDIR)/%$(obj_suffix),$(maincppsources))
+libcsources	:= $(filter %.c,$(sources))
+libf77sources	:= $(filter %.f,$(sources))  # support other extensions later
+libccsources	:= $(filter %.cc,$(sources))
+libcppsources	:= $(filter %.cpp,$(sources))
+libcobjs	:= $(patsubst %.c, $(OBJDIR)/%$(obj_suffix),$(libcsources))
+libf77objs	:= $(patsubst %.f, $(OBJDIR)/%$(obj_suffix),$(libccsources))
+libccobjs	:= $(patsubst %.cc, $(OBJDIR)/%$(obj_suffix),$(libccsources))
+libcppobjs	:= $(patsubst %.cpp, $(OBJDIR)/%$(obj_suffix),$(libcppsources))
+
+nummains        := $(words $(mains))
+numsources	:= $(words $(sources))
+cplibs		:= $(filter $(lib_prefix)%$(lib_suffix),$(sources))
+numcplibs	:= $(words $(cplibs))
+
+# must lazily evaluate siblibs and sibobjs because we won't have
+# libs or objs now, but we will when we need them
+siblibs		 = $(foreach sib,$(recsibs),../$(sib)/$(OBJDIR)/$(lib_prefix)$(sib)$(lib_suffix))
+sibdirs		:= $(foreach sib,$(recsibs),../$(sib))
+sibobjs		 = $(foreach sib,$(recsibs), \
+                      $(filter-out ../$(sib)/$(OBJDIR)/main$(obj_suffix), \
+                          $(wildcard ../$(sib)/$(OBJDIR)/*$(obj_suffix))))
+
+sibf77sources	:= $(foreach sib,$(recsibs),$(wildcard ../$(sib)/*.f))
+allf77sources	:= $(mainf77sources) $(libf77sources) $(sibf77sources)
+
+sibccsources	:= $(foreach sib,$(recsibs),$(wildcard ../$(sib)/*.cc))
+sibcppsources	:= $(foreach sib,$(recsibs),$(wildcard ../$(sib)/*.cpp))
+allccsources	:= $(mainccsources) $(libccsources) $(sibccsources)
+allcppsources	:= $(maincppsources) $(libcppsources) $(sibcppsources)
+
+library		:= $(OBJDIR)/$(lib_prefix)$(here)$(lib_suffix)
+dynlib		:= $(OBJDIR)/$(dynlib_prefix)$(here)$(dynlib_suffix)
+megalib		:= $(OBJDIR)/$(lib_prefix)mega$(here)$(lib_suffix)
+libraries	:= $(library) $(siblibs) $(user_libs)
+
+execute         := $(OBJDIR)/$(here)$(exec_suffix)
+
+
+# cause error if main.* is included in sources (it is automatically processed)
+badmains := $(filter $(mains),$(sources))
+ifneq ($(badmains),)
+  $(error [$(badmains)] explicitly listed in sources, please remove)
+endif
+
+
+
+# Paul Komarek 2001-12-16: attempt to automagically choose proper linker and
+# compiler.
+ifeq ($(linkcc),)
+  linkcc := $(compc)
+
+  # I don't know what we should do if C++ and Fortran sources are mixed.
+  # The makefile code below will end up using the C++ linker.  We should
+  # at least print a warning.  I have no examples to test right now.
+  ifneq (,$(word 1, $(allf77sources)))
+    ifneq (,$(word 1, $(allccsources)))
+	echo "WARNING: we have never tested mixed FORTRAN and C++ code." 1>&2
+    endif
+    ifneq (,$(word 1, $(allcppsources)))
+	echo "WARNING: we have never tested mixed FORTRAN and C++ code." 1>&2
+    endif
+  endif
+
+
+  # If we have .f sources in ourself or siblings, use Fortran linker.
+  ifneq (,$(word 1, $(allf77sources)))
+    linkcc := $(compf77)
+  endif
+
+  # If we have .cc or .cpp sources in ourself or siblings, use C++ linker.
+  ifneq (,$(word 1, $(allccsources)))
+    linkcc := $(compcc)
+  endif
+  ifneq (,$(word 1, $(allcppsources)))
+    linkcc := $(compcc)
+  endif
+
+endif
+
+
+standard_build_executable := $(linkcc) $(LFLAGS)   -o $(execute)   $(maincobjs) $(mainf77objs) $(mainccobjs) $(maincppobjs) $(libraries) $(LIBS) ;
+
+ifeq ($(build_executable),)
+  build_executable := $(standard_build_executable)
+endif
+
+
+
+
+### SECTION 4.  RULES FOR LIBRARY FILES
+
+# NOTE: "main" should always be the first target.
+
+.PHONY:	all main mainlinks library $(sibdirs)
+
+# Main target -- this is the first in the file, and hence the default.
+main: $(sibdirs) $(execute) mainlinks
+#	@echo Compilation finished at `date`
+
+all: main dynlib megalib library
+
+# Target to make symlinks to correct executable.
+mainlinks:
+	rm -f $(here)$(exec_suffix)
+	ln -s $(execute)
+	rm -f $(here)-$(OBJDIR)$(exec_suffix)
+	ln -s $(execute) $(here)-$(OBJDIR)$(exec_suffix)
+
+# Target for objdir's executable.
+$(execute): $(siblibs) $(library) $(maincobjs) $(mainccobjs) $(maincppobjs)
+	$(build_executable)
+
+
+# SunOS ln does not let one overwrite an existing link
+# so we need to rm it ourselves
+library: $(sibdirs) $(library)
+	(/bin/rm -f $(notdir $(library)) ; ln -s $(library))
+
+dynlib: $(sibdirs) $(dynlib)
+	@if [ "$(dynlib_ok)" = "1" ]; then \
+		(/bin/rm -f $(notdir $(dynlib)) ; ln -s $(dynlib) .); \
+		if [ "$(cver)" = "win32" ]; then \
+			(/bin/rm -f $(notdir $(library)) ; ln -s $(library) .); \
+		fi \
+	else \
+		echo "Platform not supported for dynlib.  Your platform is:"; \
+		echo "  compc=$(compc)"; \
+		echo "  ostype=$(ostype)"; \
+		echo "  hosttype=$(hosttype)"; \
+		/bin/true; \
+	fi
+
+# We make the libraries for each project, which causes all the object
+# files to be created.
+$(dynlib): $(siblibs) $(library)
+	@if [ "$(dynlib_ok)" = "1" ]; then \
+		cd $(OBJDIR); \
+			$(linkcc) $(dynlib_link_flags) \
+				$(LFLAGS) \
+				-o $(notdir $(dynlib)) \
+				$(foreach sobj,$(sibobjs), ../$(sobj)) \
+				$(notdir $(libcobjs)) \
+				$(notdir $(libccobjs)) \
+				$(notdir $(libcppobjs)) \
+				$(LIBS) $(user_libs); \
+	else \
+		echo "Platform not supported for dynlib.  Your platform is:"; \
+		echo "  compc=$(compc)"; \
+		echo "  ostype=$(ostype)"; \
+		echo "  hosttype=$(hosttype)"; \
+		/bin/true; \
+	fi
+
+
+# Modifed by Paul Komarek, 2003-07-01, to accomodate copying a single
+# static lib from the sources list into the OBJDIR.  No other sources
+# can be present in the project, and there may be only one lib.
+# Library name must start with "lib".
+$(library): $(libcobjs) $(libccobjs) $(libcppobjs) $(cplibs)
+# numsources must be positive.
+	@if [ "$(numsources)" -eq 0 -a "$(nummains)" -eq 0 ]; then \
+		echo "There are no sources to compile or libs to be made."; \
+		exit 1; \
+	fi
+# Check that sources (incl. main) do not include both libs and c files,
+# or multiple libs.
+	@if [ "$(numcplibs)" -gt 0 -a "$(numsources)" -gt 1 ]; then \
+		echo "Error: cannot have source files (not incl. main) and"; \
+		echo "libs {$(cplibs)}, or multiple libs, in same project"; \
+		exit 1; \
+	fi
+# At this point, numcplibs is 1 and numsources > 0.
+# Make library from object files, or symlink library.
+#
+# In the latter case, there might be several versions of the library.
+# The library name is $(cplibs) (though plural, we know by now that
+# there is only one library).  First we look for $(cplibs).$(OBJDIR),
+# then $(cplibs).$(t).  If neither of those is present, we use
+# $(cplibs).  If that isn't present, we give up.
+#
+# Also, we check that readme.license is present for a library project.
+# I wish we could check every time we link, but I'm not sure how.
+# Instead, we check for readme.license only when we "build" the
+# library-project.  If it is not present, we throw an error.  If it is
+# present, we print a notice that we should respect the terms of the
+# license.
+#
+# The symlink we make points to the parent directory, because
+# $(library) includes $OBJDIR.
+#
+# It appears that a minimal sh (as exemplified by FreeBSD's sh)
+# allows 1>&2 redirection.
+#
+	@if [ "$(numcplibs)" -eq 0 ]; then \
+		cd $(OBJDIR) ; 	$(ar_command) $(notdir $(library)) \
+			$(notdir $(libcobjs)) $(notdir $(libccobjs)) \
+			$(notdir $(libcppobjs)) ; \
+            if [ -n "$(post_lib_build)" ]; then \
+				$(post_lib_build) $(notdir $(library)) ; \
+			fi ; \
+	else \
+		d=`basename $$PWD`; \
+		if [ -f "$(cplibs).$(OBJDIR)" ]; then \
+			echo; echo "$$d: Using $(cplibs).$(OBJDIR)"; echo; \
+			rm -f $(library); \
+			ln -s ../$(cplibs).$(OBJDIR) $(library); \
+		elif [ -f "$(cplibs).$(t)" ]; then \
+			echo; echo "$$d: Using $(cplibs).$(t)"; echo; \
+			rm -f $(library); \
+			ln -s ../$(cplibs).$(t) $(library); \
+		elif [ -f "$(cplibs)" ]; then \
+			echo; echo "$$d: Using $(cplibs)"; echo; \
+			rm -f $(library); \
+			ln -sf ../$(cplibs) $(library); \
+		else \
+			echo; \
+			echo -n "ERROR: NO LIBRARY $(cplibs) OR " 1>&2; \
+			echo "DERIVATIVES FOUND IN PROJECT $$d" 1>&2; \
+			echo; \
+			exit 1; \
+		fi; \
+		if [ -f "readme.license" ]; then \
+			echo; \
+			echo -n "PLEASE RESPECT THE TERMS OF " 1>&2; \
+			echo "$$d/readme.license" 1>&2 ; \
+			echo; \
+		else \
+			echo; \
+			echo -n "ERROR: THERE IS NO readme.license " 1>&2; \
+			echo "FILE FOR LIBRARY PROJECT $$d" 1>&2; \
+			echo; \
+			exit 1; \
+		fi; \
+	fi
+
+
+megalib: $(sibdirs) $(megalib)
+	(rm -f $(notdir $(megalib)) ; ln -s $(megalib))
+
+
+# We make the libraries for each project, which causes all the object
+# files to be created.
+$(megalib): $(siblibs) $(library)
+	cd $(OBJDIR); \
+		$(ar_command) $(notdir $(megalib)) \
+			$(notdir $(libcobjs)) $(notdir $(libccobjs)) \
+			$(notdir $(libcppobjs)) \
+			$(foreach sobj,$(sibobjs), ../$(sobj))
+	if [ -n "$(post_lib_build)" ]; then \
+		$(post_lib_build) $(library); \
+	fi
+
+
+preprocess:
+	$(compc) -E -O0 -I.. $(foreach sib,$(recsibs),-I../$(sib)) \
+                      $(arch_include_dirs) $(sources)
+#	@echo Compilation finished at `date`
+
+
+asm:
+	$(compc) -S -O0 -I.. $(foreach sib,$(recsibs),-I../$(sib)) \
+                      $(arch_include_dirs) $(sources)
+#	@echo Compilation finished at `date`
+
+# Put object files in special dir.
+$(libcobjs) $(maincobjs) : $(OBJDIR)/%$(obj_suffix) : %.c $(includes)
+	$(compc) $(CFLAGS) -o $@ -c $<
+
+$(libf77objs) $(mainf77objs): $(OBJDIR)/%$(obj_suffix) : %.f $(includes)
+	$(compf77) $(F77FLAGS) -o $@ -c $<
+
+$(libccobjs) $(mainccobjs): $(OBJDIR)/%$(obj_suffix) : %.cc $(includes)
+	$(compcc) $(CXXFLAGS) -o $@ -c $<
+
+$(libcppobjs) $(maincppobjs): $(OBJDIR)/%$(obj_suffix) : %.cpp $(includes)
+	$(compcc) $(CXXFLAGS) -o $@ -c $<
+
+# we use _dummy_sib_ to avoid an error when a dirlib uses no siblings
+1.PHONY:	_dummy_sib_
+
+# build each sibling in turn (not really recursive)
+# note: this rule is executed once for each sibling
+$(sibdirs) _dummy_sib_ :
+	$(MAKE) -C $@ $(OBJDIR)/$(lib_prefix)$(notdir $@)$(lib_suffix)
+
+
+### SECTION 5.  extra goodies
+
+
+printlines = @/bin/sh -c "for x in $(strip $(1)); do echo \$$x; done"
+
+########################################################################
+# "gmake backup" -- backs up relevant files from the current libdir into
+#                   a compressed archive named  backup/95-09-28.tar.gz
+
+.PHONY:	backup
+
+backup :
+	test -d backup || mkdir backup
+	tar cvf backup/`date +%y-%m-%d`.tar Makefile README NOTES $(sources) $(includes) $(mains) ; gzip -f backup/*.tar
+
+
+########################################################################
+# gmake grep string="find_me" -- searches for the string "find_me" among
+#		this program's source files, including those in sibling dirs
+
+sibs.grep := $(addsuffix .grep,$(recsibs))
+
+.PHONY: grep_here $(sibs.grep) grep
+
+grep_here :
+	@echo '*****' Searching for '"'$(string)'"' in $(here) '*****'
+	@echo '  '  # print blank line
+	@fgrep -i -e '$(string)' Makefile $(includes) $(sources) $(mains) || echo
+	@echo '  '  # print blank line
+
+grep : grep_here $(sibs.grep)
+
+$(sibs.grep) _dummy_grep_sib_ :
+	@cd ../$(basename $@) ; $(MAKE) grep_here
+
+
+########################################################################
+# "gmake zap"	-- removes *$(obj_suffix) files and executable for current lib,
+#                  current arch only
+# "gmake zapsibs"-- removes *$(obj_suffix) and executables for lib & sibling libs,
+#                   current arch only
+
+sibs.zap := $(addsuffix .zap,$(recsibs))
+
+.PHONY:	$(sibs.zap) zap zapsibs _dummy_zap_sib_
+
+zap :
+	rm -f *$(obj_suffix)
+	rm -f $(OBJDIR)/*$(obj_suffix)
+	rm -f *$(lib_suffix)
+	rm -f $(OBJDIR)/*$(lib_suffix)
+	rm -f *$(dynlib_suffix)
+	rm -f $(OBJDIR)/*$(dynlib_suffix)
+	rm -f $(execute)
+	rm -f ./$(here)$(exec_suffix)
+	rm -f ./$(here)-$(OBJDIR)$(exec_suffix)
+
+zapsibs : zap $(sibs.zap)
+
+$(sibs.zap) _dummy_zap_sib_ :
+	cd ../$(basename $@) ; $(MAKE) zap
+
+# Runs zap on every AUTON-looking directory
+zapall :
+	for dir in ../*; \
+	do \
+		if [ -d "$${dir}" -a -r "$${dir}/Makefile" ]; \
+		then \
+			cd $${dir};  \
+			$(MAKE) zap; \
+		fi; \
+	done
+
+########################################################################
+# "gmake clean"	-- removes *$(obj_suffix) files afor current lib, ALL architectures
+# "gmake cleansibs"-- removes *$(obj_suffix) for lib & sibling libs, ALL architectures
+
+sibs.clean = $(addsuffix .clean,$(recsibs))
+
+.PHONY:	$(sibs.clean) clean cleansibs _dummy_clean_sib_
+
+clean : 
+	rm -f *$(obj_suffix)
+	rm -f */*$(obj_suffix)
+	rm -f *$(lib_suffix)
+	rm -f */*$(lib_suffix)
+	rm -f *$(dynlib_suffix)
+	rm -f */*$(dynlib_suffix)
+	rm -f $(execute)
+	rm -f ./$(here)$(exec_suffix)
+	rm -f ./$(here)-$(OBJDIR)$(exec_suffix)
+
+cleansibs : clean $(sibs.clean)
+
+$(sibs.clean) _dummy_clean_sib_ :
+	cd ../$(basename $@) ; $(MAKE) clean
+
+# Runs clean on every AUTON-looking directory
+cleanall :
+	for dir in ../*; \
+	do \
+		if [ -d "$${dir}" -a -r "$${dir}/Makefile" ]; \
+		then \
+			cd $${dir};  \
+			$(MAKE) clean; \
+		fi; \
+	done
+
+########################################################################
+# "gmake TAGS"	-- generate TAGS file for multi-file searches, replaces
+# 					from emacs
+#  We're adding a special regex attempting to cover function prototypes
+#  in .h files
+
+include_dirs := $(foreach sib,$(recsibs),../$(sib))
+include_files := $(includes) $(foreach dir,$(include_dirs),$(wildcard $(dir)/*.h))
+
+TAGS: $(include_files) $(sources) $(private_sources)
+	etags --regex '/[ \t]*[A-Za-z_0-9]+[ \t]+\([A-Za-z_0-9]+\)(/\1/' $(include_files)
+	etags -a $(sources) $(private_sources)
+
+########################################################################
+# "gmake status"	-- checks CVS status
+# 				       
+
+# XXX: doesn't work?
+status :
+	-cvs status 2>&1 | grep '\(Examining\)\|\(Status\)' | fgrep -v Up-to-date
+
+status-all:
+	-cd ../ ; cvs status 2>&1 | grep '\(Examining\)\|\(Status\)' | fgrep -v Up-to-date
+
+########################################################################
+# "gmake params"
+#
+params:
+	@echo "here                      = $(here)"
+	@echo "c                         = $(c)"
+	@echo "compc                     = $(compc)"
+	@echo "compcisgcc                = $(compcisgcc)"
+	@echo "gccver1                   = $(gccver1)"
+	@echo "gccver2                   = $(gccver2)"
+	@echo "gccver3                   = $(gccver3)"
+	@echo "compf77                   = $(compf77)"
+	@echo "compcc                    = $(compcc)"
+	@echo "linkcc                    = $(linkcc)"
+	@echo "type_c_compile_flags      = $(type_c_compile_flags)"
+	@echo "warn_flags                = $(warn_flags)"
+	@echo "type_f77_compile_flags    = $(type_f77_compile_flags)"
+	@echo "f77warn_flags             = $(f77_warn_flags)"
+	@echo "type_cxx_compile_flags    = $(type_cxx_compile_flags)"
+	@echo "cxx_warn_flags            = $(cxx_warn_flags)"
+	@echo "arch_compile_flags        = $(arch_compile_flags)"
+	@echo "user_flags                = $(user_flags)"
+	@echo "user_link_flags           = $(user_link_flags)"
+	@echo "hosttype                  = $(hosttype)"
+	@echo "ostype                    = $(ostype)"
+	@echo "cver                      = $(cver)"
+	@echo "archdir                   = $(archdir)"
+	@echo "numsources                = $(numsources)"
+	@echo "cplibs                    = $(cplibs)"
+	@echo "library                   = $(library)"
+	@echo "post_lib_build            = $(post_lib_build)"
+	@echo "siblings                  = $(recsibs)"
+	@echo "LIBS                      = $(LIBS)"
+	@echo "LFLAGS                    = $(LFLAGS)"
+
+########################################################################
+# "gmake showsources"
+#
+showsources:
+	@echo "mains                     = $(mains)"
+	@echo "maincsources              = $(maincsources)"
+	@echo "mainf77sources            = $(mainf77sources)"
+	@echo "mainccsources             = $(mainccsources)"
+	@echo "maincppsources            = $(maincppsources)"
+	@echo "sources                   = $(sources)"
+	@echo "includes                  = $(includes)"
+	@echo "siblings                  = $(recsibs)"
+	@echo "libcsources               = $(libcsources)"
+	@echo "libf77sources             = $(libf77sources)"
+	@echo "libccsources              = $(libccsources)"
+	@echo "libcppsources             = $(libcppsources)"
+	@echo "cplibs                    = $(cplibs)"
+	@echo "sibf77sources             = $(sibf77sources)"
+	@echo "sibccsources              = $(sibccsources)"
+	@echo "sibcppsources             = $(sibcppsources)"
+	@echo "allf77sources             = $(allf77sources)"
+	@echo "allccsources              = $(allccsources)"
+	@echo "allcppsources             = $(allcppsources)"
+	@echo "siblibs                   = $(siblibs)"
+	@echo "sibobjs			 = $(sibobjs)"
+	@echo "OBJDIR                    = $(OBJDIR)"
+
+
+#######################################################################
+# "gmake grabsiblings"
+#
+grabsiblings:
+	$(call printlines,$(recsibs))
+
+#######################################################################
+# "gmake grabsources"
+#
+grabsources:
+	$(call printlines,$(sources))
+
+#######################################################################
+# "gmake grabincludes"
+#
+grabincludes:
+	$(call printlines,$(includes))
+
+
+
+.PHONY: help
+help:
+	@true
+	$(warning $(usage))
+
+
+
+# Local Variables: ***
+# mode: makefile ***
+# End: ***

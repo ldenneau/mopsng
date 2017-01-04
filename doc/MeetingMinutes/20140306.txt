@@ -1,0 +1,45 @@
+
+Attendees: Bolin, Chastel, Denneau, Schunova, Wainscoat
+
+* Telescope Status
+No report
+
+* IPP Issues
+  - IPP Trail fitting
+  - Photometry
+  - Convolution
+No report
+
+* Data Processing
+  - Values for the different regimes (quad, md, pairs)
+SC: Prepare flow-chart for what’s processed for next meeting.
+
+  - MOPS Hardware
+We have the HW. SC is installing it. 
+
+  - IPP Stamps
+Being tested atm.
+
+* NEO Status
+No report
+
+* NEO Czaring
+Image qualities have been poor.
+
+* Comets
+No report
+
+* ATLAS
+First batch of observations submitted to MPC.
+
+* AOB
+  - Real-Time Processing
+BB: Process by footprints? Processing of fast movers across the whole chunk?
+SC: 
+RJW: We don’t really care about the very fast movers.
+
+  - neohq2 is full. Please clean your home directory
+ 
+  - 
+
+

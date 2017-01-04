@@ -1,0 +1,448 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+syntheph_worker - Worker program to generate synthetic SSM detections for a given field
+
+=head1 SYNOPSIS
+
+syntheph_worker FIELDPROXIMITY_OUTPUT
+
+  FIELDPROXIMITY_OUTPUT : (field_id, object_name) pairs from fieldProximity
+
+=head1 DESCRIPTION
+
+Given an input file containing coarse field ID-synthetic object ID
+associations, compute exact positions for the objects associated 
+with each field, and if the object is "in the field", emit a
+line that can be used by a master process to generate a complete
+MOPS synthetic detection for the field.
+
+"In the field" is messy; for PS1/PS4 there will be an IPP routine
+to report whether an (EPOCH, RA, DEC) triplet lies within a field.
+For early testing we will just use a square that gives us the nominal
+PS field of view of 7 square degrees.
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use Data::Dumper;
+use Astro::Time;
+use Astro::SLA;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::JPLEPH;
+use PS::MOPS::Config;
+
+
+# Global declarations.
+use subs qw(
+    do_field
+    emit_detection
+);
+
+# Options.
+my $inst;
+my $instance_name;
+my $outfile;
+my $debug;
+my $help;
+my $hide_diva = 1;
+
+
+# Field status management.
+my $START_FIELD_STATUS = $FIELD_STATUS_NEW;
+my $END_FIELD_STATUS = $FIELD_STATUS_SYNTH;
+
+
+
+# Start program here.
+GetOptions(
+    'instance=s' => \$instance_name,
+    'outfile=s' => \$outfile,
+#    hide_diva => \$hide_diva,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+pod2usage(2) unless @ARGV;              # no files specified
+pod2usage(-msg => '--outfile is required') unless $outfile;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $filename = shift;                   
+
+#---------------
+# Configuration.
+#---------------
+my $field_size_deg2 = $mops_config->{site}->{field_size_deg2} or die("couldn't get field_size_deg2");
+my $field_shape = $mops_config->{site}->{field_shape} || 'circle';
+
+my $add_astrometric_error = $mops_config->{synth}->{add_astrometric_error};
+die("couldn't get add_astrometric_error") unless defined($add_astrometric_error);
+my $no_trailing_info = $mops_config->{synth}->{no_trailing_info} || 0;
+
+my $add_shape_mag = $mops_config->{synth}->{add_shape_mag};
+die("couldn't get add_shape_mag") unless defined($add_shape_mag);
+
+my $astrometric_error_deg = $mops_config->{site}->{astrometric_error_arcseconds} or
+    die("couldn't get astrometric_error_arcseconds");
+$astrometric_error_deg /= 3600; # convert arcseconds to deg
+
+# fwhm_arcseconds config value no longer used as value is now retrieved from IPP
+#my $fwhm_arcsec = $mops_config->{site}->{fwhm_arcseconds} or
+#    die("couldn't get fwhm_arcseconds");
+
+my $diff_mag = $mops_config->{site}->{diff_mag} || 0;   
+my $lim_mag = $mops_config->{site}->{limiting_mag} or 
+    die("couldn't get limiting_mag");
+
+# Filter conversions.
+my $v2filt = $mops_config->{site}->{v2filt} || undef;
+
+my $limiting_s2n = $mops_config->{site}->{limiting_s2n};
+die("couldn't get limiting_s2n") unless defined($limiting_s2n);
+
+my $low_confidence_s2n = $mops_config->{site}->{low_confidence_s2n} || $limiting_s2n;
+
+my $s2n_config = $mops_config->{site}->{s2n_config};
+die("couldn't get s2n_config") unless defined($s2n_config);
+
+# Some debugging options.
+my $blind = $mops_config->{debug}->{blind};     # strip objectname from detections; run blind
+
+# Disable JPL DIVA noise.
+my $dummy = *SAVESTDOUT;               # prevent Perl warning
+if ($hide_diva) {
+    open SAVESTDOUT, '>&STDOUT';        # hackery to redirect DIVA STDOUT to /dev/null
+    open STDOUT, ">/dev/null";
+}
+
+
+# Greeting.
+my $exposure_time_s;
+my $total_num_computed = 0;
+my $t0 = time();
+
+
+# Let's start.
+##$inst->pushAutocommit(0); # disable DC autocommit
+my %fieldtbl;       # hash table of fields
+
+
+# Input files contain FieldProximity output:(fieldId, objectName) tuples.
+my $fh = new FileHandle;        # filehandle
+open $fh, $filename or warn "can't open $filename";
+my @lines = grep !/^#/, <$fh>;  # remove comments embedded in file
+chomp @lines;                   # remove new lines`
+close $fh;
+
+# Group lines by field.  We'll pass a hash keyed by field ID
+# to another routine to do the heavy lifting.
+my $fieldId : shared;
+my $line;           # complete line
+my $objectName;
+my ($fieldLno, $orbLno);
+foreach $line (@lines) {
+    ($fieldId, $objectName) = split /\s+/, $line;
+    if (!exists($fieldtbl{$fieldId})) {
+        $fieldtbl{$fieldId} = [ $objectName ];       # create list for this field
+    }
+    else {
+        push @{$fieldtbl{$fieldId}}, $objectName;    # add this orbit to this field
+    }
+}
+
+my $outfh = new FileHandle ">$outfile" or die "can't open $outfile: $!";
+$outfh->print("# FIELD_ID $fieldId\n");         # cheating
+foreach my $fieldId (keys %fieldtbl) {
+    do_field($outfh, $fieldId);
+}
+$outfh->close();
+
+
+# Restore STDOUT if we've been hiding it.
+if ($hide_diva) {
+    open STDOUT, '>&SAVESTDOUT';
+}
+
+exit();
+
+
+sub do_field {
+    my ($outfh, $fieldId) = @_;
+    my $objects = $fieldtbl{$fieldId};
+    
+    # For each orbit provided, calculate precise ephemerides at the epoch
+    # of the field.  If the object lies within the field, keep it.
+    # After checking all orbits, generate synthetic detections for
+    # kept ones and insert into MOPSDC.
+    my @keep_orbs;
+    my $pos;
+    my $orb;
+    my $dist;
+    my $field;
+    my $limiting_mag;
+    my ($fc_ra_deg, $fc_dec_deg);   # field center RA, DEC
+    my $fov_size_deg;
+
+    # Batch all objects to ephem calc.
+    $field = modcf_retrieve($inst, fieldId => $fieldId);
+    if(!$field) {
+        die "can't retrieve field $fieldId\n";
+    }
+    my $s = $field->status;
+
+    # DE10 (de->[9]) is pixel scale. Default to 0.25 if not provided.
+    my $pixel_scale = $field->de->[9] || $mops_config->{site}->{pixel_scale} || 0.25;
+    $pixel_scale = abs($pixel_scale);   # can be < 0 for flipped array
+
+    # Skip field if synthetics have already been inserted into it.
+    if ($s ne $START_FIELD_STATUS) {
+        printf STDERR "Field %s has status %s, skipping.\n", $field->fieldId, $field->status;
+        return;
+    }
+
+    $limiting_mag = $field->limitingMag || $lim_mag;
+    $fc_ra_deg = $field->ra;
+    $fc_dec_deg = $field->dec;
+    if ($field_shape eq 'circle') {
+        $fov_size_deg = 2 * sqrt($field_size_deg2 / $PI);  # width of field
+    }
+    else {
+        $fov_size_deg = sqrt($field_size_deg2);            # width of field
+    }
+    $exposure_time_s = ($field->timeStop - $field->timeStart) * 86400;  # get from field now
+
+    my $results;
+    if ($objects) {
+        # Calculate JPL ephemerides.  Note that the magnitudes reported by JPL are V-band, so we
+        # need to convert to the filter we're observing in.  
+        my @args = (
+            instance => $inst,
+            objectNames => $objects, 
+            epoch => $field->epoch,
+            obscode => $field->obscode,
+            trails => 1,                # include trailed detection info
+            exposureTime_sec => $exposure_time_s,
+            user => 'mops',
+        );
+
+        $results = jpleph_calcEphemerides(@args);
+        $total_num_computed += scalar @{$objects};
+
+        # Now loop through the results and keep close ones.
+        foreach my $key (keys %{$results}) {
+            $pos = ${$results}{$key};
+            if (!$pos || !$pos->{mag}) {
+                warn(sprintf "Got empty result for $key: %s\n", $pos->{epoch});
+            }
+            elsif ($field_shape eq 'circle') {
+                if (mopslib_inField($fc_ra_deg, $fc_dec_deg, $fov_size_deg, $pos->{ra}, $pos->{dec})) {
+                    push @keep_orbs, $pos;
+                }
+            }
+            else {
+                if (mopslib_inSquareField($fc_ra_deg, $fc_dec_deg, $fov_size_deg, $pos->{ra}, $pos->{dec})) {
+                    push @keep_orbs, $pos;
+                }
+            }
+        }
+    }
+       
+    # Now loop through good ones.
+    my $det;
+    my $bias_arcsec = $astrometric_error_deg * 3600;        # biased/baseline astrometric error
+    my $use;                                                # true unless det fails limiting_mag
+    my @dets_to_insert;
+    foreach $pos (@keep_orbs) {
+        # Add astrometric error HERE.
+        my $stuff;      # result of fuzzRDM
+        $use = 1;
+
+
+        # Twiddle MOPS control object.
+        mopslib_mutateControlObject($pos);
+
+        my $filter = lc($field->filter);
+        
+        if ($add_astrometric_error) {
+            # When getting the zero point from the config file we need to take 
+            # into account the length of time that the camera shutter was open 
+            # as the zero point is given for a 1 second exposure.
+            # DE3 (de->[2]) is the zero point
+            my $zero_point = $field->de->[2] || 
+                ($s2n_config->{$filter}->{M1} + 2.5 * log10($exposure_time_s)) || 
+                die ("Could not determine zero point. Please provide a value for M1 in the config or turn off add_astrometric_error");
+            
+            # Determine sky background. DE5 (de->[4] is the avg sky background count.
+            # The sky background is given as a magnitude per square arcsecond in
+            # the configuration file. This value needs to be converted to a count
+            # per pixel before it can be used to calculate the S/N for a 
+            # synthetic detection.
+            my $sky;
+            if ($field->de->[4] > 0) {    
+                $sky = $field->de->[4];
+            } elsif (defined($s2n_config->{$filter}->{MU})) { 
+                $sky = 10 ** (0.4 * ($zero_point - $s2n_config->{$filter}->{MU})) * ($pixel_scale ** 2)
+            } else {
+                die ("Could not determine sky background. Please provide a value for MU in the config or turn off add_astrometric_error");
+            }
+            
+            # When getting fwhm from config file convert it from arcseconds to 
+            # pixels by dividing by the given pixel scale. 
+            # DE1 (de->[0]) is the seeing
+            my $seeing = $field->de->[0] || 
+                ($mops_config->{site}->{fwhm_arcseconds} / $pixel_scale) ||
+                die ("Could not determine fwhm. Please provide via config or turn off add_astrometric_error");
+            
+            # DE6 (de->[5] is the scale factor to use when calculating S2N. 
+            # If it is not specify set it to a default value of 1.
+            my $scale_factor = $field->de->[5] || $s2n_config->{$filter}->{s2n_scale_factor} || 1;
+
+            # Add astrometric error ("fuzz" the detection).
+            $stuff = mopslib_fuzzRDM5(
+                ra => $pos->{ra}, 
+                dec => $pos->{dec}, 
+                # Convert visual magnitude of synthetic to a filter magnitude 
+                # that corresponds with the filter used.
+                mag => mopslib_V2filt($pos->{mag}, $filter, $v2filt), 
+                bias => $bias_arcsec, 
+                seeing => $seeing,      
+                pixel_scale => $pixel_scale,
+                zero_point => $zero_point,  
+                sky => $sky,         
+                scale_factor => $scale_factor,
+            );
+
+            my ($new_ra, $new_dec, $new_mag, $s2n) = @{$stuff}{qw(RA_DEG DEC_DEG MAG S2N)};
+
+            if ($s2n < $low_confidence_s2n) {
+                # Signal to noise is below the low confidence limit, do not use
+                # the synthetic detection.
+                $use = 0;
+            }
+            else {
+                # Update synthetic detection with the fuzzed ra, dec, and magnitude
+                $pos->{ra} = $new_ra;
+                $pos->{dec} = $new_dec;
+                $pos->{mag} = $new_mag;
+            }
+        }
+        else {
+            # Dont fuzz the syntetic detection.
+            if ($pos->{mag} > $limiting_mag) {
+                $use = 0;   # can't use it; beyond limiting mag
+            }
+            else {
+                # Convert the V magnitude used by JPL to the appropriate filter.
+                $pos->{mag} = mopslib_V2filt($pos->{mag}, $filter, $v2filt);
+                # Make up a S/N so we don't confuse other code (orbit determinators).
+                $stuff->{RA_SIGMA_DEG} = 0.00000001;
+                $stuff->{DEC_SIGMA_DEG} = 0.00000001;
+                $stuff->{MAG_SIGMA} = 0.00000001;
+                $stuff->{S2N} = (5.0 + rand() / 10);        # just some random value above our detection S/N
+            }
+        }
+
+        if ($use) {
+            # Synthetic detection can be used. Add it to the MOPS database.
+            my @args = (
+                ra => $pos->{ra},
+                dec => $pos->{dec},
+                epoch => $pos->{epoch},
+                mag => $pos->{mag},
+                refMag => $pos->{refMag},
+                filter => $field->filter,
+                s2n => $stuff->{S2N},
+                orient_deg => $no_trailing_info ? 0 : $pos->{orient_deg},
+                length_deg => $no_trailing_info ? -1 : $pos->{length_deg},
+                raSigma => $stuff->{RA_SIGMA_DEG},
+                decSigma => $stuff->{DEC_SIGMA_DEG},
+                magSigma => $stuff->{MAG_SIGMA},
+                obscode => $field->obscode,
+                fieldId => $field->fieldId,
+            );
+            
+            if (!($blind || $pos->{objectName} =~ /^B/)) {
+                # Flag detection as synthetic and include the synthetic name
+                # in the detection.
+                push @args, 
+                    objectName => $pos->{objectName},
+                    isSynthetic => 1;
+            }
+            else {
+                # Mark the detection as being real.
+                push @args, 
+                    isSynthetic => 0;
+            }
+
+            # Create a new detection and add it to the list of detections to be 
+            # inserted into the database.
+            $det = PS::MOPS::DC::Detection->new(
+                $inst,
+                @args
+            );
+            push @dets_to_insert, $det;
+        }
+    }
+    
+
+    # Emit detection stuff here.
+    my $det_num = 1;            # file-local det ID
+    foreach $det (@dets_to_insert) {
+        $det->detId($det_num);
+        emit_detection($outfh, $det);
+        $det_num++;
+    }
+}
+
+
+sub _chkundef {
+    my $val = $_[0];
+    if (!defined($val)) {
+        return 'undef';
+    }
+    else {
+        return $val;
+    }
+}
+
+
+sub emit_detection {
+    my ($fh, $det) = @_;
+    # RA DEC EPOCH MAG REF_MAG FILTER_ID IS_SYNTHETIC
+    # DET_NUM STATUS S2N RA_SIGMA DEC_SIGMA MAG_SIGMA 
+    # ORIENT LENGTH OBJECT_NAME FIELD_ID OBSCODE
+    my $str = join(' ',
+        'MIF-SYNTH',
+        $det->detId,
+        $det->ra,
+        $det->dec,
+        $det->epoch,
+        $det->mag,
+        _chkundef($det->refMag),
+        $det->filter,
+        $det->isSynthetic,
+        _chkundef($det->detNum),
+        $det->status,
+        $det->s2n,
+        $det->raSigma,
+        $det->decSigma,
+        $det->magSigma,
+        $det->orient_deg,
+        $det->length_deg,
+        ($det->objectName || 'NS'),
+        $det->fieldId,
+        $det->obscode,
+    );
+    $outfh->print($str, "\n");
+}

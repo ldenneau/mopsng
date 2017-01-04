@@ -1,0 +1,128 @@
+#!/usr/bin/env perl
+
+# Quickie to take LinkTracklets summary file, which contains track
+# IDs and line numbers from source tracklets file, and generates
+# a MITI or MIF tracklets file.
+
+use strict;
+use warnings;
+
+use Pod::Usage;
+use Getopt::Long;
+use FileHandle;
+
+use PS::MOPS::MITI;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Tracklet;
+
+
+use subs qw(
+    _out
+);
+
+my $inst;
+my $instance_name;
+my $dxoids;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'dxoids' => \$dxoids,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+
+my $sum_fh = new FileHandle(shift or "-");
+
+# Loop through lines in the summary file until we've read
+# an entire track.  Then fetch each of the detections for
+# the track and write out a detracklet using the link ID
+# as the det ID.  We'll pass this on for orbit determination.
+# Write out the detracklet as MIF-D, DX-D or MOBS.
+
+my ($track_id, $tracklet_id, $line_no);
+my $line;
+my @stuff;              # accumulated stuff for this track.
+my %trk_tracklet_ids;   # tracklet IDs making up current track
+my $last_track_id = '';
+
+while (defined($line = <$sum_fh>)) {
+    chomp $line;
+    ($track_id, $tracklet_id, $line_no) = split /\s+/, $line, 3;
+
+    if ($last_track_id and ($track_id ne $last_track_id)) {
+        _out($track_id, keys %trk_tracklet_ids);
+        %trk_tracklet_ids = ();
+    }
+    else {
+        $trk_tracklet_ids{$tracklet_id} = 1;
+    }
+    $last_track_id = $track_id;
+}
+_out($track_id, keys %trk_tracklet_ids);
+exit;
+
+
+sub _out {
+    my ($track_id, @tracklet_ids) = @_;
+    foreach my $tid (@tracklet_ids) {
+        my $trk = modct_retrieve($inst, trackletId => $tid);    # fetches detections
+        my $oid;
+
+        if ($dxoids) {
+            $oid = join '-', sort { $a <=> $b } @tracklet_ids;
+        }
+        else {
+            $oid = $track_id;
+        }
+
+        foreach my $d (@{$trk->detections}) {
+            $d->detId($oid);       # hijack detId for track listing
+            print $d->serialize(), "\n";
+        }
+    }
+}
+
+=head1 NAME
+
+lt2mif - Program to convert LinkTracklets track output to MOPS MIF-D format.
+
+=head1 SYNOPSIS
+
+lt2mif [options] < tracks.sum
+
+  --dxoids : create DX OIDs by concatenating tracklet IDs
+
+=head1 DESCRIPTION
+
+lt2mif takes LinkTracklets output of the form
+
+track_id tracklet_id line_no
+track_id tracklet_id line_no
+track_id tracklet_id line_no
+etc.
+
+for example,
+
+000000 14             43
+000000 14             44
+000000 14             45
+000000 14             46
+000000 165           131
+000000 165           132
+000000 273             7
+000000 273             8
+000001 85             37
+000001 85             38
+000001 182           115
+000001 182           116
+000001 216             4
+000001 216             5
+000001 216             6
+
+Each line contains a unique track_id, tracklet_id, detetion_id tuple.  The output
+of lt2mif is a list of detections aggregated by track_id that can be submitted
+to initial orbit determination.
+
+=cut
+

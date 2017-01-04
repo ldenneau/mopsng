@@ -1,0 +1,182 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Pod::Usage;
+use Getopt::Long;
+use FileHandle;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::JPLEPH;
+use File::Temp qw(tempfile);
+
+
+my $epoch_mjd;
+my $tempdir;
+my $outfile;
+my $format = 'MITI';
+my $debug;
+my $help;
+GetOptions(
+    'epoch_mjd=f' => \$epoch_mjd,
+    'tempdir=s' => \$tempdir,
+    'outfile=s' => \$outfile,
+    'format=s' => \$format,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-message => "EPOCH_MJD is required.\n") unless $epoch_mjd;
+
+
+sub _out_orb {
+    # Construct a MITI-format string for an orbit.
+    my ($orb, $fmt) = @_;
+
+    if ($fmt eq 'DES') {
+        return join(" ", 
+            $orb->{objectName} || 'FOO',
+            'COM',
+            sprintf("%-.12f", $orb->{q}),
+            sprintf("%-.12f", $orb->{e}),
+            sprintf("%-.12f", $orb->{i}),
+            sprintf("%-.12f", $orb->{node}),
+            sprintf("%-.12f", $orb->{argPeri}),
+            sprintf("%-.12f", $orb->{timePeri}),
+            sprintf("%-.12f", $orb->{hV}),
+            sprintf("%-.12f", $orb->{epoch}),
+            1, 6, -1, 'MOPS'
+        ), "\n";
+    }
+    elsif ($fmt eq 'MIF-O') {
+        return join(" ",
+            'MIF-O',
+            $orb->{objectName} || 'FOO',
+            sprintf("%-.12f", $orb->{q}),
+            sprintf("%-.12f", $orb->{e}),
+            sprintf("%-.12f", $orb->{i}),
+            sprintf("%-.12f", $orb->{node}),
+            sprintf("%-.12f", $orb->{argPeri}),
+            sprintf("%-.12f", $orb->{timePeri}),
+            sprintf("%-.12f", $orb->{epoch}),
+            sprintf("%-.12f", $orb->{hV}),
+            'undef',    # resid
+            'undef',    # MOID1
+            'undef',    # MOID2
+            'S',        # conv code
+        ), "\n";
+    }
+    else {
+        return join(" ", 
+            sprintf("%-.12f", $orb->{q}),
+            sprintf("%-.12f", $orb->{e}),
+            sprintf("%-.12f", $orb->{i}),
+            sprintf("%-.12f", $orb->{node}),
+            sprintf("%-.12f", $orb->{argPeri}),
+            sprintf("%-.12f", $orb->{timePeri}),
+            sprintf("%-.12f", $orb->{hV}),
+            sprintf("%-.12f", $orb->{epoch}),
+            $orb->{objectName} || 'FOO',
+        ), "\n";
+    }
+}
+
+
+my $dummy = *SAVESTDOUT;            # prevent main::SAVEDSTDOUT usage warning
+open SAVESTDOUT, ">&STDOUT";        # save current file descriptor
+open STDOUT, ">/dev/null";         # hide JPL DIVA noise
+#close STDOUT;                       # now close STDOUT to hide DIVA noise
+
+my @stuff;
+my $orb;
+my $res;
+my $stdout;
+my ($fh, $filename);
+if ($tempdir) {
+    ($fh, $filename) = tempfile(UNLINK => 1, DIR => $tempdir);
+}
+else {
+    ($fh, $filename) = tempfile(UNLINK => 1);        # UNLINK => 1 for auto-deletion
+}
+
+# While propagating orbits, write our result to a temp file, then restore
+# STDOUT and copy the temp file to STDOUT.
+while(<>) {
+    next if /^#/;       # comment, skip
+
+    if (/^!!/) {
+        # Looks like DES header, so set $format.
+        $format = 'DES';
+        next;
+    }
+    elsif (/^!/) {
+        next;           # comment line, skip
+    }
+    elsif ($format eq 'DES') {
+        # ($objectName, $dummy, $q, $e, $i, $node, $argPeri, $timePeri, $hV, $epoch) = split;
+        @{$orb}{qw(objectName dummy q e i node argPeri timePeri hV epoch)} = split;
+    }
+    else {
+        # MITI
+        @{$orb}{qw(q e i node argPeri timePeri hV epoch objectName)} = split;
+    }
+
+    print STDERR "Object Name: " . $orb->{objectName}, "\n" if $debug;
+    $res = jpleph_propagateElements(
+        orbit => $orb,
+        epoch_mjd => $epoch_mjd,
+    );
+    if (defined $res) {
+        print $fh _out_orb($res, $format);
+    } else {
+        print STDERR "Failed to propagate " . $orb->{objectName} . "\n";
+    }
+    
+}
+close $fh;
+
+if ($outfile) {
+    # Just mv tmp file to outfile and we're done.
+    system("/bin/mv $filename $outfile");
+}
+else {
+    $fh = new FileHandle $filename;
+    open STDOUT, '>&SAVESTDOUT';        # restore STDOUT
+    while (<$fh>) {
+        print $_;
+    }
+    close $fh;
+}
+exit;
+
+
+=head1 NAME
+
+propagateOrbits - Propagate a set of orbits from epoch to another using JPL ephemerides
+
+=head1 SYNOPSIS
+
+propagateOrbits [options] < ssm.orbit > ssm.orbit.newepoch
+
+  --epoch_mjd=EPOCH_MJD : required, epoch to propagate to, in MJD
+  --tempdir=DIR : use DIR as tempdir, otherwise system temp dir (for large catalogs)
+  --outfile=FILE : write output to FILE, not STDOUT
+  --debug : write some extra debugging info
+  --help : show manpage
+
+=head1 DESCRIPTION
+
+Propagate a catalog of orbits from one epoch to another.  This is done by converting
+the orbit to Cartesian elements, propagating to the specified epoch, then converting
+back to cometary elements.  The new elements are written to STDOUT in MOPS MITI format.
+
+=head1 BUGS
+
+We should use Andrea Milani's DX orbit format, but we aren't yet.
+
+The JPL code used by propagateOrbits will fail with the message "Stopped in MESS"
+when attempting in integrate a large object that is a perturber such as Ceres.
+
+=cut
+

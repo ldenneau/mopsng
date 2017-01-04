@@ -1,0 +1,47 @@
+Attendees: Wainscoat, Micheli, Denneau, Veres, Chastel (chair/scribe),
+
+* Telescope Status (KC)
+-> flaky cells in upper left corner of the camera since Sept. 1st: mostly fixed
+-> shutter concerns: fixed
+-> TDI: 1/2 night tonight
+-> IPP: hardware concerns (2 mobo burned)
+-> PSPS: moved from MHPCC to Manoa. Interruption during a week.
+-> Expect downtime a couple of days in January
+
+IPP Issues:
+  - Trail fitting (SC)
+-> IPP is working on it
+  - Photometry (PV)
+-> PV: Differences between smf and values provided by AF.
+  - Convolution (SC)
+No report
+
+* Data Processing (SC)
+-> No change
+-> digest2 isntalled on NEO cluster
+-> working on fast movers
+
+* NEO Status (RW)
+-> Plagued by bad weather; telescope issues: Nothing interesting to report
+
+* NEO Czaring
+No report
+
+* Comets (RW)
+-> Karen Meech got some discretionary time on Gemini for ISON.
+-> Unknown comets page: need all stamps
+
+* ATLAS (LD)
+-> Pipeline: there should be a direct connection between MOPS and IPP for stamps: Means there should be pixel coordinates as well as chip info on the MOPS side.
+
+* AOB
+  - New postage stamp form available on PSPS
+-> SC made a demo
+
+  - mops11
+-> We won't replace the PSU
+
+  - Pairs for OSS
+-> RW: get rid
+-> RW: loosen up gcr
+

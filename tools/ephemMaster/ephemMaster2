@@ -1,0 +1,139 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use File::Slurp;
+use Getopt::Long;
+use Pod::Usage;
+
+
+# Globals
+my $SSH = 'ssh -q -n -x';
+my $SCP = 'scp -q';
+my $REMOTE_GENEPHEM = "MOPS/bin/genEphem";    # genEphem exe on remote host
+
+# Options.
+my $EPOCH;          # ephemeris epoch
+my $sleep = 10;     # sleep time in seconds, default 10
+my $outfile;
+my $help;
+my $verbose;
+my $debug;
+GetOptions(
+    'out=s' => \$outfile,
+    'epoch=f' => \$EPOCH,
+    'sleep=f' => \$sleep,
+    verbose => \$verbose,
+    help => \$help,
+    debug => \$debug,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my @node_files = @ARGV;
+if (!@node_files) {     # not specified yet
+    @node_files = <>;   # get from STDIN
+    chomp @node_files;  # clean up line endings
+}
+pod2usage(2) unless @node_files;
+
+
+sub _dispatch {
+    my ($N, $E) = @_;       # node, epoch
+
+    my $cmd = join ' ', 
+        qq{($SCP objects.$N $N:/tmp/mopsO$$; },   # copy to remote node
+        qq{($SSH $N },            # ssh remote host
+        qq{"$REMOTE_GENEPHEM $E /tmp/mopsE$$ < /tmp/mopsO$$ > /dev/null;},  # genEphem to tmp file
+        qq{cat /tmp/mopsE$$; rm /tmp/mopsE$$ /tmp/mopsO$$") > },                              # cat remote file, rm it
+        qq{ephem.$N.$E.tmp;},        # local tmp file to hold output
+        qq{mv ephem.$N.$E.tmp ephem.$N.$E) &};    # mv it when done, bkgnd it
+
+    system($cmd) == 0 or die "ephem cmd failed: $cmd";
+}
+
+
+my @nodes;                              # node hostnames, from filenames
+my $cmd;
+my $NODE;
+
+
+# Get nodes from filenames by extracting suffix.
+@nodes = 
+    grep { $_ }                         # discard undefs from map{}
+    map { /\.(\w+?)$/ ? $1 : undef }     # return file extension or undef
+    @node_files;
+
+printf STDERR "Dispatching to %d nodes.\n", scalar @nodes if $verbose;
+
+foreach $NODE (@nodes) {
+    _dispatch($NODE, $EPOCH);
+}
+
+# Now wait for jobs to finish.  Scan for all tmp files to be
+# moved to final state.
+print STDERR "Waiting...\n";
+while (1) {
+    sleep $sleep;
+
+    # Scan directory
+    my %found;
+    opendir DIR, "." or die "can't read current directory";
+    $found{$_} = 1 foreach readdir DIR;  # note all found files in this dir
+    closedir DIR;
+
+    # Now check that all nodes have completed -- that their $EPOCH.$NODE files exist. 
+    my $found_bad = 0;      # set if a node's output file doesn't exist yet
+    foreach my $n (@nodes) {
+        if (!exists($found{"ephem.$n.$EPOCH"})) {   # output file exists?
+            $found_bad = 1; # note it
+            last;   # abort foreach()               # exit foreach()
+        }
+    }
+
+    last unless $found_bad; # exit while 
+}
+
+# Concatenate all the node files into a single file.
+$outfile ||= "$EPOCH.eph";  # default outfile name
+print STDERR "Building output file $outfile.\n";
+my $all_nodes = join " ", map { "ephem.$_.$EPOCH" } @nodes;
+system "/bin/cat $all_nodes > $outfile";
+unlink "ephem.$_.$EPOCH" foreach @nodes;    # remove node output files
+
+
+=head1 NAME
+
+ephemMaster2
+
+=SYNOPSIS
+
+ephemMaster2 --epoch EPOCH [--sleep TIME] nodefile1 nodefile2 ...
+
+  --epoch EPOCH : EPOCH of ephemeris calculation
+  --sleep TIME : set sleep duration, in seconds
+  nodefile1 nodefile2 ... : nsplitted files containing orbit definitions
+
+=head1 DESCRIPTION
+
+ephemMaster2 performs distributed bulk ephemeris calculation, usually
+for MOPS corse ephemeris generation.  A master orbit definition file
+is split into orbit files for each node, usually using nsplit, and an
+ephemeris epoch is specified.  ephemMaster2 submits genEphem jobs to
+nodes whose hostnames are suffixes of the nodefiles and waits for the
+submitted jobs to complete.  The output from each node are then collected
+into a single output file.
+
+The distributed jobs are sent via ssh.  Input and output data are
+specified using STDIN/STDOUT.  Note that genEphem cannot write directly to
+STDOUT, so a tmp file is written, catted to remote STDOUT, then deleted.
+
+The background job saves the output to a tmp file, then renames the tmp
+file to a well-known name.  The master process periodically checks for
+the existence of all well-known output files, and when they are all
+present, it concludes that the background jobs are completed.
+
+The nodefile arguments are optional; if not present, nodefile names are
+read from STDIN.
+
+=cut

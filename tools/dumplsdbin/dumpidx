@@ -1,0 +1,59 @@
+#! /usr/bin/env perl
+
+=head1 NAME
+
+dumpidx - Dump contents of LSD binary index
+
+=head1 SYNOPSIS
+
+dumpidx FILENAME
+
+=head1 DESCRIPTION
+
+This program dumps the contents of a low-significance detection (LSD)
+archive file to STDOUT.
+
+=cut
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use PS::MOPS::LSD;
+
+my $help;
+GetOptions(
+    help => \$help,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+pod2usage(-msg => 'no file specified') unless @ARGV;
+
+
+foreach my $filename (@ARGV) {
+    my $fh = new FileHandle $filename;
+    my $buf;
+    my $num_read;
+    my $size = 8;
+    my @stuff;
+    my $pos;
+    my $last_pos = -1;
+    my $slice;
+
+    $fh->read($buf, 4);
+    my $num_slices = (unpack('i', $buf))[0];
+    print $num_slices, " slices.\n";
+
+    $slice = 0;
+    while (($num_read = $fh->read($buf, $size)) > 0) {
+        die "partial data read from file $filename" if $num_read != $size;
+        $pos = (unpack('q', $buf))[0];
+        if ($pos != $last_pos) {
+            print $slice, ' ', $pos, "\n";
+        }
+        $last_pos = $pos;
+        $slice++;
+    }
+    $fh->close();
+}

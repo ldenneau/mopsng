@@ -1,0 +1,12 @@
+
+2003 August 26
+Robert Jedicke
+
+The file fakeneos.h25 contains 268896 simulated NEO orbits according to the Bottke et al.
+model.  The columns are:
+
+Number/id a e i ascendingNode ArgumentOfPerihelion MeanAnomaly H MOID P_Opik
+
+but the three angular elements are merely distributed randomly in the range [0,360).
+
+

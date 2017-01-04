@@ -1,0 +1,309 @@
+#!/usr/bin/env perl
+# $Id$
+
+use strict;
+
+use Pod::Usage;
+use Getopt::Long;
+use File::Slurp;
+use Astro::Time;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::MITI;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+
+
+=head1 NAME
+
+insertCADCFields - Program to insert CADC detection catalogs
+
+=head1 SYNOPSIS
+
+insertCADCFields [FILES]
+  --help : show man page
+
+=cut
+
+
+# Globals.
+use subs qw(
+    get_headers
+    process_cadc_catalog
+    det_parse
+);
+my @default_de = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+my $_ln10 = log(10);        # ln(10)
+
+# Options.
+my $inst;
+my $instance_name;
+my $limiting_mag = 21.5; # from http://spacewatch.lpl.arizona.edu/09meter.html
+my $max_dets = 20000;
+my $help = 0;
+my $debug = 0;
+my $DEFAULT_S2N = 5;
+
+# Start program here.
+GetOptions(
+    'instance=s' => \$instance_name,
+    'limiting_mag=f' => \$limiting_mag,
+    'max_dets=n' => \$max_dets,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(2) if !@ARGV;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+
+# Config stuff.
+my $obscode = $mops_config->{site}->{obscode} or die "obscode not in configuration";
+print STDERR "Using observatory code $obscode.\n";
+
+foreach my $filename (@ARGV) {
+    process_cadc_catalog($filename);
+}
+
+exit;
+
+
+sub process_cadc_catalog {
+    my ($filename) = @_;      # input CADC filename
+    my $line;
+
+    my @all_lines = read_file($filename);
+    my @comment_lines = grep { /^#/ } @all_lines;
+    my @dets = 
+        grep { %{$_} }                          # got non-empty has back
+        map { det_parse($_) }                   # line => HASHREF
+        grep { !/^#/ }                          # not a comment
+        @all_lines;
+
+
+    # Get list of detection hash descriptions.
+    my %headers = get_headers(@comment_lines);
+    print STDERR "Headers: \n" . join("\n", map {"$_ => $headers{$_}"} sort keys %headers). "\n";
+    my $lm = 24.0;
+
+    if (@dets == 0) {
+        print STDERR "No detections.\n";
+        return;
+    }
+
+
+    # Insert into DB.
+    my $id;
+    my $field;
+    my $fpa_id;
+
+    if ($filename =~ /FIELD_(\d+\.\d+)/) {
+        $fpa_id = $1;
+    }
+    else {
+        $fpa_id = $headers{EPOCH_MJD};
+    }
+
+    $field = PS::MOPS::DC::Field->new(
+        $inst,
+        epoch => $headers{EPOCH_MJD},
+        ra => $headers{RA_DEG},
+        dec => $headers{DEC_DEG},
+        timeStart => $headers{EXP_START_MJD},
+        timeStop => $headers{EXP_STOP_MJD},
+        filter => 'r',
+        surveyMode => 'DD',
+        limitingMag => $lm,
+        raSigma => 0,
+        decSigma => 0,
+        obscode => $obscode,
+        de => \@default_de,
+        fpaId => $fpa_id,
+    );
+
+    my $h = int($headers{EPOCH_MJD});
+# Doofy
+# 54197
+# 54198
+# 54199
+# 54201
+# 54203
+# 54205
+# 54207
+# 54208
+# 54209
+# 54210
+# 54212
+# 54213
+#    if (!($h == 54203 || $h == 54208 || $h == 54213)) {
+    if (!($h == 54197 || $h == 54201 || $h == 54205 || $h == 54209)) {
+        return;
+    }
+
+    my $num = 0;
+    my $dbh = $inst->dbh();
+    $inst->atomic($dbh, sub {
+        $id = $field->insert();
+        if ($id) {
+            print STDERR "created new field ID $id for $filename.\n";
+        }
+        else {
+            die "could not insert field for $filename.\n";
+            return;
+        }
+
+        # Now insert detections.
+        $field = modcf_retrieve($inst, fieldId => $id);
+        foreach my $detref (@dets) {
+            if (defined($detref->{S2N}) and $detref->{S2N} >= 5) {
+                my $det = PS::MOPS::DC::Detection->new(
+                    $inst,
+                    ra => $detref->{RA_DEG},
+                    dec => $detref->{DEC_DEG},
+                    epoch => $headers{EPOCH_MJD},
+                    mag => $detref->{MAG},
+                    filter => $field->filter,
+                    s2n => $detref->{S2N},
+                    isSynthetic => 0,
+                    orient_deg => 0,
+                    length_deg => 0,
+                    raSigma => $detref->{RA_SIGMA_DEG},
+                    decSigma => $detref->{DEC_SIGMA_DEG},
+                    magSigma => $detref->{MAG_ERR},
+                ) or die("couldn't create detection: " . join(' ', map {"$_=".$detref->{$_}} keys %{$detref}));
+
+                if ($det) {
+                    $det->addToField($field);
+                    $num++;
+                }
+            }
+        }
+    });
+    printf STDERR "Added %d detections.\n", $num;
+}
+
+
+sub get_headers {
+    my %headers;
+    my @stuff;
+    my ($key, $val);
+    foreach my $line (@_) {
+        $line =~ s|/.*$||;      # strip '/' to EOL
+        $line =~ s|\s+$||;      # trip trailing whitespace
+        if ($line =~ /^#\s+(\w+)\s+=\s+(.*)/) {
+            ($key, $val) = ($1, $2);
+            $val =~ s/^'|'$//g;         # strip quotes
+            $headers{$key} = $val;
+        }
+    }
+
+    # Convert some stuff.
+    die("Can't find RA header") unless exists($headers{RA});
+    die("Can't find DEC header") unless exists($headers{DEC});
+    $headers{RA_DEG} = Astro::Time::turn2deg(Astro::Time::str2turn($headers{RA}, 'H'));
+    $headers{DEC_DEG} = Astro::Time::turn2deg(Astro::Time::str2turn($headers{DEC}, 'D'));
+    $headers{EPOCH_MJD} = $headers{MJDATE} + $headers{EXPTIME} / 86400 / 2; # exposure midpoint
+    $headers{EXP_START_MJD} = $headers{MJDATE};                             # start of exposure
+    $headers{EXP_STOP_MJD} = $headers{MJDATE} + $headers{EXPTIME} / 86400;  # end of exposure
+
+    return %headers;
+}
+
+
+sub _log10 {
+    # Compute base-10 log of input.
+    my $arg = shift;
+    return log($arg) / $_ln10;
+}
+
+#   1 NUMBER          Running object number
+#   2 X_IMAGE         Object position along x                         [pixel]
+#   3 Y_IMAGE         Object position along y                         [pixel]
+#   4 ALPHA_J2000     Right ascension of barycenter (J2000)           [deg]
+#   5 DELTA_J2000     Declination of barycenter (J2000)               [deg]
+#   6 MAG_AUTO        Kron-like elliptical aperture magnitude         [mag]
+#   7 MAGERR_AUTO     RMS error for AUTO magnitude                    [mag]
+#   8 MAG_BEST        Best of MAG_AUTO and MAG_ISOCOR                 [mag]
+#   9 MAGERR_BEST     RMS error for MAG_BEST                          [mag]
+#   10 MAG_APER        Fixed aperture magnitude vector                 [mag]
+#   11 MAGERR_APER     RMS error vector for fixed aperture mag.        [mag]
+#   12 A_WORLD         Profile RMS along major axis (world units)      [deg]
+#   13 ERRA_WORLD      World RMS position error along major axis       [pixel]
+#   14 B_WORLD         Profile RMS along minor axis (world units)      [deg]
+#   15 ERRB_WORLD      World RMS position error along minor axis       [pixel]
+#   16 THETA_J2000     Position angle (east of north) (J2000)          [deg]
+#   17 ERRTHETA_J2000  J2000 error ellipse pos. angle (east of north)  [deg]
+#   18 ISOAREA_IMAGE   Isophotal area above Analysis threshold         [pixel**2]
+#   19 MU_MAX          Peak surface brightness above background        [mag * arcsec**(-2)]
+#   20 FLUX_RADIUS     Fraction-of-light radii                         [pixel]
+#   21 FLAGS           Extraction flags
+#
+#   1.5<RFLUX<3.5
+#   DMAPER>0
+#   1.09/DMAPER>5
+#   LOG10(B)>-4.15
+#   LOG10(A)>-4.15
+#
+sub det_parse {
+    # Return a hashref of detection elements from a line in a CADC/CFHT catalog.
+    my ($line) = @_;
+    $line =~ s/^\s+//;  # strip
+    my @stuff = split /\s+/, $line;
+    my %det;
+    my $pos_err;
+
+    $det{RA_DEG} = $stuff[3];
+    $det{DEC_DEG} = $stuff[4];
+    $det{MAG} = $stuff[9];      # MAG_APER
+    $det{MAG_ERR} = $stuff[10];
+    $det{FLUX_RADIUS} = $stuff[19];
+    $det{S2N} = 1.09 / ($det{MAG_ERR} == 0 ? 1 : $det{MAG_ERR});
+    $det{A} = $stuff[11];
+    $det{B} = $stuff[13];
+#   $pos_err = sqrt($det{A} * $det{A} + $det{B} * $det{B});
+    $pos_err = 0.1 / 3600;          # 0.1 arcsec astrometry
+    $det{RA_SIGMA_DEG} = $pos_err;
+    $det{DEC_SIGMA_DEG} = $pos_err;
+
+    if ($det{MAG_ERR} > 0           # MAGERR_APER > 0
+        and $det{MAG} < 25          # MAG_APER < 25
+        and (1.5 < $det{FLUX_RADIUS} and $det{FLUX_RADIUS} < 3.5)
+        and $det{S2N} > 5
+        and _log10($det{A}) > -4.15
+        and _log10($det{B}) > -4.15
+        ) {
+        return \%det;
+    };
+
+    return {};
+}
+
+
+=head1 DESCRIPTION
+
+insertSpacewatchFields insert fields and detections from MITI
+files created by mosaic2miti.    The files must have a first
+line containing 
+
+FIELD EPOCH_MJD RA_DEG DEC_DEG MAG OBSCODE
+
+FIELD is the literal "FIELD"; RA and DEC are RA and DEC in degrees;
+MAG is apparent magnitude; and OBSCODE is obtained from the configuration
+file for the simulation.
+
+When FIELD is encountered, a new field is created in the current
+PSMOPS instance, then all subscquent detections in the field are
+inserted into the newly created field.
+
+If --reffile REFFILE is specified, then for each file on the command
+line, a corresponding entry is looked up in REFFILE to obtain RA, DEC
+and EPOCH for the field.  Format for the reffile should be
+
+  ID RA_DEG DEC_DEG EPOCH_MJD EXP_S
+
+where ID is something like "2005.09.30.03.01.1".
+
+=cut

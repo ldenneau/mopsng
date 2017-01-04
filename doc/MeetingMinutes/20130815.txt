@@ -1,0 +1,101 @@
+ATTENDING:
+Bolin, Chambers, Chastel (chair), Denneau, Hsieh, Jedicke (scribe), Schunova, Sherstyuk, Veres, Wainscoat
+MINUTES:
+* No meeting last week because of ISS meeting
+* PS1 Status (KC)
+much discussion on IPP move from MHPCC
+PS1 focus is working much better than ever
+last few nights has seen 99% images in-focus
+* IPP
+  * IPP Trail fitting (PV)
+PV plans to write a report but hasn't done so yet
+trail fitting is implemented but not yet good
+pos. angle looks good
+but lengths and mags are still not good
+untrailed objects appear to be OK
+KC requests that it is more important to make report than to worry about it looking good
+LD? what about the 'original' set of 100 sample trails
+PV is still working on that analysis
+  * mdrm137 Ubercal (SC for AF)
+Minor concerns with the data. Should be fixed soon
+  * Convolution (SC)
+SC continues to evaluate the latest IPP convolution algorithms
+trying to determine how/whether the MOPS config can be altered to improve detection efficiency
+SC sees some skycell border artifacts in the processing 
+expects to be done evaluation next week
+* Data Processing (SC)
+lots of hiccups last week
+IPP was reprocessing e.g. M31 which has performance impact on cluster
+Grand Reprocessing is also taking place
+last night's data not processed yet
+mops13 was the target of a denial of service attack last friday
+was not successful but still caused problems all weekend
+somebody requested 20k stamps! that knocked out MOPS ability to get stamps
+MOPS is supposed to get priority but is limited to just 200 stamps per request
+SC complained and now has capability to set priorities
+SC suggested 2 stamp servers - 1 for MOPS and 1 for everybody else
+this request has no response as of yet
+IPP will be late in processing for the next 4 months
+e.g. might not get data till 2pm in the afternoon
+because they are doing some archiving in advance of exit from MHPCC
+RW will get involved with reducing these delays
+
+
+* NEO Status (RW/PV)
+doing well this lunation but not as well as last
+220 NEOs this year
+over 700 total since start of operations
+RJ points out that we are supposed to be finding >500 per year
+there is one interesting distant object, probably a Centaur
+haven't found a PHO is a while
+
+* NEO Czaring (BB)
+affected by denial of service and IPP delays
+it is admirable that we can do so well at finding NEOs given the problems
+SC has created a 'Submit Suspected Comet' candidate button
+the button is not a substitute for the MPEC email
+i.e. the email still needs to be completed
+
+* Comets
+there is a continuing issue with 2013 P2 = 107slc
+this is an object on a LPC orbit but has no detectable activity
+it was submitted by PS1 but never reported as a comet
+it was reported to have coma/tail by amateurs but no activity detected by big telescopes
+but it is moving across a messy background
+MPC only wants 'suspected comet' if we have good evidence
+i.e. *if* MOPS stamps or PS1 analysis shows cometary activity than submit as comet candidate otherwise do not submit
+BB wants to know if there is another utility for comets like MPChecker
+he says it works 9 of 10 times for known objects
+RJ suggests that MPChecker can use a wider search radius to bring in the other 10%
+* ATLAS
+LD is thinking about making MOPS leaner and meaner
+trying to use OpenOrb for ephemeris prediction 
+but it is much slower than he expects
+would like to implement 2-body ephemerides
+BB suggests adopting HG12 system
+LD agrees but it should be talked about at another meeting
+RJ we have to move to HG12 for ATLAS and PS1/2
+AS and LD are creating a full-pass processing pipeline
+from synthetic images thru MOPS 
+including a postage stamp server
+* AOB
+
+minimoons
+BB did a little study to investigate minimoon detectability with PS1
+he was concerned about the GCR cut eliminating minimoons
+he simulated PS1 survey cadence w/ minimoon model
+he limited detected rates to <3 deg/day
+peak minimoon GCR is at about 0.3" 
+PS1 GCR cuts are about 0.5" for slow rates and 2" for fast rates
+so MOPS cuts should allow minimoon detection
+but detection rate is very low
+finding trails and finding faster objects would increase the detection rate
+RW wants to review the GCRs for impactors
+RJ reminds that BB did a study of GCR vs. distance, etc.
+PS2
+RJ proposes that new 'PS2 Status' item be added to regular MOPS meeting agenda
+Schunova
+Schunova's last official workday of employment is *today*
+WEKA (data mining environment) online course
+SC suggests that this online course might be interesting
+

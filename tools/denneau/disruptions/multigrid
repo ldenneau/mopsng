@@ -1,0 +1,314 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+grid - sample MB disruption space in delta-M and decay time and produce a grid of results
+
+=head1 SYNOPSIS
+
+grid [options] SSMFILE OBSFILE
+
+  SSMFILE : list of solar system object names
+  OBSFILE : list of observations (detections)
+  --count : count number of events in trials
+  --find : count number until first detection
+  --trials : number of trials to execute (required for --count)
+
+  --ssmhoffsetspec min,max,nom : loop using these vals
+  --m1 dMAG : delta M lower limit, default 1.0
+  --m2 dMAG : delta M upper limit, default 5.0
+  --minc dMAG : mag increment for grid
+  --d1 DECAY1 : decay rate upper limit, mag/day, default .001
+  --d2 DECAY2 : decay rate lower limit, mag/day, default 1.0
+  --dfact : decay factor for grid
+  --s MAG : mag sensitivity, default 0.1
+  --help : show this manpage
+
+=head1 DESCRIPTION
+
+Given a solar system model in ssm.txt and a file of observations, create
+synthetic disruptions for objects and determine if they would have
+been observed.  This requires a special simulation where detections are
+stored far below the visibility threshold, so that we know if there are
+in the FOV.
+
+The --ssmdelta option allows a simulation to be created with a constant
+(say H=16) absolute mag, then application of the H delta to explore 
+other bins of mag space where there may be too few objects in the model
+to provide good statistics.  The output grid from this analysis must be
+normalized by the fraction of objects in the H bin relative to the entire
+SSM.
+
+=cut
+
+use strict;
+use warnings;
+use FileHandle;
+use Getopt::Long;
+use Astro::Time;
+use Pod::Usage;
+use Math::Random;
+use List::Util qw(min max);
+
+
+my $count;  # if set, count number of evts in trial set
+my $find;   # if set, count number until first event
+my $m1 = 0.5;
+#my $m2 = 5.0;
+my $m2 = 15.0;
+my $minc = .1;
+my $d1 = .001;
+my $d2 = 10.0;
+my $dfact = 1.2;
+my $trials = 1;
+my $ssmhoffsetspec;
+my $debug;
+my $help;
+GetOptions(
+    'm1=f' => \$m1,
+    'm2=f' => \$m2,
+    'minc=f' => \$minc,
+    'd1=f' => \$d1,
+    'd2=f' => \$d2,
+    'dfact=f' => \$dfact,
+
+    find => \$find,
+    count => \$count,
+    'trials=i' => \$trials,
+
+    'ssmhoffsetspec=s' => \$ssmhoffsetspec,
+
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => "--count or --find must be set.\n") unless ($count or $find);
+
+my ($ssmhoffset_min, $ssmhoffset_max, $ssmhoffset_nom) = split /:/, $ssmhoffsetspec;
+
+# Useful vars;
+my $fh;
+my $line;
+my @ssm;
+my %dets;
+my $LOG10 = log(10);
+
+
+# First read in some input data.
+my $ssmfile = shift;
+die "no file $ssmfile" unless -r $ssmfile;
+my $obsfile = shift;
+die "no file $obsfile" unless -r $obsfile;
+
+print STDERR "Reading SSM objects...";
+$fh = new FileHandle $ssmfile or die "can't open $ssmfile";
+while ($line = <$fh>) {
+    next unless $line =~ /^S/;  # must begin with object name
+    chomp $line;
+    push @ssm, $line;
+}
+printf STDERR "found %d objects.\n", scalar @ssm;
+
+
+print STDERR "Reading observations...";
+$fh = new FileHandle $obsfile or die "can't open $obsfile";
+my @foo;
+my $min_mjd;
+my $max_mjd;
+while ($line = <$fh>) {
+    next unless $line =~ /^S/;  # must begin with object name
+    chomp $line;
+    @foo = split /\s+/, $line;
+#    $foo[7] += $ssmhoffset;
+    push @{$dets{$foo[0]}}, [ @foo ];        # each SSM obj gets a list of observations
+
+# object_name fpa_id  det_id  round(d.epoch_mjd,6)    round(d.ra_deg,5)   round(d.dec_deg,5)  round(s2n,2)    round(mag,2)    filter_id
+# S1000seYa   o5613g0088o 2213    55613.286317    140.83599   30.41652    233.37  18.85   r
+
+    if (!defined($min_mjd) || $foo[3] < $min_mjd) {
+        $min_mjd = $foo[3];
+    }
+    if (!defined($max_mjd) || $foo[3] > $max_mjd) {
+        $max_mjd = $foo[3];
+    }
+}
+printf STDERR "found %d observations.\n", scalar keys %dets;
+printf STDERR "MJD limits are %.5f to %.5f\n", $min_mjd, $max_mjd;
+
+
+
+# Now loop through our space.  For each grid location, produce random
+# disruption events until we have one that is detectable in our detection
+# space.
+my $ssmhoffset;
+my $ssmhoffsetfile;
+for ($ssmhoffset = $ssmhoffset_min; $ssmhoffset <= $ssmhoffset_max; $ssmhoffset += 0.25) {
+    printf STDERR "Applying %.4f offset to mags.\n", $ssmhoffset;
+
+    $ssmhoffsetfile = sprintf("%05.2f", $ssmhoffset + $ssmhoffset_nom);
+    printf STDERR "Writing to $ssmhoffsetfile.\n";
+    my $fh = new FileHandle ">$ssmhoffsetfile" or die "can't create $ssmhoffsetfile";
+
+    my $m;
+    for ($m = $m1; $m <= $m2; $m += $minc) {
+        my $d;
+        for ($d = $d1; $d <= $d2; $d *= $dfact) {
+
+            if ($find) {
+                my ($nevents, $name, $start_epoch_mjd, $end_epoch_mjd, $base_mag, $dis_epoch, $dis_mag);
+                if ($trials == 1) {
+                    ($nevents, $name, $start_epoch_mjd, $end_epoch_mjd, $base_mag, $dis_epoch, $dis_mag) = find_disruption($m, $d);
+                    printf $fh "%.3f %.5f %d %s %.5f %.5f %.2f %.5f %.2f\n", $m, log($d) / $LOG10, $nevents, $name, $start_epoch_mjd, $end_epoch_mjd, $base_mag, $dis_epoch, $dis_mag;
+                }
+                else {
+                    my $nnev = 0;
+                    for (1..$trials) {
+                        ($nevents, $name, $start_epoch_mjd, $end_epoch_mjd, $base_mag, $dis_epoch, $dis_mag) = find_disruption($m, $d);
+                        $nnev += $nevents;
+                    }
+                    $nnev /= $trials;
+                    printf $fh "%.3f %.5f %.2f\n", $m, log($d) / $LOG10, $nnev;
+                }
+            }
+            elsif ($count) {
+                my $nevts = count_disruptions($trials, $m, $d);
+                printf $fh "%.3f %.5f %.6f\n", $m, log($d) / $LOG10, $nevts / $trials;
+            }
+        }
+    }
+
+    $fh->close;
+}
+exit;
+
+
+sub find_disruption {
+    # Given a delta M and decay time, produce random disruption events.
+    # Assume that the mag delta is instantanous upon impact, and that the decay
+    # stops when the delta mag reaches the limiting mag (accounting for sensitivity
+    # limits due to light curves, etc., around 0.1).
+    # Return the number of random events until a disruption was detected.
+    my ($deltam, $decay) = @_;
+    my $nevt = 0;
+#    my $lim = 21.5;     # strawman global limiting mag, refine later
+    my $lim = 18.5;     # brightest mag of unknown MBO from ONS data
+    my $bright_limit_w = 15;
+    my $bright_limit_3pi = 13;
+    my $mag_err = 0.1;  # strawman sensitivity
+
+    my $found_name;
+    my $found_start_epoch;
+    my $found_end_epoch;
+    my $found_base_mag;
+    my $found_det_epoch;
+    my $found_mag;
+    while (!$found_name) { 
+        $nevt++;
+
+        # 1. Pick an object at random.
+        my $objname = $ssm[random_uniform_integer(1, 0, scalar @ssm)];
+        my $dref = $dets{$objname};
+        if ($dref) {
+            # Note we have to adjust for disruptions that occurred before our
+            # observations but might still be decaying.
+            my $start_mjd = random_uniform(1, $min_mjd - $deltam / $decay, $max_mjd);
+            my $end_mjd = $start_mjd + ($deltam / $decay);
+
+            # Now see if we have any detections in this range that are
+            # visible given the additional brightness from the disruption.
+            my $mag;
+            my $epoch_mjd;
+            my $filt;
+            for my $det (@{$dref}) {
+                $epoch_mjd = $det->[3];
+                $mag = $det->[7] + $ssmhoffset;
+                $filt = $det->[8];
+
+                if ($start_mjd <= $epoch_mjd and $epoch_mjd <= $end_mjd) {
+                    # Compute mag due to disruption, including decay.  We're guaranteed
+                    # to be in the disruption time range.
+                    my $dis_mag = $mag - $deltam + ($epoch_mjd - $start_mjd) * $decay;
+
+                    # Make sure we are not saturated.
+                    if ($filt eq 'w') {
+                        next if ($dis_mag < $bright_limit_w)
+                    }
+                    else {
+                        next if ($dis_mag < $bright_limit_3pi)
+                    }
+
+                    # Accept if not too faint.
+                    if ($dis_mag < $lim) {
+                        $found_name = $objname;
+                        $found_start_epoch = $start_mjd;
+                        $found_end_epoch = $end_mjd;
+                        $found_base_mag = $mag;
+                        $found_det_epoch = $epoch_mjd;
+                        $found_mag = $dis_mag;
+                        last;
+                    }
+                }
+            }
+        }
+    }
+    
+    # number events & found object info
+    return ($nevt, $found_name, $found_start_epoch, $found_end_epoch, $found_base_mag, $found_det_epoch, $found_mag);
+}
+
+
+sub count_disruptions {
+    # Given a delta M and decay time, produce $count random disruption events.
+    # Assume that the mag delta is instantanous upon impact, and that the decay
+    # stops when the delta mag reaches the limiting mag (accounting for sensitivity
+    # limits due to light curves, etc., around 0.1).
+    # Return the number of detected events from this sample.
+    my ($count, $deltam, $decay) = @_;
+    my $nevt = 0;
+#    my $lim = 21.5;     # strawman global limiting mag, refine later
+    my $lim = 19.0;     # brightest mag of unknown MBO from ONS data
+    my $mag_err = 0.1;  # strawman sensitivity
+
+    my $nfound = 0;
+    my $i = 0;
+    while ($i++ < $count) {
+        # Create random disruption event.
+        my $s = random_uniform_integer(1, 0, scalar @ssm - 1);
+        my $objname = $ssm[$s];
+        die "got empty $objname for $s" unless $objname;
+        my $dref = $dets{$objname};
+        if ($dref) {
+            my $start_mjd = random_uniform(1, $min_mjd, $max_mjd);
+            my $end_mjd = $start_mjd + ($deltam / $decay);
+
+            # Now see if we have any detections in this range that are
+            # visible given the additional brightness from the disruption.
+            my $mag;
+            my $epoch_mjd;
+            for my $det (@{$dref}) {
+                $epoch_mjd = $det->[3];
+                $mag = $det->[7] + $ssmhoffset;
+
+                if ($start_mjd <= $epoch_mjd and $epoch_mjd <= $end_mjd) {
+                    # Compute mag due to disruption, including decay.  We're guaranteed
+                    # to be in the disruption time range.
+                    my $dis_mag = $mag - $deltam + ($epoch_mjd - $start_mjd) * $decay;
+                    if ($dis_mag < $lim) {
+                        $nfound++;
+                        if ($debug) {
+                            printf STDERR "FOUND %.2f %.4f %d %s %.6f %.6f %.2f\n", $deltam, $decay, $i, $objname, $start_mjd, $end_mjd, $dis_mag;
+                        }
+                        last;   # no need to check other dets
+                    }
+                }
+            }
+
+            # Not found.
+            if ($debug) {
+                printf STDERR "UNFOUND %.2f %.4f %d %s %.6f %.6f\n", $deltam, $decay, $i, $objname, $start_mjd, $end_mjd;
+            }
+        }
+    }
+    
+    return $nfound;
+}

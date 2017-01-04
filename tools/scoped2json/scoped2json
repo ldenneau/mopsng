@@ -1,0 +1,65 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use File::Slurp;
+use Config::Scoped;
+use JSON;
+use Data::Dumper;
+
+use Getopt::Long;
+use Pod::Usage;
+
+
+my $help;
+GetOptions(
+    help => \$help,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+pod2usage(2) unless @ARGV;              # no files specified
+
+eval {
+    my $parser = Config::Scoped->new(file => $ARGV[0], warnings => {permissions => 'off'});
+    my $cfg = $parser->parse();
+
+    my $json = new JSON;
+    my $js = $json->objToJson($cfg, { pretty => 1, indent => 4});
+    print $js, "\n";
+};
+
+die $@ if $@;
+exit;
+
+=head1 NAME
+
+scoped2json - Convert MOPS Config::Scoped config files to JSON format
+
+=head1 SYNOPSIS
+
+  scoped2json master.cf > master.json
+
+=head1 DESCRIPTION
+
+Reads the specified MOPS config file assumed to be in Config::Scoped
+format and emits a JSON-formatted config file.
+
+=head1 BUGS
+
+Does not preserve the ordering of dictionary (hash) elements
+in the emitted file.
+
+=head1 AUTHOR
+
+Larry Denneau, Jr., <lt>denneau@ifa.hawaii.edu<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 2007 by Larry Denneau, Jr., Institute for Astronomy,
+University of Hawaii.
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.7 or,
+at your option, any later version of Perl 5 you may have available.
+
+=cut

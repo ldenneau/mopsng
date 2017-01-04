@@ -1,0 +1,88 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+
+
+# Options.
+my $inst;
+my $instance_name;
+my $parent_id;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'parent_id=s' => \$parent_id,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+pod2usage(-message => '--parent_id=PARENT_ID is required.') unless $parent_id;
+pod2usage(-message => 'No child fields were specified.') unless @ARGV;
+my @chillins = @ARGV;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_logger = $inst->getLogger;
+my $dbh = $inst->dbh;
+my $field;
+
+eval {
+    $mops_logger->info("Marking field IDs: " . join(' ', @chillins));
+    $inst->atomic($dbh, sub {
+        # Mark parent's parent_id=NULL.
+#        my $field = modcf_retrieve($inst, fieldId => $field_id) or $mops_logger->logdie("can't retrieve field ID $field_id");
+#        $f->parentId($parent_id);
+
+        # Mark each of the children as having this parent.
+        foreach my $field_id (@chillins) {
+            $field = modcf_retrieve($inst, fieldId => $field_id) or $mops_logger->logdie("can't retrieve field ID $field_id");
+
+            # Check that the field does not already have a parent.
+            if ($field->parentId) {
+                my ($fieldId, $parentId) = ($field->fieldId, $field->parentId);
+                $mops_logger->logwarn("Field ID $fieldId already has a parent: $parentId");
+            }
+
+            $field->parentId($parent_id);
+        }
+    });
+};
+
+#$mops_logger->info("Marking field IDs: " . join(' ', @chillins));
+#foreach my $field_id (@chillins) {
+#    my $field = modcf_retrieve($inst, fieldId => $field_id) or $mops_logger->logdie("can't retrieve field ID $field_id");
+#    $field->parentId($parent_id);
+#}
+
+if ($@) {
+    $mops_logger->logdie("Could not mark fields: $@");
+}
+
+exit;
+
+
+
+=head1 NAME
+
+markFieldTuples - Program to mark field parend_ids to indicate field tuple groupings
+
+=head1 SYNOPSIS
+
+markFieldTuples [options] --parent_id PARENT_ID ID1 ID2 ...
+    --help : show this man page
+
+=head1 DESCRIPTION
+
+markFieldTuples marks the specified fields ID1, ID2, etc. as children of PARENT_DI
+by setting their parent_id column values to PARENT_ID.  This association reflects
+groupings of tracklet processing by DTCTL.
+
+If a child field already has a parent, then emit an error message.
+
+=cut

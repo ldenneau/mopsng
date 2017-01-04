@@ -1,0 +1,865 @@
+#!/usr/bin/env perl
+
+=pod
+
+=head1 NAME
+
+tracklet - MOPS pipeline stage to compute tracklets for field stacks on cluster
+
+=head1 SYNOPSIS
+
+tracklet --nn NIGHT_NUMBER [--help]
+
+  --nn NIGHT_NUMBER : night to process
+  --test : test mode; don't modify DB, don't execute makefiles
+  --run  : id of the run that tracklet is a part of. This parameter is used by the 
+           mopper script and should not be specified when manually running tracklet.  
+  --help : show man page
+
+=head1 DESCRIPTION
+
+TRACKLET performs distributed tracklet computation on a MOPS cluster
+using a simple scatter-gather method.  Fields for the specified night
+are organized into "stacks" for tracklet processing, then Condor jobs
+are created for each stack.  The worker jobs produce lists of
+detection IDs in a simple MIF-TRACKLET format and the results are
+submitted to the MOPS DB after the gather. Results are submitted
+transactionally -- all tracklets for a stack are inserted, then
+the stack is marked as processed.
+
+If there are any single fields not in any stacks, they are marked
+as processed prior to scatter.
+
+=head1 EXIT VALUE
+
+TRACKLET exits with the following values:
+
+  0 - successful completion
+  other - internal failure
+
+=cut
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+use File::Slurp;
+use FileHandle;
+use Params::Validate;
+
+use Astro::SLA;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::GCR;
+
+
+our $nosubmit = 0;
+
+
+# Utility queue class.
+package queue;
+
+use subs qw(
+    mark_fields_with_error_flag
+);
+
+sub new {
+    my ($pkg, $mops_inst, $nn, $run_id) = @_;
+    my $self = {
+        QUEUE => [],
+        INST => $mops_inst,
+        NN => $nn,
+	RUN_ID => $run_id,
+    };
+    bless $self, $pkg;
+    return $self;
+}
+
+
+sub add {
+    my ($self, $tuple, $method) = @_;
+    push @{$self->{QUEUE}}, {
+        TUPLE => $tuple,
+        METHOD => $method,
+    };
+}
+
+
+sub mark_fields_with_error_flag {
+    my ($inst, $run_id, @fields) = @_;
+    my $field;
+    $inst->pushAutocommit(0);
+    my $dbh = $inst->dbh();
+    eval {
+        for $field (@fields) {
+	    my $fid = $field->fieldId;
+	    print STDERR "Setting status of field $fid to X (SKIP)\n";
+            $field->status("X", $run_id);
+        }
+        $dbh->commit();
+    };
+    if ($@) {
+	$dbh->rollback();
+    }
+}
+
+sub execute {
+    # Submit the queued LINKOD passes as a single Condor job.
+    my ($self) = @_;
+    my $inst = $self->{INST};
+    my $run_id = $self->{RUN_ID};
+    my $nn = $self->{NN};
+    my $num_jobs = scalar @{$self->{QUEUE}};
+    my @suffixes = (0..$num_jobs - 1);
+
+    my $logger = $inst->getLogger();
+    my $config = $inst->getConfig();
+
+    # Extract the environment the remote jobs run in.
+    my $remote_mops_home = $config->{cluster}->{MOPS_HOME} || $ENV{'MOPS_HOME'};
+    my $remote_path = $config->{cluster}->{PATH} || $ENV{'PATH'};
+    my $remote_perl5lib = $config->{cluster}->{PERL5LIB} || "$remote_mops_home/lib/perl";
+    my $remote_pythonpath = $config->{cluster}->{PYTHONPATH} || "$remote_mops_home/lib/python";
+    my $remote_ld_library_path = $config->{cluster}->{LD_LIBRARY_PATH} || "$remote_mops_home/lib";
+    my $remote_caet_data = $config->{cluster}->{CAET_DATA} || $ENV{'CAET_DATA'};
+    my $remote_oorb_data = $config->{cluster}->{OORB_DATA} || $ENV{'OORB_DATA'};
+    my $remote_orbfit_data = $config->{cluster}->{ORBFIT_DATA} || $ENV{'ORBFIT_DATA'};
+    my $environment = "MOPS_HOME=$remote_mops_home CAET_DATA=$remote_caet_data OORB_DATA=$remote_oorb_data ORBFIT_DATA=$remote_orbfit_data PATH=$remote_path PERL5LIB=$remote_perl5lib PYTHONPATH=$remote_pythonpath LD_LIBRARY_PATH=$remote_ld_library_path";
+
+    my $gmt_offset_hours = $config->{site}->{gmt_offset_hours}; 
+    die "no gmt_offset_hours" unless defined($gmt_offset_hours);
+
+    if (!$num_jobs) {
+        $logger->info("TRACKLET: no jobs to process for night $nn");
+        return;
+    }
+
+    $logger->info(sprintf "TRACKLET: Executing job for night $nn (%d fields)", scalar @{$self->{QUEUE}});
+
+    my $dir = Cwd::getcwd;
+    my $dbname = $inst->dbname;
+
+    # Create Condor files.
+    my $job_str = <<"JOB";
+universe = vanilla
+executable = $ENV{'MOPS_HOME'}/bin/condor_runner
+arguments = tracklet.remotecmd.\$(Process)
+environment = "$environment MOPS_DBINSTANCE=$dbname"
+# Dummy memory line to prevent vacate due to large process size
+#requirements = Memory > 1024
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+transfer_input_files = tracklet.remotecmd.\$(Process)
+initialdir = $dir
+log = tracklet.condorlog
+error = tracklet.stderr.\$(Process)
+output = tracklet.stdout.\$(Process)
+input = /dev/null
+notification = Error
+queue $num_jobs
+JOB
+    my $job_fh = new FileHandle ">tracklet.cmd";
+    print $job_fh $job_str;
+    $job_fh->close;
+
+    # Write one file for each TRACKLET job.
+    my $num = 0;
+    my $cmd;
+    my @field_ids;
+    my @fieldsIds;
+    my $fieldsStr;
+    foreach $num (@suffixes) {
+        my $fh = new FileHandle ">tracklet.remotecmd.$num";
+
+        # Make the remote command.
+        @field_ids = map { $_->fieldId } @{$self->{QUEUE}->[$num]->{TUPLE}};
+        my $method = $self->{QUEUE}->[$num]->{METHOD};
+        my $outfile = sprintf('tracklet.%d.tracklets', $num);
+        $self->{QUEUE}->[$num]->{OUTFILE} = $outfile;
+
+        $cmd = <<"CMD";
+tracklet_worker --method $method --outfile $outfile @field_ids
+CMD
+        print $fh $cmd;
+        $fh->close;
+    }
+
+    unless ($nosubmit) {
+        open CONDUH, "condor_submit tracklet.cmd|" or $logger->logdie('TRACKLET: condor_submit failed');
+        my @submit_stuff = <CONDUH>;
+        close CONDUH;
+
+        # Suss out the Condor job ID.
+        my $job_id = '';
+        if ($submit_stuff[-1] =~ /submitted to cluster (\d+)/) {
+            $job_id = $1;
+        }
+    
+        # Sleep for a fraction of a second to give condor_submit the time to 
+        # create the log file. Is this necessary?
+        sleep(0.5);
+
+        $logger->info("TRACKLET: monitoring tracklet.condorlog (job ID $job_id)");
+	if ( system("condor_wait tracklet.condorlog $job_id") != 0 ) {
+	    $logger->info("TRACKLET: At least one job failed");
+	    # At least one job failed: get the failed jobs from the log
+	    open (CONDORLOG, "tracklet.condorlog") or $logger->logdie('TRACKLET: Cannot open tracklet.condorlog');
+	    my $prevLine = "";
+	    for my $line (<CONDORLOG>) {
+		if ($line =~ /return value/) {
+		    unless ($line =~ /return value 0/) {
+			#Extract the job id from the prevLine
+			$num = int((split /\./, $prevLine)[1]);
+			$logger->info("Job $job_id.$num exited with status != 0");
+			@fieldsIds = map { $_->fieldId } @{$self->{QUEUE}->[$num]->{TUPLE}};
+			$fieldsStr = join(' ', @fieldsIds);
+			$logger->info("Marking fields " . $fieldsStr . " with error flag");
+			mark_fields_with_error_flag($inst, $run_id, @{$self->{QUEUE}->[$num]->{TUPLE}});
+		    }
+		}
+		$prevLine = $line;
+	    }
+	    close(CONDORLOG);
+	    $logger->info("TRACKLET: At least one job failed");
+	}
+    }
+}
+
+
+# Main.
+package main;
+
+# Globals.
+my $debug;
+my $t0 = time;                          # for timing
+
+use subs qw(
+    insert_tracklets
+);
+
+
+my $inst;
+my $instance_name;
+my $nn;
+my $run_id;
+my $help;
+my $no_synth;
+GetOptions(
+    debug => \$debug,
+    'instance=s' => \$instance_name,
+    'run=i' => \$run_id,    
+    'nn=i' => \$nn,
+    nosubmit => \$nosubmit,
+    no_synth => \$no_synth,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => '--nn is required') unless $nn;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+$mops_logger->info("Starting TRACKLET.");
+
+my $mag_diff_control = $mops_config->{tracklet}->{mag_diff_control};
+my $gcr_thresh_arcsec = $mops_config->{tracklet}->{gcr_thresh_arcsec} || 1.0;
+my $gcr_thresh_arcsec_conservative = 0.5 * $gcr_thresh_arcsec;
+my $do_high_gcr = $mops_config->{tracklet}->{do_high_gcr};
+my $high_gcr_thresh_arcsec = $mops_config->{tracklet}->{high_gcr_thresh_arcsec} || 2.5;
+my $high_gcr_thresh_arcsec_conservative = 0.5 * $high_gcr_thresh_arcsec;
+my $high_gcr_minv_degperday = $mops_config->{tracklet}->{high_gcr_minv_degperday} || 1.5;
+my $minv_degperday = $mops_config->{tracklet}->{minv_degperday} || 0;
+my $vtot_control_degperday = 100; # value is refined according to execution context
+
+# Update process status.
+$0 = sprintf "TRACKLET %s", $inst->dbname;
+
+# Create our working directory, and go there.
+my $dir = $inst->makeNNDir(NN => $nn, SUBSYS => 'tracklet', FORCE_EMPTY => 1);
+chdir $dir or die "can't chdir to $dir";
+
+
+# Create a table (@fields) of all fields that we need to process for this night.
+# We will organize them into tuples (stacks), then distribute jobs for
+# each stack.  Fields that are leftover (not in a stack) will be cleaned
+# up at the end.
+my $field_i;
+my $field;
+my @fields;
+my $queue;
+
+# Retrieve all fields for the night that have gone through the synthetics stage.
+if ($no_synth) {
+    $field_i = modcf_retrieve($inst,
+        nn => $nn,
+        status => $FIELD_STATUS_READY, );
+} else {
+    $field_i = modcf_retrieve($inst,
+        nn => $nn,
+        status => $FIELD_STATUS_SYNTH,
+    );
+}
+while ($field = $field_i->next()) {
+    push @fields, $field;
+}
+
+
+# Get import config items to create the tuple list.
+my $tuplewise = $mops_config->{tracklet}->{tuplewise};
+my $tuplewise_min_fields = $mops_config->{tracklet}->{tuplewise_min_fields} || 2;
+my $tuplewise_max_fields = $mops_config->{tracklet}->{tuplewise_max_fields} || 4;
+my $tuplewise_min_tti_min = $mops_config->{tracklet}->{tuplewise_min_tti_min} || 10;
+my $tuplewise_max_tti_min = $mops_config->{tracklet}->{tuplewise_max_tti_min} || 30;
+my $tuplewise_max_time_min = $mops_config->{tracklet}->{tuplewise_max_time_min} || 90;
+my $allow_chunk = $mops_config->{tracklet}->{allow_chunk};
+
+my $skip_deep_stacks = $mops_config->{tracklet}->{skip_deep_stacks};
+my $pair_mag_diff_control = $mops_config->{tracklet}->{pair_mag_diff_control} || $mag_diff_control;
+
+
+# Assemble the fields into tuples.
+my $tuple_data;
+#$tuple_data = mopslib_assembleTTITuples(
+$tuple_data = assembleTupleData(
+    any_filter => $mops_config->{tracklet}->{any_filter},           # allow any filter combo in tuple
+    no_deep_stacks => $mops_config->{tracklet}->{no_deep_stacks},   # don't create 'deep stacks'
+    fields => \@fields,                                             # list of fields to organize
+
+    min_fields => $tuplewise_min_fields,                    # min number of fields per tuple
+    max_fields => $tuplewise_max_fields,                    # max number of fields per tuple
+    min_tti_min => $tuplewise_min_tti_min,                  # min consecutive time in minutes
+    max_tti_min => $tuplewise_max_tti_min,                  # max consecutive time in minutes
+    max_time => $tuplewise_max_time_min,                    # total max time for a tuple/tracklet
+    max_deep_tuple => ($mops_config->{tracklet}->{max_deep_tuple} || 8),
+);
+
+dump_debug_data($tuple_data) if ($debug);
+
+my $msg = 'Found ' . join('; ', 
+    sprintf("%d TTI tuple(s)", scalar keys %{$tuple_data->{TTI_TUPLES}}),
+    sprintf("%d deep stack(s)", scalar keys %{$tuple_data->{DEEP_STACKS}}),
+    sprintf("%d chunk(s)", scalar keys %{$tuple_data->{CHUNKS}}),
+    sprintf("%d orphan(s)", scalar @{$tuple_data->{ORPHANS}}),
+);
+$mops_logger->info($msg);
+exit if $debug;
+
+# Now queue jobs for the tuples.
+$queue = queue->new($inst, $nn, $run_id);
+
+# TTI pairs.
+for my $parent_id (sort keys %{$tuple_data->{TTI_TUPLES}}) {
+    $queue->add($tuple_data->{TTI_TUPLES}->{$parent_id}, 'TTI');
+}
+
+# Queue deep stack jobs.
+my @skipped_fields;
+unless ($skip_deep_stacks) {
+    for my $parent_id (sort keys %{$tuple_data->{DEEP_STACKS}}) {
+        $queue->add($tuple_data->{DEEP_STACKS}->{$parent_id}, 'DEEP');
+    }
+}
+else {
+    $mops_logger->info("Skipping deep stacks");
+    push @skipped_fields, values %{$tuple_data->{DEEP_STACKS}};
+}
+
+# Chunks.
+for my $parent_id (sort keys %{$tuple_data->{CHUNKS}}) {
+    $queue->add($tuple_data->{CHUNKS}->{$parent_id}, 'CHUNK');
+}
+
+# Execute!
+$queue->execute();
+
+# Now finish up.  First write tracklets for our TTI tuples and deep stacks.
+$inst->pushAutocommit(0);
+my $dbh = $inst->dbh();
+my $queue_data;
+my $tuple_aref;
+
+eval {
+    for $queue_data (@{$queue->{QUEUE}}) {
+        # Insert tracklets by tuple here.
+	if (-e ($queue_data->{OUTFILE})) {
+	    insert_tracklets($queue_data->{OUTFILE}, $queue_data->{METHOD});
+	    $tuple_aref = $queue_data->{TUPLE};
+
+	    # Update field statuses.
+	    my $parent = $tuple_aref->[-1];                    # last tuple is parent
+	    for $field (@{$tuple_aref}) {
+		if ($field == $parent) {
+		    $field->parentId(undef);                # tuple parent fields have parent_id==NULL
+		}
+		else {
+		    $field->parentId($parent->fieldId);
+		}
+		$field->status($FIELD_STATUS_TRACKLET, $run_id);
+	    }
+	    $dbh->commit();
+	}
+    }
+};
+
+if ($@) {
+    $dbh->rollback();
+    $mops_logger->logdie($@);
+}
+
+# Retire orphans.
+eval  {
+    for $field (@{$tuple_data->{ORPHANS}}) {
+        $field->status($FIELD_STATUS_LINKDONE, $run_id);     # nothing MOPS can do with these; retire them
+    }
+    $dbh->commit();
+};
+
+if ($@) {
+    $dbh->rollback();
+    $mops_logger->logdie($@);
+}
+
+$mops_logger->info(
+    mopslib_formatTimingMsg(
+        subsystem => 'TRACKLET',
+        time_sec => (time - $t0),
+        nn => $nn,
+    )
+);
+
+
+# Compute digests and submit stamp requests for NEO czaring.
+#if ($mops_config->{main}->{enable_digest}) {
+#    my $cmd = "nightly_digests --nn=$nn";
+#    system($cmd) == 0 or $mops_logger->logdie("TRACKLET: nightly_digests failed: %?");
+#}
+#if ($mops_config->{main}->{enable_stamps}) {
+#    my $cmd = "submit_stamps --fuzzy --quads --derived --nn=$nn";
+#    system($cmd) == 0 or $mops_logger->logdie("TRACKLET: nightly_digests failed: %?");
+#}
+#
+#
+## If tracklet known attribution is enabled, perform known attribution now.
+#if ($mops_config->{tracklet}->{attribute_known}) {
+#    my $cmd = "KNOWN_LOCAL --nn $nn --mark_status=$TRACKLET_STATUS_KNOWN";
+#    system($cmd) == 0 or $mops_logger->logdie('TRACKLET: KNOWN_LOCAL failed');
+#}
+
+exit;
+
+
+sub dump_debug_data {
+    # Dump stuff.
+    my ($tuple_data) = @_;
+    my ($k, $f, $goo, $thing);
+    my $tt;
+
+    $tt = $tuple_data->{TTI_TUPLES};
+    printf STDERR "Found %d TTI tuples:\n", scalar keys %{$tt};
+    foreach $k (sort keys %{$tt}) {
+        print STDERR $k, "\n";
+        $goo = 0;
+        foreach $f (@{$tt->{$k}}) {
+            if ($goo) {
+                $thing = int(($f->epoch - $tt->{$k}->[0]->epoch) * 1440);
+            }
+            else {
+                $thing = $f->epoch;
+                $goo = 1;
+            }
+            print STDERR "  ", join(" ", $f->fieldId, $f->ra, $f->dec, $thing), "\n";
+        }
+    }
+
+    printf STDERR "Found %d deep stacks:\n", scalar keys %{$tt};
+    $tt = $tuple_data->{DEEP_STACKS};
+    foreach $k (sort keys %{$tt}) {
+        print STDERR $k, "\n";
+        $goo = 0;
+        foreach $f (@{$tt->{$k}}) {
+            if ($goo) {
+                $thing = int(($f->epoch - $tt->{$k}->[0]->epoch) * 1440);
+            }
+            else {
+                $thing = $f->epoch;
+                $goo = 1;
+            }
+            print STDERR "  ", join(" ", $f->fieldId, $f->ra, $f->dec, $thing), "\n";
+        }
+    }
+
+    $tt = $tuple_data->{ORPHANS};
+    printf STDERR "Found %d TTI orphans:\n", scalar @{$tt};
+    print STDERR join(' ', map { $_->fieldId } @{$tt}), "\n";
+}
+
+
+sub insert_tracklets {
+    my ($filename, $method) = @_;
+    if (! -e $filename) {
+	print STDERR "No $filename\n";
+	return;
+    }
+    my $fh = new FileHandle $filename or die "can't open $filename";
+    my $line;
+    my ($dummy, $classification, @det_ids);
+    my $objectName;
+    my $det_id;
+    my $det;
+    my $ssm_id;
+
+    # Read all the lines and decide if we have to do tracklet triage.
+    my @all = <$fh>;
+    $fh->close();
+    my $max_tracklets = $mops_config->{tracklet}->{max_tracklets} || 1e9;
+
+    # If the number of tracklets is silly large, abandon this exposure altogether.
+    if ($method ne 'CHUNK') {
+        if (scalar @all > 5 * $max_tracklets) {
+            $mops_logger->info(sprintf "TRACKLET: abandoning $filename, >%d tracklets (%d)", 5 * $max_tracklets, scalar @all);
+            return;
+        }
+
+        if (scalar @all > $max_tracklets) {
+            $mops_logger->info(sprintf "TRACKLET: triaging $filename, >%d tracklets (%d)", 5 * $max_tracklets, scalar @all);
+            $mag_diff_control = 0.2;    # extreme!
+            $vtot_control_degperday = 0.4;
+        }
+    }
+
+    my @tracklets;
+    foreach $line (@all) {
+        next if $line =~ /^#/;                      # comment, skip
+        next unless $line =~ /^MIF-TRACKLET/;       # not MIF-TRACKLET, skip
+        ($dummy, $classification, @det_ids) = split /\s+/, $line;
+
+	# Before inserting, check our various controls (mag diff, GCR). This should help
+	# reject tracklets due to dipoles and other bad detection strangeness.
+	my $tracklet = validate_tracklet(0, $classification, @det_ids);
+	if (defined($tracklet)) {
+	    push @tracklets, $tracklet;         # keep it!
+	} elsif (scalar @det_ids == 4) {
+	    # Subsets of 3-detections when size of tracklet is 4
+	    my @sub_det_ids = ( $det_ids[0], $det_ids[1], $det_ids[2] );
+	    my $subtracklet = validate_tracklet(1, $classification, @sub_det_ids);
+	    if (defined($subtracklet)) {
+		push @tracklets, $subtracklet;         # keep it!
+	    }
+	    @sub_det_ids = ( $det_ids[0], $det_ids[1], $det_ids[3] );
+	    $subtracklet = validate_tracklet(1, $classification, @sub_det_ids);
+	    if (defined($subtracklet)) {
+		push @tracklets, $subtracklet;         # keep it!
+	    }
+	    @sub_det_ids = ( $det_ids[1], $det_ids[2], $det_ids[3] );
+	    $subtracklet = validate_tracklet(1, $classification, @sub_det_ids);
+	    if (defined($subtracklet)) {
+		push @tracklets, $subtracklet;         # keep it!
+	    }
+	}
+    }
+    undef(@all);
+
+    # If we *still* have too many tracklets, force the max number.
+    if (scalar @tracklets > $max_tracklets) {
+        @tracklets = @tracklets[0..$max_tracklets - 1];
+    }
+    
+    # Insert em finally!
+    foreach my $tracklet (@tracklets) {
+        $tracklet->insert() or $mops_logger->logdie("can't insert tracklet");
+    }
+}
+
+sub _sep_rad {
+    # Support routine for assembleTTITuples.
+    my ($f1, $f2) = @_;
+    return slaDsep(
+        $f1->{ra} / $DEG_PER_RAD, $f1->{dec} / $DEG_PER_RAD,
+        $f2->{ra} / $DEG_PER_RAD, $f2->{dec} / $DEG_PER_RAD,
+    );
+}
+
+
+sub assembleTupleData {
+
+=item mopslib_assembleTTITuples
+
+Given a list of fields, group them into TTI stacks and return a data structure
+like the following:
+
+$res = {
+    TTI_TUPLES => {
+        FIELD_ID_A => [ $field_1, $field_2, $field_A ],
+        FIELD_ID_B => [ $field_3, $field_4, $field_B ],
+    },
+    DEEPSTACKS => {
+        FIELD_ID_C => [ $field_5, $field_6, $field_C ],
+        FIELD_ID_D => [ $field_7, $field_8, $field_D ],
+    },
+    ORPHANS => [ $field_10, $field_11, ... ],
+}
+
+=cut
+
+    my %args = validate(@_,  {
+        fields => 1,                # field list ref
+        min_fields => 1,            # min number of fields required for tuple
+        max_fields => 1,            # max number of fields required for tuple
+        min_tti_min => 1,           # min time between successive fields
+        max_tti_min => 1,           # max time between succesive fields
+        max_time => 0,              # max time for complete tuple
+        max_deep_tuple => 0,        # max num exposures in deep stack
+        any_filter => 0,            # allow any filter in TTI (default no => require same filter)
+        no_deep_stacks => 0,        # disallow deep stacks (> min_fields)
+    });
+    my @inp_fields = sort { $a->{epoch} <=> $b->{epoch} } @{$args{fields}};      # copy fields, sort by field epoch
+    my $min_fields = $args{min_fields};
+
+    my %tuples;
+    my %deep_stacks;
+    my %chunks;
+    my @orphans;
+
+    my $res = {};           # results go here
+    my ($f, $f1, $idx);     # field objects
+
+    my $min_tti_span_mjd = $args{min_tti_min} / $MINUTES_PER_DAY;
+    my $max_tti_span_mjd = $args{max_tti_min} / $MINUTES_PER_DAY;
+    my $MAX_SEP_RAD = 0.1 / $DEG_PER_RAD;                               # .1 degree max spatial separation of TTI pair
+    my $max_deep_tuple = $args{max_deep_tuple} || 8;
+
+    # These will keep track of the range of times for the current tuple of fields.
+    my $current_tuple;
+    my $time_since_last_mjd;
+
+    # Main loop here.  Since the fields have been sorted in time, all subsequent tuple matches
+    # will extend the range of the tuple.  Only extend when the extension is less than some function
+    # of the nominal TTI, for now 1.5 * TTI.
+    #
+    # The outside while loop retrieves a field from the list of all fields to be processed.
+    # The inner for loop looks through all of the remaining fields in the list of
+    # all fields for for fields with the same RA/DEC and creates a foot print 
+    # containing all the fields with the same bore site. Matched fields are  
+    # removed from the list of fields.
+    # The next iteration of the while loop will select a field with a different
+    # boresight a new footprint will be created.
+    while (@inp_fields) {
+        $f = shift @inp_fields;     # get first in list
+        $current_tuple = {
+            TYPE => 'ORPHAN',   # a dummy value
+            TUPLE => [ $f ],    # start current tuple
+        };
+
+        # Need special PS1 rules for unaligned single-color chunkwise quads.
+        my $chunk_match = undef;        # when set, indicates we are trying to match a chunk for this field
+        my $survey_mode = normalize_survey_mode($f->surveyMode);
+        my $chunk_match_len = length $survey_mode;
+
+        # Now check whether our normalized name looks like a quaddish name.
+#            ($survey_mode =~ /^\d+\.3PI.[gri]\.([AB]\w\w\d\.Q)[12]/)
+#            ($survey_mode =~ /^([AB]\w\w\d\.Q)[12]/)
+        if ($allow_chunk) {
+            if ($survey_mode =~ /([AB]\w\w\d)/) {
+                $chunk_match = $1;
+                $chunk_match_len = length $chunk_match;
+            }
+            elsif ($survey_mode =~ /^([AB]\w\w\d\.[JK])\./)
+            {
+                # 09 DEC 2011 P1/Q1 => J, P2/Q2 => K
+                $chunk_match = $1;
+                $chunk_match_len = length $chunk_match;
+            }
+        }
+
+        # Loop through all the remaining fields.
+        $idx = 0;
+        foreach ($idx = 0; $idx <= $#inp_fields; $idx++) {
+            $f1 = $inp_fields[$idx];
+            # Calculate the amount of time seperating the current field from the previous field.
+            $time_since_last_mjd = $f1->{epoch} - $current_tuple->{TUPLE}->[-1]->{epoch};
+
+            if ($chunk_match && substr(normalize_survey_mode($f1->surveyMode), 0, $chunk_match_len) eq $chunk_match) {
+                # See if it's a chunkable field.
+                $current_tuple->{TYPE} = 'CHUNK';
+                push @{$current_tuple->{TUPLE}}, $f1;
+                splice @inp_fields, $idx, 1;        # extract item, compressing list
+                $idx--;
+            }
+            # Ensure that the w filter is not combined with any other filter.
+            elsif ((($args{any_filter} and $f->{filter} ne 'w' and $f1->{filter} ne 'w') || ($f1->{filter} eq $f->{filter})) and _sep_rad($f, $f1) < $MAX_SEP_RAD) {
+                # Accept the current field into the tuple if the field center is approximately
+                # coincident and within the allowed time interval (1.5 * nominal TTI).
+                if ($time_since_last_mjd > $min_tti_span_mjd and $time_since_last_mjd < $max_tti_span_mjd) {
+                    # Normal TTI tuple.
+                    $current_tuple->{TYPE} = 'TTI';
+                    push @{$current_tuple->{TUPLE}}, $f1;
+                    splice @inp_fields, $idx, 1;        # extract item, compressing list
+                    $idx--;
+                    last if (scalar @{$current_tuple->{TUPLE}} >= $args{max_fields});
+                }
+                elsif ($time_since_last_mjd < $min_tti_span_mjd and !$args{no_deep_stacks} and scalar @{$current_tuple->{TUPLE}} < $max_deep_tuple) {
+                    # Deep stack (short time sequences).
+                    $current_tuple->{TYPE} = 'DEEP';
+                    push @{$current_tuple->{TUPLE}}, $f1;
+                    splice @inp_fields, $idx, 1;        # extract item, compressing list
+                    $idx--;
+
+                    last if (scalar @{$current_tuple->{TUPLE}} >= $max_deep_tuple);
+                }
+            }
+        }    # foreach
+
+        # Now figure out how to classify the tuple.  If the length is less than
+        # tuplewise_min_fields, it's an ORPHAN.  If length is equal to tuplewise_min_fields,
+        # it's a TTI_TUPLE.  Otherwise (longer), it's a DEEP_STACK.     
+        if ($current_tuple->{TYPE} eq 'CHUNK' and scalar @{$current_tuple->{TUPLE}} >= 3) {     # 3 => blech
+            $chunks{$current_tuple->{TUPLE}->[-1]->{fieldId}} = $current_tuple->{TUPLE};        # store ref to list
+        }
+        elsif (scalar @{$current_tuple->{TUPLE}} >= $min_fields) {
+            if (scalar @{$current_tuple->{TUPLE}} <= $args{max_fields}) {
+                $current_tuple->{TYPE} = 'TTI';
+                $tuples{$current_tuple->{TUPLE}->[-1]->{fieldId}} = $current_tuple->{TUPLE};   # store ref to list
+            }
+            else {
+                $current_tuple->{TYPE} = 'DEEP';
+                $deep_stacks{$current_tuple->{TUPLE}->[-1]->{fieldId}} = $current_tuple->{TUPLE};    # store ref to list
+            }
+        }
+        else {
+            # Not enough fields, so orphan them.
+            push @orphans, @{$current_tuple->{TUPLE}};
+        }
+    }   # while
+
+    $res->{TTI_TUPLES} = \%tuples;
+    $res->{DEEP_STACKS} = \%deep_stacks;
+    $res->{CHUNKS} = \%chunks;
+    $res->{ORPHANS} = \@orphans;
+
+    return $res;
+}
+
+
+sub normalize_survey_mode {
+    # Want to match e.gr. 3PI.i.APN0.Q1, etc.  Chunk names have changed several times during
+    # OC 136/137/138, so we need to normalize.
+    my ($s) = @_;
+
+    # Convert OC 136 name to something we can quad-match (an OC 137 name).
+    # This routine is probably broken with recent brick chunk names.  But we
+    # aren't doing chunk-wide tracklet finding now (09 DEC 2011).
+    if ($s =~ /^\d+\.3PI.[gri]\.([AB])-(\w\w)-([PQ][12])\+(\d)$/) {
+        $s = "$1$2$4.$3";
+    }
+    elsif ($s =~ /^\d+\.3PI.\d\d\.([AB]\w\w\d)\.[JK]/) {
+        $s = $1;
+    }
+
+    return $s;
+}
+
+sub validate_tracklet {
+    my ($validationContext, $classification, @det_ids) = @_;
+
+    my $local_gcr_thresh_arcsec = $validationContext==0 ? $gcr_thresh_arcsec : $gcr_thresh_arcsec_conservative;
+    my $local_high_gcr_thresh_arcsec = $validationContext==0 ? $high_gcr_thresh_arcsec : $high_gcr_thresh_arcsec_conservative;
+    
+    my @dets;
+    my %filtermags;     # max and min for each filter band;
+    my $mag;
+    my $filt;
+    foreach my $det_id (@det_ids) {
+	my $det = modcd_retrieve($inst, detId => $det_id) || die "can't fetch detection ID $det_id";
+	$filt = $det->filter;
+	$mag = $det->mag;
+	if (!exists($filtermags{$filt})) {
+	    $filtermags{$filt}->{MIN} = $mag;
+	    $filtermags{$filt}->{MAX} = $mag;
+	} else {
+	    $filtermags{$filt}->{MIN} = $mag if $mag < $filtermags{$filt}->{MIN};
+	    $filtermags{$filt}->{MAX} = $mag if $mag > $filtermags{$filt}->{MAX};
+	}
+	# Save the det for our tracklet.
+	push @dets, $det;
+    }
+
+    # Before we compute GCR, check for something stupid: that the end detections are not
+    # coincident.
+    if (_sep_rad($dets[0], $dets[-1]) < (1 / 3600 / 1000)) {
+	return;   # quietly skip
+    }
+
+    # Mag range must meet control if specified.
+    if ($mag_diff_control) {
+	while (my ($k, $v) = each %filtermags) {
+	    # Skip if our range for this filter is too large.
+	    if ($v->{MAX} - $v->{MIN} > $mag_diff_control) {
+		return;
+	    }
+	}
+    }
+
+    # XXX Should we do this for "unfound" tracklets as well?
+    # XXX LD 2012-10-14 YES
+    my $objectName;
+    my $ssm_id;
+    if ($classification eq $MOPS_EFF_UNFOUND) {
+	($classification, $objectName) = modcd_classifyDetections($inst, @dets);
+	$classification = $MOPS_EFF_UNFOUND;    # keep as UNFOUND
+    } else {
+	($classification, $objectName) = modcd_classifyDetections($inst, @dets);
+    }
+    $ssm_id = modcs_objectName2ssmId($inst, $objectName);
+
+    # GCR.  Workaround for two-detection tracklets.
+    my $gcr_arcsec = @dets == 2 ? 0 : PS::MOPS::GCR::compute_gcr(\@dets);
+
+    my $tracklet = PS::MOPS::DC::Tracklet->new(
+	$inst,
+	detections => \@dets,
+	classification => $classification,
+	ssmId => $ssm_id,
+	gcr_arcsec => $gcr_arcsec,
+        ) or $mops_logger->logdie("can't create tracklet using detections " . join(' ', @det_ids));
+
+    # Min velocity check.
+    if (!defined($tracklet->vTot)) {
+	$mops_logger->info("TRACKLET: got undefined vTot for " . join(' ', map { $_->detId } @dets));
+	return;       # zero velocity, bogus
+    }
+    if ($tracklet->vTot < $minv_degperday) {
+	return;
+    }
+
+    # we are allowing all fast ones
+    if ($do_high_gcr) {
+	if ($tracklet->vTot < $high_gcr_minv_degperday) {
+	    if ($gcr_arcsec > $local_gcr_thresh_arcsec) {
+		return;
+	    }
+	} else {
+	    if ($gcr_arcsec > $local_high_gcr_thresh_arcsec) {
+		return;
+	    }
+	}
+    } else {
+	if ($gcr_arcsec > $local_gcr_thresh_arcsec) {
+	    return;
+	}
+    }
+
+    # Last ditch checks.
+    if ($tracklet->vTot > $vtot_control_degperday) {
+	return;
+    }
+
+    return $tracklet; # All good
+}

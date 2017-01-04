@@ -1,0 +1,396 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+nightly_digests - Compute nightly NEO digests in batch
+
+=head1 SYNOPSIS
+
+nightly_digests --nn NIGHTNUM [FIELD_ID1 FIELD_ID2 ...]
+
+  --nn NIGHTNUM : submit requests for all tracklets in night
+  --known_pairs : process only known pairs; otherwise all quads (known or unknown)
+  --pairs : process czarable pairs
+  --all : all nonsynthetic tracklets
+  --field_status=X : only use tracklets from fields with specified status
+  --digest2_bin FILE : override default binary of 'digest2'
+  --data_dir DIR : override default data dir of $MOPS_HOME/data/digest2
+  --help : show this manpage
+
+=head1 DESCRIPTION
+
+Processes NEO digests in batch using the Google Code digest2 program from the MPC.
+
+=cut
+
+
+use strict;
+use warnings;
+use Pod::Usage;
+use Getopt::Long;
+use File::Spec;
+use File::Temp;
+use Cwd;
+
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::MPC qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Tracklet;
+
+# Start program here.
+my $LABEL = 'digest2';
+my $instance_name;
+my $nn;
+my $field_status;
+my $known_pairs;
+my $pairs;
+my $all;
+my $digest2_bin = 'digest2';
+my $data_dir = "$ENV{MOPS_HOME}/data/digest2";
+my $rms_threshold;
+my $debug;
+my $help;
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => undef);
+my $ml = $inst->getLogger();
+my $mc = $inst->getConfig();
+my @field_ids;
+
+my $NUM_JOBS = $mc->{main}->{cpus} || 72;
+my $MIN_TRACKLETS = $mc->{tracklet}->{minTrackletsForDigest} || 100;
+
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    'field_status=s' => \$field_status,
+    known_pairs => \$known_pairs,
+    pairs => \$pairs,
+    all => \$all,
+    'digest2_bin=s' => \$digest2_bin,
+    'data_dir=s' => \$data_dir,
+    rms_threshold => \$rms_threshold,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+if (@ARGV) {
+    @field_ids = @ARGV;
+}
+else {
+    die("Night number not specified") unless $nn;
+}
+my $t0 = time;
+
+$SIG{'INT'} = 'my_int_handler';
+
+# If the RMS threshold is not defined then get the maximum RMS deviation from
+# linear that a detection may have in arcsec from the schema configuration
+$rms_threshold ||= $mc->{tracklet}->{high_gcr_thresh_arcsec} 
+    || $mc->{tracklet}->{fit_threshold_arcsec} 
+    || die "can't determine fit_threshold_arcsec";
+my $field_status_str = $field_status ? "f.status='$field_status' and" : '';
+
+# Select tracklets that have more than two detections. (i.e. Tracklets that
+# are from a quad).
+my $dbh = $inst->dbh;
+my $sth;
+my $sql;
+my $classification_str = $mc->{tracklet}->{compute_synthetic_digests} ? '' : "and t.classification='N'";
+
+if (@field_ids) {
+    my $field_id_str = join(',', @field_ids);
+    $sql = <<"SQL";
+select t.tracklet_id tracklet_id 
+from tracklet_attrib ta 
+    join tracklets t ignore index(classification) using(tracklet_id) 
+    join fields f using(field_id) 
+where field_id in ($field_id_str)
+group by tracklet_id
+SQL
+    $sth = $dbh->prepare($sql) or $ml->logdie($dbh->errstr . ": $sql");
+    $sth->execute() or $ml->logdie($sth->errstr);
+}
+elsif ($known_pairs) {
+    $sql = <<"SQL";
+select t.tracklet_id tracklet_id 
+from tracklet_attrib ta 
+    join tracklets t ignore index(classification,known_id) using(tracklet_id) 
+    join fields f using(field_id) 
+    join known k using(known_id)
+where $field_status_str f.nn=? $classification_str
+group by tracklet_id
+having count(*) = 2
+order by t.v_tot desc
+SQL
+    $sth = $dbh->prepare($sql) or $ml->logdie($dbh->errstr . ": $sql");
+    $sth->execute($nn) or $ml->logdie($sth->errstr);
+}
+elsif ($pairs) {    
+    $sql = <<"SQL";
+select t.tracklet_id tracklet_id 
+from tracklet_attrib ta 
+    join tracklets t ignore index(classification) using(tracklet_id) 
+    join fields f using(field_id) 
+where $field_status_str f.nn=? $classification_str
+/*and ((t.v_tot between 0.15 and 0.9) or t.v_tot >= 1.2)*/
+and t.probability > 0.5
+group by tracklet_id
+having count(*) = 2
+order by t.v_tot desc
+SQL
+    $sth = $dbh->prepare($sql) or $ml->logdie($dbh->errstr . ": $sql");
+    $sth->execute($nn) or $ml->logdie($sth->errstr);
+}
+elsif ($all) {    
+    $sql = <<"SQL";
+select t.tracklet_id tracklet_id 
+from tracklet_attrib ta 
+    join tracklets t ignore index(classification) using(tracklet_id) 
+    join fields f using(field_id) 
+where $field_status_str f.nn=? and /* t.classification='N' and */ t.v_tot > .001
+and t.probability > 0.1
+group by tracklet_id
+SQL
+    $sth = $dbh->prepare($sql) or $ml->logdie($dbh->errstr . ": $sql");
+    $sth->execute($nn) or $ml->logdie($sth->errstr);
+}
+else {
+    $sql = <<"SQL";
+select t.tracklet_id tracklet_id 
+from tracklet_attrib ta 
+    join tracklets t ignore index(classification) using(tracklet_id) 
+    join fields f using(field_id) 
+where $field_status_str f.nn=? $classification_str and t.v_tot > .001
+group by tracklet_id
+having count(*) > 2
+
+union
+
+select t.tracklet_id tracklet_id 
+from tracklet_attrib ta 
+    join tracklets t ignore index(classification) using(tracklet_id) 
+    join fields f using(field_id) 
+where $field_status_str f.nn=? $classification_str and t.v_tot > 1.2
+group by tracklet_id
+having count(*) = 2
+SQL
+    $sth = $dbh->prepare($sql) or $ml->logdie($dbh->errstr . ": $sql");
+    $sth->execute($nn, $nn) or $ml->logdie($sth->errstr);
+}
+
+$ml->info(sprintf "NEODIGEST: evaluating %d tracklets.", $sth->rows);
+
+# Calculate the number of tracklets to place in each input file.
+my $num_tracklets = $sth->rows;
+my $remainder = $num_tracklets % $NUM_JOBS;
+my $quotient = int($num_tracklets/$NUM_JOBS);
+
+# Check to see if there are any tracklets selected. If none were selected then
+# exit as there are no tracklets for which to calculate digests.
+$ml->info("Processing $num_tracklets tracklets.");
+if ($num_tracklets == 0) {
+	$ml->info("Exiting nightly_digests as there is nothing to do");
+	exit;
+}
+# Check to see if $num_tracklets is larger than $MIN_TRACKLETS. If it isn't then
+# don't parallelize digest generation. Set $NUM_JOBS to 1 and place all tracklets 
+# in one file and create only one condor job.
+if ( $num_tracklets < $MIN_TRACKLETS ) {
+	$NUM_JOBS = 1;
+	$quotient = $num_tracklets;
+	$remainder = 0;
+}
+
+# Create our working directory, and go there. 
+my $dir = $inst->makeNNDir(NN => $nn, SUBSYS => $LABEL, FORCE_EMPTY => 1); 
+chdir $dir or $ml->logdie("Can't chdir to $dir");
+
+# Write out our input files. There will be $NUM_JOBS input files. Each file 
+# contains MPC-formatted designations.
+# Since tracklet IDs can be large, map the integer tracklet ID into a packed 
+# designation six digits long. This is done to accomodate the 80 character 
+# limit of the MPC-format used to report observations.
+my $href;
+#my $TMPDIR = File::Temp::tempdir('/tmp/digest2.XXXXXXXX', CLEANUP => 1) or die "can't create temp dir";
+my $TMPDIR = '.';
+my $FILENAME = 'neodigest';
+my %desig2trk;
+my $desig;
+my $trk;
+for (my $i = 0; $i < $NUM_JOBS; $i++) {
+	my $tmpfname = File::Spec->catfile($TMPDIR, $FILENAME.$i); 
+	open(OUT, ">", $tmpfname) or 	$ml->logdie("Can't create $tmpfname.");
+	print STDERR "\nWriting $tmpfname.\n" if $debug;
+
+	my $r;
+
+	# This if statement evenly distributes any remaining tracklets among the
+	# input files by setting $r to 1 if there is a remainder. $r is added to the 
+	# total number of tracklets written to an input file.
+	if ($remainder-- > 0) {
+		$r = 1;
+	} else {
+		$r = 0;
+	}
+
+	# For all of the tracklets with three or more detections
+	# 	* retrieve the tracklet
+	#   * convert tracklet id into a 6 digit designation
+	#   * save tracklet in a hash keyed on the packed 6 digit designations
+	#	  * convert tracklet detections into the MPC format, and save to temp file	
+	for (my $j = 0; $j < ($quotient + $r); $j++) {
+        $href = $sth->fetchrow_hashref();
+        $trk = modct_retrieve($inst, trackletId => $href->{tracklet_id}) or 
+            $ml->logdie ("can't fetch tracklet ID " . $href->{tracklet_id});
+        $desig = mopslib_toB62($trk->trackletId, 'T000000');
+        $desig2trk{$desig} = $trk;      # save mapping from desig to tracklet
+        print OUT det2mpc($_, $desig), "\n" foreach @{$trk->detections};
+   }
+   close(OUT);
+}
+
+
+# Submit the digest job to the condor cluster. 
+$ml->info("Creating $NUM_JOBS condor jobs to calculate digests.");
+eval {
+	execute_condor_job($NUM_JOBS);
+};
+$ml->logdie($@) if $@;
+
+# Now process the output files.
+my $line;
+my ($rms, $int_score, $neo_score);
+my $digest;
+my $n = 0;
+	
+# Loop through all of the digests files created and:
+#		* retrieve the designation, the RMS of residuals in arc seconds of the 
+#     observations against a great circle fit, and the NEO digest
+#		* get the tracklet associated with the 6 digit designation
+#		* verify that the RMS calculated is not larger than twice the RMS 
+#     threshold specified in the master configuration. If it is then set the
+#     NEO digest to zero.
+#		* Save calculated digest to digest column in tracklet table.
+for (my $i = 0; $i < $NUM_JOBS; $i++) {
+	open(IN, "<", "$LABEL.stdout.$i");  	
+	while ($line = <IN>) {
+        # digest2 v 0.10 looks like this without digest2.config
+        # Desig.    RMS Int NEO N22 N18 Other Possibilities
+        # T196298  0.03  75  74  15   0 (MC 17) (MB1 <1) (MB2 4) (MB3 3) (Hil <1) (JFC 1)
+        #
+        # digest2 v 0.10 looks like this WITH digest2.config specifying NEOs only
+        # Desig.    RMS NEO
+        # T196298  0.03 75
+
+        next unless $line =~ /^T/;      # must look like digest output
+        ($desig, $rms, $neo_score) = split /\s+/, $line;
+        $trk = $desig2trk{$desig} || $ml->logdie("missing tracklet for $desig");
+
+        $digest = $neo_score;
+#        if ($rms < $rms_threshold * 2) {
+#            $digest = $neo_score;
+#        }
+#        else {
+#            $digest = 0;   # doesn't meet threshold, mark as unprobable
+#        }
+
+        if ($debug) {
+            # Print calculated digest to standard error.
+            print STDERR $trk->trackletId . "/$desig => $digest\n";
+        }
+        else {
+            # Save calculated digest to digest column in tracklet table.
+            $trk->digest($digest);
+        }
+	}
+	close(IN);
+}
+
+# Log timing information.
+$ml->info(
+	mopslib_formatTimingMsg(
+  	subsystem => 'DIGEST2',
+  	time_sec => (time - $t0),
+    nn => $nn));
+&clean_up;
+exit;
+
+#-------------------------------------------------------------------------------
+# execute_condor_job($num_jobs)
+#
+# Parameters
+#		$num_jobs -	Number of condor jobs to create.
+#
+# Description
+#		Creates a condor job file which will be used to submit the digest jobs to 
+#   the cluster.
+#-------------------------------------------------------------------------------
+sub execute_condor_job {
+    my ($num_jobs) = @_;
+    my $inst = PS::MOPS::DC::Instance->new(DBNAME => undef);
+		my $ml = $inst->getLogger();
+		my $mc = $inst->getConfig();  #MOPS configuration
+		my $dir = Cwd::getcwd(); 
+		
+    # Extract the environment the remote jobs run in.
+    my $remote_mops_home = $mc->{cluster}->{MOPS_HOME} || $ENV{'MOPS_HOME'};
+    my $remote_path = $mc->{cluster}->{PATH} || $ENV{'PATH'};
+    my $remote_perl5lib = $mc->{cluster}->{PERL5LIB} || "$remote_mops_home/lib/perl";
+    my $remote_pythonpath = $mc->{cluster}->{PYTHONPATH} || "$remote_mops_home/lib/python";
+    my $remote_ld_library_path = $mc->{cluster}->{LD_LIBRARY_PATH} || "$remote_mops_home/lib";
+    my $remote_caet_data = $mc->{cluster}->{CAET_DATA} || $ENV{'CAET_DATA'};
+    my $remote_oorb_data = $mc->{cluster}->{OORB_DATA} || $ENV{'OORB_DATA'};
+    my $remote_orbfit_data = $mc->{cluster}->{ORBFIT_DATA} || $ENV{'ORBFIT_DATA'};
+    my $environment = "MOPS_HOME=$remote_mops_home CAET_DATA=$remote_caet_data OORB_DATA=$remote_oorb_data ORBFIT_DATA=$remote_orbfit_data PATH=$remote_path PERL5LIB=$remote_perl5lib PYTHON_PATH=$remote_pythonpath LD_LIBRARY_PATH=$remote_ld_library_path";
+    my $dbname = $inst->dbname();
+
+    my $job_str = <<"JOB";
+universe = vanilla
+executable = $remote_mops_home/bin/$digest2_bin
+arguments = $FILENAME\$(Process)
+environment = "$environment MOPS_DBINSTANCE=$dbname"
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+transfer_input_files = $TMPDIR/$FILENAME\$(Process), $data_dir/digest2.config, $data_dir/digest2.model, $data_dir/digest2.obscodes
+initialdir = $dir 
+log = $LABEL.condorlog
+error = $LABEL.stderr.\$(Process)
+output = $LABEL.stdout.\$(Process)
+input = /dev/null
+notification = Error
+queue $num_jobs
+JOB
+
+    # Write job string to disk.
+    my $job_fh = new FileHandle ">$LABEL.cmd";
+    $job_fh->print($job_str);
+    $job_fh->close;
+
+    # Read stuff created by condor when creating the job so we can 
+    # guess job ID.
+    open CONDUH, "condor_submit $LABEL.cmd|" or $ml->logdie("$LABEL: condor_submit failed");
+    my @submit_stuff = <CONDUH>;
+    close CONDUH;
+
+    # Suss out the Condor job ID.
+    my $job_id = '';
+    if ($submit_stuff[-1] =~ /submitted to cluster (\d+)/) {
+        $job_id = $1;
+    }
+    
+    # Sleep for a fraction of a second to give condor_submit the time to 
+    # create the log file. Is this necessary?
+    sleep(0.5);
+
+    #$ml->info("DIGEST: monitoring $LABEL.condorlog (job ID $job_id)");
+    system("condor_wait $LABEL.condorlog $job_id") == 0 or $ml->logdie("$LABEL: condor_wait failed");
+}
+
+sub clean_up { 
+	unlink glob "$TMPDIR/*"; 
+	rmdir $TMPDIR; 
+} 
+sub my_int_handler { 
+	&clean_up; 
+	die "interrupted, exiting...\n"; 
+} 
+

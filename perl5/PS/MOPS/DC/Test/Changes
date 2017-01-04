@@ -1,0 +1,6 @@
+Revision history for Perl extension PS::MOPS::DC::Test.
+
+0.01  Fri Feb 25 10:16:07 2005
+	- original version; created by h2xs 1.22 with options
+		-AXO PS::MOPS::DC::Test
+

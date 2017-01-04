@@ -1,0 +1,44 @@
+Attendees: Bolin, Chastel, Denneau, Veres
+
+* Telescope Status
+No  report
+* IPP Issues
+  - IPP Trail fitting
+SC: Showed the comments page to EAM (Magnier) http://mopshq2.ifa.hawaii.edu/studies/trailfitting/
+  - Convolution
+1d-convolution: SC showed results to EAM (test set conv02). EAM: Problem in IPP parameters. Will run new test.
+dual: SC processed it http://mopshq2.ifa.hawaii.edu/model/psmops_schastel_conv03/index.html not better but not worse than original results in terms of detections and tracklets see http://mopshq2.ifa.hawaii.edu/model/psmops_ps1_mdrm152/index.html?tjd=6370&proj=h for original data. (Note: Incomplete data for OSS so niot analyzed)
+* Data Processing
+-> LD: we need validation tests to measure and accept/reject IPP changes
++ define a set of exposures that the IPP will have to process with each new "release"
++ at some point ingest synthetic asteroids to measure the IPP/MOPS efficiency
+-> panda failure in PV G96 simulations: LD and SC found where the bug was but it still needs to be fixed.
+* NEO Status
+-> Bad weather, telescope failure
+-> PV will take Micheli's activities for CFHT follow-up. Use astrometry.net software to process the images? LD suggests to use JT tphot for photometry for cfht images.
+
+* NEO Czaring
+-> Nothing to report
+
+* Comets
+-> No report
+
+* ATLAS
+-> Nothing to report
+
+* AOB
+->  RJW: pairwise processing of w-band quads - to look for fast moving objects.
+  - will need to be czared after the quads
+  - recommend that we limit it only to high rate of motion - no pairs presented for < 0.6 deg/day
++ PV/LD/SC: 2 deg/day or more otherwise too many tracklets
++ Use orientation to reject burns.
++ Strategy: link visits 1 and 2, visits 2 and 3, 3 and 4 for sure (maybe later visits 1 and 3, 2 and 4, and 1 and 4 but high risk of mislinkages). Reject pairs which are a subset of a triplet/quadlet previously found. Display in separate page.
+-> RJW: comet czaring - can the displayed ranking on the comet czar page be tweaked a little to push higher signal-to-noise objects a little higher.
+  - specific case to look at - P1080KW on August 14 UT
+  - identified as interesting by our parameters, but buried below low signal-to-noise ratio spurious objects
++ Using s2n will make bright asteroids pop up (and we don't want that).
++ More a question of removing the non-detection detections.
+-> LD ingested CFHT smfs but astrometry is not reliable.
+-> SC on vacation for the next 2 weeks
+-> Marco Micheli left the IfA.
+

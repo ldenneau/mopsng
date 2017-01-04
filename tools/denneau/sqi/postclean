@@ -1,0 +1,105 @@
+#!/usr/bin/env perl
+
+
+=head1 SYNOPSIS
+
+postclean [options] FPA_ID FILE
+
+=head1 OPTIONS
+
+  --flags
+  --linear
+  --density
+  --silly
+  --burn
+  --s2n
+
+=head1 DESCRIPTION
+
+Astroclean a field after it has been ingested.
+
+=cut
+
+
+use strict;
+use warnings;
+
+use Carp;
+use Getopt::Long;
+use Pod::Usage;
+use File::Slurp;
+use Cwd;
+
+use FileHandle;
+use Math::Trig;
+use LWP::Simple;
+
+
+use Astro::FITS::CFITSIO qw(:longnames :shortnames :constants);
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+
+my $instance_name;
+my $inst;
+my $flags;
+my $linear;
+my $density;
+my $silly;
+my $s2n;
+my $burn;
+my $debug;
+my $reject_flags = 0x3888;          # per IPP, see XXX HREF
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    flags => \$flags,
+    linear => \$linear,
+    density => \$density,
+    silly => \$silly,
+    burn => \$burn,
+    s2n => \$s2n,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+my ($fpa_id, $filename) = @ARGV;
+pod2usage(-msg => 'FPA_ID not specified') unless $fpa_id;
+pod2usage(-msg => 'FILENAME not specified') unless $filename;
+pod2usage(-msg => "Can't read $filename") unless -e $filename;
+
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_logger = $inst->getLogger();
+my $mops_config = $inst->getConfig();
+my $dbh = $inst->dbh();
+
+my $S2N_LIMIT = $mops_config->{site}->{limiting_s2n} or die "can't get limiting_s2n";
+
+# Read remaining good dets from input file.
+my @det_ids;
+my $inf = new FileHandle $filename or die "can't open $filename";
+while (my $line = <$inf>) {
+    $line =~ s/ .*$//;  # strip everything after first token
+    push @det_ids, $line;
+}
+$inf->close();
+
+# Mark all detections as cleaned or low S/N by default.  We will mark the survivors from the
+# cleaning process as 'F'.
+$dbh->do("update detections d join fields f using(field_id) set d.status='I' where f.fpa_id='$fpa_id'") or die $dbh->errstr;
+$dbh->do("update detections d join fields f using(field_id) set d.status='L' where d.s2n < $S2N_LIMIT and f.fpa_id='$fpa_id'") or die $dbh->errstr;
+
+# Now update all nonsynthetic dets in field as found if they survived our astrocleaning..
+my $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+update detections set status='F' where det_id=?
+SQL
+
+$dbh->begin_work;
+for (@det_ids) {
+    $sth->execute($_) or die "status update failed for $_";
+}
+$dbh->commit;
+
+exit;

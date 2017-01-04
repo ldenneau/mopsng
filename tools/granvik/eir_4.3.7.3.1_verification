@@ -1,0 +1,102 @@
+#!/bin/bash
+ 
+# Verification test for EIR 4.3.7.3.1 (ssm orbits size)
+# Mikael Granvik  07/28/2008
+
+USERNAME="granvik"
+STUB="eir_43731_verification"
+INSTANCE_NAME="psmops_granvik_emptysim"
+NSSM=100000000
+MYSQLHOST="mops00"
+MYSQLUSER="mops"
+MYSQLPASSWD="mops"
+
+echo "1..1"
+
+# Initialize empty MOPS DB
+source $HOME/bin/mops_env $INSTANCE_NAME
+buildInstance --description "Empty sim" &> /dev/null
+
+# Remove unique field 'object_name' from table 'ssm', because it
+# is time consuming to produce:
+echo \
+"
+create table ssm2(
+    ssm_id bigint not null auto_increment,
+    q real not null             comment 'semi-major axis, AU',
+    e real not null             comment 'eccentricity e (dimensionless)',
+    i real not null             comment 'inclination, deg',
+    node real not null          comment 'longitude of ascending node, deg',
+    arg_peri real not null      comment 'argument of perihelion, deg',
+    time_peri real not null     comment 'time of perihelion, MJD',
+    epoch real not null         comment 'epoch of osculating elements, MJD',
+    h_v real not null           comment 'Absolute magnitude',
+    h_ss real                   comment '??',
+    g real                      comment 'Slope parameter g, dimensionless',
+    albedo real                 comment 'Albedo, dimensionless',
+
+    moid_1 real                 comment 'Vestigial, deprecated',
+    moid_long_1 real            comment 'Vestigial, deprecated',
+    moid_2 real                 comment 'Vestigial, deprecated',
+    moid_long_2 real            comment 'Vestigial, deprecated',
+
+    object_name varbinary(32)   comment 'MOPS synthetic object name',
+    taxonomic_type char(2)      comment 'Asteroid taxonomic type (vestigial, deprecated)',
+    desc_id bigint null         comment 'Pointer to SSM description',
+
+    PRIMARY KEY (ssm_id),
+    index(object_name),
+    index(epoch)
+) type=InnoDB;
+" | mysql -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME
+
+# Write more than 1,000,000 SQL insertion commands to a single string
+str="INSERT INTO ssm2() VALUES(); "
+a=1
+while (( a <= 1000000 ))
+  do
+  str="$str$str"
+  let a=a*2
+done
+
+# Write the stuff into the table
+b=0
+while (( b <= $NSSM ))
+  do
+  echo \
+"
+SET AUTOCOMMIT=0;
+$str
+COMMIT;
+" | mysql -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME
+b=$b+$a
+done
+
+# Count rows in table after insertion
+rows=`echo \
+"
+select
+ count(*)
+from
+ ssm2;
+" | mysql -N -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME`
+if [[ $1 == "--result" ]]
+    then
+    echo $rows
+fi
+
+# Check whether the size req is met:
+if (( $rows >= $NSSM )) ; then
+    echo "ok 1 - ${STUB}"
+else
+    echo "not ok 1 - ${STUB}"
+fi
+
+# Delete temporary MOPS DB
+echo \
+"
+drop table ssm2
+" | mysql -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME
+buildInstance --remove $INSTANCE_NAME &> /dev/null
+
+exit

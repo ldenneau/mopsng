@@ -1,0 +1,57 @@
+#!/usr/bin/env python
+#
+# Little script to provide timing services in shell environments.
+#
+import os
+import re
+import sys
+import optparse
+import time
+
+import MOPS.Lib
+
+
+if __name__ == '__main__':
+    usage_str = """\
+Usage: timing [options]
+
+  --get : print current time, used to set time baseline
+  --subsystem=SUBSYS : specify subsystem string
+  --subsubsystem=SUBSUBSYS : specify subsubsystem string (optional)
+  --t0=TIME : specify reference time
+  --nn=NN : specify night number (optional, default 0)
+
+  T0=`timing --get`
+  timing --subsystem=LODCTL --subsubsystem=IOD --nn=127 --t0=$T0
+"""
+
+    # Get user input (tracks file) and make sure that it exists.
+    parser = optparse.OptionParser(usage_str)
+    parser.add_option('--get', dest='get', action='store_true', default=False, help='report current system time from time()')
+    parser.add_option('--subsystem', dest='subsystem', help='MOPS subsystem (DTCTL, LODCTL, etc.)')
+    parser.add_option('--subsubsystem', dest='subsubsystem', help='MOPS subsubsystem, optional')
+    parser.add_option('--nn', dest='nn', help='night number')
+    parser.add_option('--t0', dest='t0', help='reference time 0 (from --get)')
+    options, args = parser.parse_args()
+    
+    # If --get was set, then just report the current time().  Otherwise
+    # format a timing string and emit it.
+    if options.get:
+        print time.time()
+
+    else:
+        if not options.t0:
+            parser.error('--t0 must be specified')
+
+        print MOPS.Lib.formatTimingMsg(
+            subsystem=options.subsystem,
+            subsubsystem=options.subsubsystem,
+            nn=options.nn,
+            time_sec=(time.time() - float(options.t0))
+        )
+
+    exit(0)
+
+    # <-- if
+
+# <-- if

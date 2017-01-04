@@ -1,0 +1,203 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Params::Validate qw(:all);
+
+#use Math::Trig;
+use Data::Dumper;
+
+use Astro::Time;
+use Astro::SLA;
+use PS::MOPS::DC::Instance;
+
+#---
+#Command line options.
+#---
+my $target;
+my $fpa_id;
+my $survey_mode;
+my $thresh_arcsec = 3.0;
+my $nn;
+my $help;
+my $sql_modifier;
+
+GetOptions(
+    'target=s' => \$target,
+    'fpa=s' => \$fpa_id,
+    'survey=s' => \$survey_mode,
+    'nn=i' => \$nn,
+    'r=f' => \$thresh_arcsec,
+    help => \$help,
+);
+pod2usage(-verbose => 3) if $help;
+
+my $SOURCE_DET_FH = new FileHandle ">submitted_det.txt" || die "Can't create submitted_det.txt file.";
+my $TARGET_DET_FH = new FileHandle ">found_det.txt" || die "Can't create found_det.txt file.";
+
+$sql_modifier = "f.survey_mode = '$survey_mode' and TRUNCATE(m.epoch_mjd, 0) - 1 = $nn" if ($survey_mode);
+$sql_modifier = "f.fpa_id = '$fpa_id'" if ($fpa_id);
+
+#-------------------------------------------
+#Get list of submitted detections from exposure/survey mode
+#-------------------------------------------
+
+my $tar_inst = PS::MOPS::DC::Instance->new(DBNAME => $target);
+my $tar_dbh = $tar_inst->dbh;   #Get connection to target database.
+
+my $sql = << "SQL";
+select 
+    m.fpa_id,
+    m.det_id det_id,
+    m.ra_deg ra_deg,
+    m.dec_deg dec_deg,
+    m.mag mag, 
+    m.desig desig,
+    m.mpc_desig mpc_desig 
+    from export.mpc_sub m 
+    join fields f on m.fpa_id = f.fpa_id 
+    where $sql_modifier
+SQL
+my $sth = $tar_dbh->prepare($sql) || die $tar_dbh->errstr;
+$sth->execute() || die $tar_dbh->errstr;
+
+
+#-------------------------------------------
+# Write submitted detections to disk and also find detection in target simulation
+#-------------------------------------------
+$TARGET_DET_FH->print("SRC_DET_ID FPA_ID TRACKLET_ID DET_ID RA_DEG DEC_DEG MAG KNOWN_NAME DIST\n");
+$SOURCE_DET_FH->print("FPA_ID DET_ID RA_DEG DEC_DEG MAG PS_DESIG MPC_DESIG\n");
+while (my $row = $sth->fetchrow_hashref()) {
+    # Write detection to disk 
+    $row->{mpc_desig} = "NULL" unless defined($row->{mpc_desig});   
+    $SOURCE_DET_FH->print(join(' ', $row->{fpa_id}, $row->{det_id}, $row->{ra_deg}, $row->{dec_deg}, $row->{mag}, $row->{desig}, $row->{mpc_desig}), "\n");
+        
+    # Find detection in target.
+    foreach my $line (find_det(dbh=>$tar_dbh, fpa_id=>$row->{fpa_id}, ra_deg=>$row->{ra_deg}, dec_deg=>$row->{dec_deg}, det_id=>$row->{det_id})) {
+        $TARGET_DET_FH->print($line);
+    }
+}
+$TARGET_DET_FH->close();
+$SOURCE_DET_FH->close();
+$sth->finish;
+$tar_dbh->disconnect;
+
+sub find_det {
+    my %args = validate(@_,  {
+        fpa_id => 1,         
+        ra_deg => 1,
+        dec_deg => 1,
+        dbh => 1,
+        det_id => 0,
+    });
+    my $fpa_id = $args{fpa_id};
+    my $ra_deg = $args{ra_deg};
+    my $dec_deg = $args{dec_deg};
+    my $dbh = $args{dbh};
+    my $det_id = $args{det_id};
+    
+    if ($ra_deg =~ /:/) {
+        $ra_deg = Astro::Time::turn2deg(Astro::Time::str2turn($ra_deg, 'H'));
+    }
+    if ($dec_deg =~ /:/) {
+        $dec_deg = Astro::Time::turn2deg(Astro::Time::str2turn($dec_deg, 'D'));
+    }
+  
+    my $sql = <<"SQL";
+select 
+    tracklet_attrib.tracklet_id tracklet_id,
+    d.det_id det_id, 
+    d.ra_deg ra_deg, 
+    d.dec_deg dec_deg, 
+    d.mag mag, 
+    known_name,
+    abs(degrees(
+            /* spherical distance from tracklet to target field center */
+            acos(least(1.0, /* handle slight roundoff error causing arg > 1.0 */
+                sin(radians(d.dec_deg)) * sin(radians($dec_deg))
+                + cos(radians(d.dec_deg)) * cos(radians($dec_deg)) * cos(radians(d.ra_deg - $ra_deg))
+            )) 
+        )  
+    ) * 3600 dist_arcsec
+from detections d left join tracklet_attrib using(det_id) 
+left join tracklets using (tracklet_id) 
+left join known using (known_id) 
+join fields f on d.field_id = f.field_id
+where f.fpa_id="$fpa_id"
+and abs(
+    degrees(
+        /* spherical distance from tracklet to target field center */
+        acos(least(1.0, /* handle slight roundoff error causing arg > 1.0 */
+            sin(radians(d.dec_deg)) * sin(radians($dec_deg))
+            + cos(radians(d.dec_deg)) * cos(radians($dec_deg)) * cos(radians(d.ra_deg - $ra_deg))
+        )) 
+    )  
+) * 3600 < $thresh_arcsec
+order by 
+abs(
+    degrees(
+        /* spherical distance from tracklet to target field center */
+        acos(least(1.0, /* handle slight roundoff error causing arg > 1.0 */
+            sin(radians(d.dec_deg)) * sin(radians($dec_deg))
+            + cos(radians(d.dec_deg)) * cos(radians($dec_deg)) * cos(radians(d.ra_deg - $ra_deg))
+        )) 
+    )  
+)
+SQL
+
+    my @stuff = @{ $dbh->selectall_arrayref($sql, { Slice => {} }) };
+    my @results;
+     
+    foreach my $row (@stuff) {
+        my $dist = slaDsep(deg2rad($ra_deg), deg2rad($dec_deg), deg2rad($row->{ra_deg}), deg2rad($row->{dec_deg}));
+        $dist = rad2deg($dist) * 3600;
+        $row->{known_name} = "NULL" unless defined($row->{known_name});
+        $row->{tracklet_id} = "NULL" unless defined($row->{tracklet_id});
+        push(@results, (join(' ', $det_id, $fpa_id, $row->{tracklet_id}, $row->{det_id}, $row->{ra_deg}, $row->{dec_deg}, $row->{mag}, $row->{known_name}, sprintf "%.2f", $dist), "\n"));
+    }
+    return @results;
+}
+
+=head1 NAME
+
+find_submitted_in_exp 
+=head1 SYNOPSIS
+
+find_submitted_in_exp [OPTIONS] 
+
+=head1 DESCRIPTION
+
+Given a single exposure (fpa_id) or survey_mode (group of exposures) this tool will
+attempt to find all detections submitted to the MPC from the exposure/chunk in the
+specified target database. In other words given an exposure/chunk, this script 
+will list all of the detections submitted to the MPC from that exposure/chunk 
+in the file named submitted_det.txt, and then it will find the corresponding 
+detections in the target database and list them in the file named found_det.txt.
+
+Two files are generated in the directory from which this script is executed. So
+make sure that you have write permissions to the directory.
+
+    1. submitted_det.txt which lists all of the detections in the specified 
+       exposure/chunk that were submitted to the MPC
+       
+    2. found_det.txt which lists all of the detections found in the target
+       simulation that match the detections listed in source_det.txt.
+       
+When using this script you must specify a value for --target. The -r option 
+defaults to a radius of 3.0 arcseconds if it is not specified. In addition either
+the --fpa OR the --survey option must be specified. Do NOT specify both at the 
+same time. If you use the --survey option then you must also provide a value
+for the --nn option.
+
+=head1 OPTIONS
+
+    --target <sim>          -   Simulation to find detections that match the submitted detections.
+    --fpa <fpa_id>          -   FPA in which to search for submitted detections
+    --survey <survey_mode>  -   Chunk in which to search for submitted detections.
+    --nn <night_number>     -   Night number on which exposures were taken.
+    -r <thresh_arcsec>      -   Maximum distance matching detection can be from the source detection in arcseconds.
+
+=cut

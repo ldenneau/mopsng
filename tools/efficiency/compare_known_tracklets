@@ -1,0 +1,284 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+compare_known_tracklets - MOPS tool to compare tracklets from current sim to a DB of real data
+
+=head1 SYNOPSIS
+
+compare_known_tracklets --nn NIGHTNUM [options] DBNAME
+
+  DBNAME : names of database to search
+  --nn NIGHTNUM : specify night number to search 
+
+  --instance INST : source database of synthetic detections [optional, use ENV otherwise]
+  --chunkmatch PATTERN : specify pattern for chunk matching
+  --out FILENAME : write output to FILENAME instead of STDOUT
+  --debug : enable debug mode
+  --help : show this manpage
+
+=head1 DESCRIPTION
+
+This program takes all synthetic tracklets from the MOPS database specified
+by current environment variables or --inst and searches DBNAME for real detections
+close to the positions in the source DB.  A tracklet is considered "found" if more
+than half the detections are located in the real source DB.
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+use Astro::SLA;
+use Math::Trig;
+
+use PS::MOPS::DC::Instance;
+
+
+
+my $instance_name;
+my $sim;
+my $nn;
+my $chunk_match;
+my $filter_match;
+my $dist_thresh_arcsec = 10;
+my $out;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    'dist_thresh_arcsec=f' => \$dist_thresh_arcsec,
+    'chunk_match=s' => \$chunk_match,
+    'filter_match=s' => \$filter_match,
+    'out=s' => \$out,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$sim = shift || pod2usage(-message => 'Must specify a DB to search.');
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbh = $inst->dbh;
+my $sth;
+my $outfh;
+if ($out) {
+    $outfh = new FileHandle ">$out" or die "can't create filehandle for $out";
+}
+else {
+    $outfh = *STDOUT;
+}
+
+my $chunk_match_str = "and f.survey_mode not like 'MD%'";
+if ($chunk_match) {
+    $chunk_match_str = "and f.survey_mode like '%$chunk_match%'";
+}
+else {
+    $chunk_match_str = "and f.survey_mode not like 'MD%'";
+}
+
+my $filter_match_str = '';
+if ($filter_match) {
+    $filter_match_str = "and f.filter_id='$filter_match'";
+}
+
+$sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select 
+    ta.tracklet_id tracklet_id,
+    d.object_name object_name, 
+    f.fpa_id fpa_id,
+    d.det_id det_id, 
+    d.epoch_mjd epoch_mjd, 
+    d.ra_deg ra_deg, 
+    d.dec_deg dec_deg, 
+    radians(d.ra_deg) ra_rad,
+    radians(d.dec_deg) dec_rad,
+    d.mag mag, 
+    d.filter_id filt,
+abs(     
+    3600 * degrees(         
+    acos(least(1.0,              
+    sin(radians(d.dec_deg)) * sin(radians(f.dec_deg))
+    + cos(radians(d.dec_deg)) * cos(radians(f.dec_deg)) * cos(radians(d.ra_deg - f.ra_deg))
+    ))     
+)) fc_dist_arcsec
+from 
+    $sim.tracklet_attrib ta join $sim.detections d using(det_id) join $sim.fields f using (field_id)
+where f.nn=$nn
+$chunk_match_str
+$filter_match_str
+/*and tracklet_id=944*/
+order by tracklet_id
+SQL
+$sth->execute() 
+    or die $sth->errstr;
+my $href;
+
+# Assemble into individual tracklets, where each tracklet contains a list of detections.
+my @tracklets;
+my $last_trk_id;
+my $trk_id;
+my $trk;
+while ($href = $sth->fetchrow_hashref) {
+    $trk_id = $href->{tracklet_id};
+    if (!defined($last_trk_id) || $trk_id != $last_trk_id) {
+        $trk = { ID => $trk_id, DETS => [] };
+        push @tracklets, $trk;
+    }
+    push @{$trk->{DETS}}, $href;
+    $last_trk_id = $trk_id;
+}
+$sth->finish;
+printf STDERR "Found %d synthetic tracklets for night $nn.\n", scalar @tracklets;
+
+# Now we have all synthetic tracklets.  Now load real tracklets.  For all detections in each
+# synthetic tracklet, search for another detection that is nearby.  When a match is found, 
+# test the other positions for the synthetic tracklet.  If more than half the detections
+# match between tracklets, consider it found.
+# 
+# We need to arrange our real tracklets by FPA ID, and by tracklet ID for fast lookup.
+my $sql = <<"SQL";
+select 
+    ta.tracklet_id tracklet_id, f.fpa_id fpa_id, d.det_id det_id, d.ra_deg ra_deg, d.dec_deg dec_deg, radians(d.ra_deg) ra_rad, radians(d.dec_deg) dec_rad, d.mag mag, d.filter_id filt, d.s2n s2n, d.proc_id proc_id
+from tracklet_attrib ta join detections d using(det_id) join fields f using (field_id)
+where f.nn=$nn
+order by ta.tracklet_id, d.epoch_mjd
+SQL
+
+my %fpalookup;
+my %trkidlookup;
+$sth = $dbh->prepare($sql) or die $sth->errstr;
+$sth->execute() or die $sth->errstr;
+
+$last_trk_id = undef;
+while ($href = $sth->fetchrow_hashref) {
+    $trk_id = $href->{tracklet_id};
+    if (!defined($last_trk_id) || $trk_id != $last_trk_id) {
+        $trk = { ID => $trk_id , DETS => [] };
+        $trkidlookup{$trk_id} = $trk;
+    }
+    push @{$fpalookup{$href->{fpa_id}}}, $href;     # list of detections in FPA ID
+    push @{$trk->{DETS}}, $href;                    # add to tracklet
+    $last_trk_id = $trk_id;
+}
+$sth->finish;
+printf STDERR "Found %d real tracklets for night $nn.\n", scalar keys %trkidlookup;
+
+
+sub dist_arcsec {
+    my ($ora_rad, $odec_rad, $hra_rad, $hdec_rad) = @_;
+    my $dist_rad = slaDsep($ora_rad, $odec_rad, $hra_rad, $hdec_rad);
+    return rad2deg($dist_rad) * 3600; 
+}
+
+
+sub finddet {
+    my ($fpa_id, $ora_rad, $odec_rad, $max_dist) = @_;
+    my $dist_arcsec;
+    my $nearest;
+    my $nearest_dist = 36000;
+    foreach $href (@{$fpalookup{$fpa_id}}) {
+        $dist_arcsec = dist_arcsec($ora_rad, $odec_rad, $href->{ra_rad}, $href->{dec_rad});
+        if ($dist_arcsec < $dist_thresh_arcsec and $dist_arcsec < $nearest_dist) {
+            $nearest_dist = $dist_arcsec;
+            $nearest = $href;
+            last if $nearest_dist < 2;
+        }
+    }
+    return $nearest;
+}
+
+
+# Now run a search for each detection in each of our tracklets.
+my $strk;   # synth tracklet
+my $sdet;   # synth detection
+my $ndet;   # real detection
+my %match;  # store matched tracklet IDs info
+foreach $strk (@tracklets) {
+    $match{$strk->{ID}} = undef;        # default as unfound
+    foreach $sdet (@{$strk->{DETS}}) {
+        my $nearest = finddet($sdet->{fpa_id}, $sdet->{ra_rad}, $sdet->{dec_rad});
+        if ($nearest) {
+            # We have a nearby detection.  Check the other detections in the synthetic tracklet against this tracklet.
+            my $ntrk = $trkidlookup{$nearest->{tracklet_id}} or die "can't lookup real tracklet $nearest->{tracklet_id}";
+
+            # Build a table for this individual tracklet so we can lookup up real detections by field ID.
+            my %nfpa;
+            foreach $ndet (@{$ntrk->{DETS}}) {
+                $nfpa{$ndet->{fpa_id}} = $ndet;
+            }
+
+            # Now count matches between the tracklets.
+            my $count = 1;  # already found first detection
+            my $sfpa2_id;
+            my $nearest_dist = 99999;
+            foreach my $sdet2 (@{$strk->{DETS}}) {
+                $sfpa2_id = $sdet2->{fpa_id};
+                next if $sfpa2_id eq $sdet->{fpa_id};    # this is our original matching detection, skip it
+                if (exists($nfpa{$sfpa2_id})) {          # track has det from this FPA ID
+                    my $dist_as = 3600 * rad2deg(slaDsep($sdet2->{ra_rad}, $sdet2->{dec_rad}, $nfpa{$sfpa2_id}->{ra_rad}, $nfpa{$sfpa2_id}->{dec_rad}));
+                    if ($dist_as < $dist_thresh_arcsec) {
+                        $nearest_dist = $dist_as if ($dist_as < $nearest_dist);
+                        $count++;
+                    }
+#                    else {
+#                        last;   # bad position, not correct tracklet
+#                    }
+                }
+            }
+
+            if ($count > @{$strk->{DETS}} / 2) {
+                $match{$strk->{ID}} = {
+                    TRK => $ntrk,       # store matched tracklet
+                    DET => $nearest,    # first matched det
+                };
+                $strk->{NEAREST_DIST} = $nearest_dist;
+                last;   # found match, so done with detection loop
+            }
+        }
+    }
+}
+
+
+sub _f2 {
+    return sprintf "%.2f", $_[0];
+}
+
+
+sub _f4 {
+    return sprintf "%.4f", $_[0];
+}
+
+
+sub _f6 {
+    return sprintf "%.6f", $_[0];
+}
+
+
+# Emit match info.
+print $outfh "#object_name trk_id fpa_id epoch_mjd orig_ra_deg orig_dec_deg orig_mag orig_filt fc_dist_arcsec near_trk_id near_ra_deg near_dec_deg near_mag near_filt near_s2n near_proc_id dist_arcsec\n";
+foreach $strk (@tracklets) {
+    my $orig = $strk->{DETS}->[-1];
+    if (defined($match{$strk->{ID}})) {
+
+#        $href = $trkidlookup{$match{$strk->{ID}}};      # lookup real tracklet
+        $href = $match{$strk->{ID}}->{DET};              # lookup matching detection
+        die "empty match det" unless $href;
+
+        print $outfh join(' ', 
+            $orig->{object_name}, $orig->{tracklet_id}, $orig->{fpa_id}, _f6($orig->{epoch_mjd}), _f6($orig->{ra_deg}), _f6($orig->{dec_deg}), _f2($orig->{mag}), $orig->{filt}, _f2($orig->{fc_dist_arcsec}),
+            $href->{tracklet_id}, _f6($href->{ra_deg}), _f6($href->{dec_deg}), _f2($href->{mag}), $href->{filt}, _f2($href->{s2n}), ($href->{proc_id} || 'NULL'),
+            _f6($strk->{NEAREST_DIST}),
+        ), "\n";
+    }
+    else {
+        print $outfh join(' ', 
+            $orig->{object_name}, $orig->{det_id}, $orig->{fpa_id}, _f6($orig->{epoch_mjd}), _f6($orig->{ra_deg}), _f6($orig->{dec_deg}), _f2($orig->{mag}), $orig->{filt}, _f2($orig->{fc_dist_arcsec}),
+            'NONE'
+        ), "\n";
+    }
+
+#    print STDERR '.';
+}
+#print STDERR "\n";

@@ -1,0 +1,62 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+=pod
+ID EPOCH_MJD RA_DEG DEC_DEG MAG OBSCODE OBJECT_NAME
+0   #Designation   09990
+1   Code           F51
+2   MJD_UTC/UT1    56399.9992224074
+3   Delta          3.2644885752
+4   RA             94.9466706752
+5   Dec            21.7589804642
+6   dDelta/dt      0.0132638553
+7   dRA/dt         0.2748148389
+8   dDec/dt        0.0013371597
+9   VMag           19.2934322762
+10  Alt            47.7893046380
+11  Phase          17.8269401432
+12  LunarElon      18.6171670241
+13  LunarAlt       29.2367779943
+14  LunarPhase     0.4732516527
+15  SolarElon      66.6647789422
+16  SolarAlt       65.3005146124
+17  r              3.0113688798
+18  HLon           112.4293021642
+19  HLat           -1.7357123087
+20  TLon           94.5952400070
+21  TLat           -1.6014389667
+22  TOCLon         -113.3448451928
+23  TOCLat         -1.6025623786
+24  HOCLon         -95.5107830356
+25  HOCLat         -1.7368357206
+26  TOppLon        207.9400851998
+27  TOppLat        0.0011234119
+28  HEclObj_X      -1.1484400149
+29  HEclObj_Y      2.7822847460
+30  HEclObj_Z      -0.0912121389
+31  HEclObj_dX/dt  -0.0090633173
+32  HEclObj_dY/dt  -0.0031309246
+33  HEclObj_dZ/dt  0.0001785477
+34  HEclObsy_X     -0.8870040290
+35  HEclObsy_Y     -0.4704392873
+36  HEclObsy_Z     0.0000196864
+=cut
+
+use PS::MOPS::MPC qw(:all);
+
+while (my $line = <STDIN>) {
+    next if $line =~ /^#/;
+    my @foo = split /\s+/, $line;
+    my ($id, $epoch, $ra, $dec, $mag, $obscode) = @foo[0, 2, 4, 5, 9, 1];
+    my %h = (
+        ID => $id,
+        EPOCH_MJD => $epoch,
+        RA_DEG => $ra,
+        DEC_DEG => $dec,
+        MAG => $mag,
+        OBSCODE => $obscode,
+    );
+    print mpc_format_miti(%h), "\n";
+}

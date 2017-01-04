@@ -1,0 +1,327 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Pod::Usage;             # POD documentation => usage message
+use Getopt::Long;           # command-line options handline
+use FileHandle;             # better file descriptors
+
+use PS::MOPS::DC::Instance;     # simulation object
+use PS::MOPS::DC::SSM;          # SSM access
+use PS::MOPS::JPLEPH;           # JPL ephem wrappers
+
+use Astro::SLA;
+use Astro::Time;
+use PS::MOPS::Constants qw(:all);
+#use radec2azalt;
+
+my $begin; # cal date (UT)
+my $end; # cal date (UT)
+my $eph_int = 1.0; #days
+my $help;
+my $inst;
+my $instance_name;
+my $max_mag = 22.7; #mag
+my $min_alt = 20.0; #degrees
+my $min_period = 12.0; #days
+my $mjd;
+my $nightly_visits = 3;
+my $nonvis_outfile;
+my $obscode = 568;
+my $vis_outfile;
+my $verbose;
+GetOptions(
+   'begin=s' => \$begin,
+   'end=s' => \$end,
+   'eph-int=s' => \$eph_int,
+    help => \$help,
+   'instance=s' => \$instance_name,
+   'max-mag=f' => \$max_mag,
+   'min-alt=f' => \$min_alt,
+   'min-period=f' => \$min_period,
+   'mjd' => \$mjd,
+   'nightly-visits=i' => \$nightly_visits,
+   'non-visible-out=s' => \$nonvis_outfile,
+   'obscode=s' => \$obscode,
+   'verbose' => \$verbose,
+   'visible-out=s' => \$vis_outfile,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-message => "INSTANCE is required.\n") unless $instance_name;
+#pod2usage(-message => "BEGIN is required.\n") unless $begin;
+#pod2usage(-message => "END is required.\n") unless $end;
+
+
+# Find start and end epochs for the computation
+my $mjd_begin;
+my $mjd_end;
+my @sqlout;
+if ($begin) {
+# Use cl options...
+    if (not $mjd) {
+	$mjd_begin = int(`cal2jd --mjd $begin`);
+    } else {
+	$mjd_begin = int($begin);
+    }
+} else {
+# ..., or read from database 
+    @sqlout = `echo \'select min(epoch_mjd) from \`fields\`\' | mysql -umops -pmops -hschmopc01 $instance_name`;
+    $mjd_begin = int($sqlout[1]);
+}
+# Same as above but for end date
+if ($end) {
+    if (not $mjd) {
+	$mjd_end = int(`cal2jd --mjd $end`);
+    } else {
+	$mjd_end = int($end);
+    }
+} else {
+    @sqlout = `echo \'select max(epoch_mjd) from \`fields\`\' | mysql -umops -pmops -hschmopc01 $instance_name`;
+    $mjd_end = int($sqlout[1]);
+}
+
+print "Starting date: $mjd_begin UTC\n" if $verbose;
+print "Ending date:   $mjd_end UTC\n" if $verbose;
+
+# Set up connection to simulation/database.
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();      # in case you need these
+my $mops_logger = $inst->getLogger();
+
+# Interesting stuff starts here.
+my $out_fh_vis;
+my $out_fh_nonvis;
+if ($vis_outfile) {
+    $out_fh_vis = new FileHandle ">$vis_outfile" 
+	or die "can't create output file $vis_outfile";
+}
+if ($nonvis_outfile) {
+    $out_fh_nonvis = new FileHandle ">$nonvis_outfile" 
+	or die "can't create output file $nonvis_outfile";
+}
+
+# Add colummn first_visible to ssm
+system "echo '".
+    "alter table ssm add first_visible double default null".
+    "' | mysql -umops -pmops -hschmopc01 $instance_name";
+
+# Compute epochs
+my $start_of_night = 0.20; 
+my $length_of_night = 0.44;
+my @epochs;
+my $mjd_tmp1 = $mjd_begin;
+while ($mjd_tmp1 < $mjd_end) {
+    my $mjd_tmp2 = $mjd_tmp1;
+    foreach (1..$nightly_visits) { # three dates each night 
+    	$mjd_tmp2 = $mjd_tmp2 + $start_of_night +
+	    ($length_of_night / ($nightly_visits - 1)) * ($_ - 1);
+        push (@epochs, $mjd_tmp2);
+    }
+    $mjd_tmp1 += $eph_int;
+}
+
+# Get an object to iterate through all the SSM orbits returned by modcs_retrieve().
+my $ssm_i = modcs_retrieve($inst, all => 1);
+
+# Find out which objects fulfil the visibility requirements specified:
+my $mjd_out;
+my $ssm;
+my $orbit;
+my $nobject = 0;
+my $detected;
+my $nvisible = 0;
+my $ephem;
+my @ssms;
+while ($ssm = $ssm_i->next) { 
+    push @ssms, $ssm;
+}
+
+foreach $ssm (@ssms) {
+
+    # Create MOPS orbit object.  SSM members are not same as Orbit members, so we need
+    # to shred our object a little.
+    $orbit = PS::MOPS::DC::Orbit->new($inst, 
+        q => $ssm->{q},
+        e => $ssm->{e},
+        i => $ssm->{i},
+        node => $ssm->{node},
+        argPeri => $ssm->{argPeri},
+        timePeri => $ssm->{timePeri},
+        epoch => $ssm->{epoch},
+        hV => $ssm->{hV},
+        objectName => $ssm->{objectName},
+				      );
+    $nobject++;
+    my $days_visible = 0;
+    for (my $i=0; $i <= $#epochs-1; $i += $nightly_visits) {
+	# visible at specific date within a night?
+	$detected = undef;
+	for (0..$nightly_visits-1) {
+#	    $orbit = jpleph_propagateElements(
+#					      orbit => $orbit,
+#					      epoch_mjd => $epochs[$i+$_],
+#					      );
+	    $ephem = jpleph_calcEphemeris(
+					  orbit => $orbit,
+					  epoch_mjd => $epochs[$i+$_],
+					  obscode => $obscode,
+					  );
+
+	    # Check that we actually got something back.  Sungrazers for example might
+	    # not return anything if epoch_mjd is close to orbit's epoch.
+	    if (!$ephem) {
+		#warn sprintf "no ephemeris returned for object %s\n", $orbit->objectName;
+		next;
+	    }
+
+	    my @eph = @{$ephem}{qw(epoch ra dec mag)};
+	    if ($eph[3] < $max_mag) {
+		# Either call subroutine,..
+		#my ($az, $alt) = radec2azalt("KECK1", $ephem);
+		# or use inline code:
+		# Get cal date of epoch
+		my ($d, $mo, $yr, $dfrac) = mjd2cal($eph[0]);
+		my $h = int ($dfrac * 24);
+		my $min = int ( ( $dfrac * 24 - $h) * 60 );
+		my $sec = int ( ( $dfrac - ( $h / 24 + $min / (24 * 60) ) ) * 3600);
+		
+		# Get Local Sidereal Time and Modified Julia date: LST and MJD
+		my ($lst, $mjd_temp) = ut2lst_tel($yr,$mo,$d,$h,$min,$sec,"KECK1");
+		
+		# Get geodetic latitude for observatory
+		slaObs(undef, "KECK1", my $name, my $w, my $p, my $hh);
+		
+		# Compute horizontal coordinates and print output
+		slaDe2h($lst - $eph[1] / $DEG_PER_RAD, $eph[2] / $DEG_PER_RAD, 
+			$p, my $az, my $alt);
+
+		#print "$eph[0] " . $alt * $DEG_PER_RAD . " $eph[3]\n" if $verbose;
+		
+		if ($alt * $DEG_PER_RAD > $min_alt) {
+		    #print "Az = $az deg    Alt = $alt deg \n" if $verbose;
+		    $detected = 1;
+		    $mjd_out = $epochs[$i+$_];
+		    last;
+		}
+	    }
+	}
+	if ($detected) {
+	    $days_visible++;
+	} else {		 
+	    $days_visible = 0;	 
+	}
+	if ($days_visible > $min_period) {
+	    last;		 
+	}
+    }
+    if ($days_visible > $min_period) {
+	$nvisible++;
+	# Insert mjd into ssm table
+	system "echo '".
+	    "update ssm set first_visible=$mjd_out ".
+	    "where ssm.object_name = \"$ssm->{objectName}\"".
+	    "' | mysql -umops -pmops -hschmopc01 $instance_name";
+	if ($out_fh_vis) {
+	    print $out_fh_vis 
+		join(" ", $orbit->objectName, "COM",
+		     @{$orbit}{qw(q e i node argPeri timePeri hV epoch)}), 
+		" 1 6 -1 MOPS\n";
+	}
+    } elsif ($out_fh_nonvis) {
+	print $out_fh_nonvis 
+	    join(" ", $orbit->objectName, "COM",
+		 @{$orbit}{qw(q e i node argPeri timePeri hV epoch)}), 
+	    " 1 6 -1 MOPS\n";
+    }
+    print "$nvisible visible out of $nobject objects (" . 
+	$nvisible/$nobject . ")...\n" if $verbose;
+}
+if ($out_fh_vis) {
+    close $out_fh_vis;
+}
+if ($out_fh_nonvis) {
+    close $out_fh_nonvis;
+}
+print "$nvisible $nobject\n"; 
+exit;
+
+
+=head1 NAME
+
+objectsVisible_db - Counts the number of objects visible during a given timespan.
+
+=head1 SYNOPSIS
+
+objectsVisible_db [options] --begin=DATE1 --end=DATE2
+
+    --begin=DATE1           : DATE1 is the starting epoch either as mjd (specify --mjd) or cal
+
+    --end=DATE2             : DATE2 is the ending epoch either as mjd (specify --mjd) or cal
+
+    --eph-int=INT           : INT is the interval in days between the nights on which 
+                              ephemerides are computed, default=1
+
+    --help                  : this message
+
+    --instance=NAME         : NAME is the name of the db instance from which 
+                              the needed input is collected, default=current
+
+    --max-mag=MAG           : MAG is the maximum magnitude (band?) accepted for an object
+                              to be counted as visible, default=22.7
+
+    --min-alt=ALT           : ALT is the minimum altitude in degrees accepted for 
+                              an object to count as visible, default=20
+
+    --min-period=P          : P is the minimum number of nights that an object
+                              needs to fulfil the visibility requirements in order 
+                              to be counted as visible, default=12
+
+    --mjd                   : toggle interpretation of dates as mjd's, default=off
+
+    --nightly-visits=NEPH   : ephemerides are computed NEPH times each night, default=3
+
+    --non-visible-out=FNAME : orbits of non-visible objects are written to FNAME, default=none
+
+    --verbose               : toggle verbosity, default=off
+
+    --visible-out=FNAME     : orbits of visible objects are written to FNAME, default=none
+
+    --obscode=OBSCODE       : use OBSCODE as station/observatory code, default=568
+
+Examples:
+
+    objectsVisible_db --begin=2008-01-01 --end=2008-01-15
+
+    objectsVisible_db --begin=2008-01-01 --end=2008-01-15 --verbose --visible-out=visible.tmp
+
+    objectsVisible_db --begin=2008-01-01 --end=2008-01-15 --non-visible-out=nonvisible.tmp
+
+=head1 DESCRIPTION
+
+This program reads all the SSM objects from the current simulation and
+counts the number of objects reaching a given altitude and brightness
+at a specified observatory location for a given number of continous
+nights during a given timespan. Optionally, the initial orbits are
+written into two DES files depending on whether the object was visible
+or not.
+
+The program outputs
+
+      NUMBER OF ORBITS VISIBLE
+      NUMBER OF ORBITS INCLUDED
+
+to STDOUT.
+
+=head1 BUGS
+
+The JPL DIVA integrator spews stuff to STDOUT while it's operating, so
+we can't (easily) just write out results to STDOUT.  That's why we
+write to a file.  There are workarounds; see the MOPS tools/ephem
+program.
+
+Local Sidereal Time (LST) is always computed for Keck1, which produces
+erroneous results for observing sites other than Mauna Kea
+(obscode=568).
+
+=cut

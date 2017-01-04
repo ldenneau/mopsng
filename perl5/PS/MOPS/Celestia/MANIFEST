@@ -1,0 +1,6 @@
+Changes
+Makefile.PL
+MANIFEST
+README
+t/PS-MOPS-Celestia.t
+lib/PS/MOPS/Celestia.pm

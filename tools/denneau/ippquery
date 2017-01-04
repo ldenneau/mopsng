@@ -1,0 +1,38 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Data::Dumper;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::IPPDB;
+
+
+my $debug;
+my $chunk;
+my $help;
+GetOptions(
+    debug => \$debug,
+    chunk => \$chunk,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+
+my $dbh = PS::MOPS::IPPDB::dbh();
+my @stuff;
+
+if ($chunk) {
+    foreach my $thing (@ARGV) {
+        my $re = quotemeta($thing);
+        my $aref = $dbh->selectcol_arrayref(<<"SQL") or die $dbh->errstr;
+select exp_name from rawExp where comment regexp('[[:<:]]${re}[[:>:]]');
+SQL
+        push @stuff, @{$aref};
+    }
+    print join(' ', @stuff), "\n";
+}
+
+exit;

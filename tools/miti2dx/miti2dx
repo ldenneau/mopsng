@@ -1,0 +1,107 @@
+#!/usr/bin/env perl
+# Convert MITI file to various MOPS Data Exchange formats.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use PS::MOPS::MITI;
+use PS::MOPS::DX;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Orbit;
+
+my $dxtype = $DX_DETECTION;
+my $header;
+my $help;
+GetOptions(
+    'dxtype=s' => \$dxtype,
+    header => \$header,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+
+
+use subs qw(
+    _demitify_orbit
+);
+
+
+my $did_header;
+my $line;
+my %miti;
+my $href;
+
+while (defined($line = <>)) {
+    next if $line =~ /^\s*$/;               # skip blank lines
+
+    # MOPS internal formats.
+    if ($dxtype eq 'MIF-O' || $dxtype eq 'MIFO') {
+        $href = _demitify_orbit($line);
+        if ($href) {
+            my $orb = PS::MOPS::DC::Orbit->new(undef, $href);
+            print $orb->serialize(), "\n";
+        }
+    }
+
+
+    # Milani data exchange (DX) formats.
+    elsif ($dxtype eq 'D') {
+        print $PS::MOPS::DX::header_DETECTION, "\n" if ($header && !$did_header);
+        $href = miti_parse_det($line);          # get fmtted MPC line as MITI hash
+        print modx_toDETECTION($href), "\n" if $href;
+    }
+    elsif ($dxtype eq 'O') {
+        print $PS::MOPS::DX::header_ORBIT, "\n" if ($header && !$did_header);
+        $href = _demitify_orbit($line);
+        print modx_toORBIT($href), "\n" if $href;
+    }
+
+    $did_header = 1;
+}
+
+
+sub _demitify_orbit {
+    # Convert undocumented MITI-like orbit format to an orbit object.
+    my ($line) = @_;
+    my %h;
+
+    @h{qw(
+        q e i node argPeri timePeri hV epoch orbitId residual convCode
+    )} = split /\s+/, $line;
+
+    return \%h;
+}
+
+
+=head1 NAME
+
+miti2dx - Convert MITI data to MOPS data exchange (DX) format
+
+=head1 SYNOPSIS
+
+miti2dx [options] < input > output
+
+  --dxtype=DXTYPE : convert data to specified DX type, see below
+  --header : put a DX header before the data
+  --help : show manpage
+
+=head1 DESCRIPTION
+
+Converts a MPC file to MOPS MITI format.  Many of the fields are ignored;
+only ID, epoch, RA, DEC, magnitude and obscode are output.
+
+=head1 DATA TYPES
+
+  D, DETECTION : DX detection type
+  O, ORBIT : DX orbit type
+
+=head1 SEE ALSO
+
+PS::MOPS::DX - Data Exchange module
+
+=head1 BUGS
+
+Does not handle compound DX types yet.
+
+=cut

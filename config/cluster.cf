@@ -1,0 +1,25 @@
+# $Id: cluster.cf 5517 2014-06-03 02:54:20Z schastel $
+# Cluster node execution environment
+# Parse this file with Config::Parsed or subclass
+hosts = [
+    localhost
+]
+concurrency = 16     # number of jobs to submit simultaneously
+
+MOPS_HOME=/home/mops/MOPS_STABLE
+CAET_DATA=/home/mops/MOPS_DATA/caet_data
+OORB_DATA=/home/mops/MOPS_DATA/oorb
+ORBFIT_DATA=/home/mops/MOPS_DATA/orbfit
+PATH=/home/mops/MOPS_STABLE/bin:/usr/local/bin:/usr/bin:/bin
+PERL5LIB=/home/mops/MOPS_STABLE/lib/perl5
+PYTHONPATH=/home/mops/MOPS_STABLE/lib/python
+LD_LIBRARY_PATH=/home/mops/MOPS_STABLE/lib
+
+# MOPS_HOME=/home/mops/MOPS_DEVEL
+# CAET_DATA=/home/mops/MOPS_DATA/caet_data
+# OORB_DATA=/home/mops/MOPS_DATA/oorb
+# ORBFIT_DATA=/home/mops/MOPS_DATA/orbfit
+# PATH=/home/mops/MOPS_DEVEL/bin:/usr/local/bin:/usr/bin:/bin
+# PERL5LIB=/home/mops/MOPS_DEVEL/lib/perl5
+# PYTHONPATH=/home/mops/MOPS_DEVEL/lib/python
+# LD_LIBRARY_PATH=/home/mops/MOPS_DEVEL/lib

@@ -1,0 +1,116 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+
+# Start program here.
+my $inst;
+my $instance_name;
+my $nn;
+my $ocnum;
+my $binsize = 0.05;
+my $terminal = '';
+my $xrange = 2.0;
+my $xsize = 800;
+my $ysize = 600;
+my $title = "Orbit RMS Residuals";
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    'ocnum=i' => \$ocnum,
+    'binsize=i' => \$binsize,
+    'terminal=s' => \$terminal,
+    'title=s' => \$title,
+    'xrange=f' => \$xrange,
+    'xsize=s' => \$xsize,
+    'ysize=s' => \$ysize,
+    help => \$help,
+) or pod2usage(2);
+
+# Scrub opts.
+$terminal = 'postscript solid' 
+    if ($terminal eq 'postsscript' or $terminal eq 'eps');
+$terminal = 'postscript enhanced color solid' 
+    if ($terminal eq 'postscriptc' or $terminal eq 'epsc');
+
+my $size_str = '';
+if ($terminal eq 'png') {
+    $size_str = "size $xsize, $ysize font arial 12"
+}
+
+
+print <<"EOF" if $terminal;
+set fontpath "/usr/lib/X11/fonts/TTF"
+set terminal $terminal $size_str
+EOF
+
+my $buf = '';
+my $num = 0;
+my $x0;
+my $n;
+
+# Fetch orbits.
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbh = $inst->dbh();
+my $stuff = $dbh->selectcol_arrayref(<<"SQL");
+select o.residual
+from derivedobjects do join orbits o using (orbit_id)
+where do.classification='N' and do.status<>'M'
+SQL
+
+
+my $hist = mopslib_histogram(data => $stuff, binsize => $binsize, hmax => $xrange);
+
+$x0 = $hist->{min};
+$n = 0;
+foreach my $x (@{$hist->{hist}}) {
+    $buf .= join(" ", $x0 + $n * $hist->{binsize}, $x) . "\n";
+    $n++;
+}
+$num = scalar @{$stuff};
+$buf .= "e\n";
+
+my $date_str = "";
+if ($nn) {
+    $date_str = ", Night $nn";
+}
+elsif ($ocnum) {
+    $date_str = ", OC $ocnum";
+}
+
+    print <<"EOF";
+set title '${title}$date_str
+set xrange [0:$xrange]
+set xlabel 'RMS Residual, arcsec'
+set ylabel 'Number'
+set style fill solid 0.25 noborder
+plot \\
+"-" using 1:2 title 'Nonsynthetic ($num)' with boxes lc rgb 'blue'
+EOF
+
+print $buf;
+
+
+=head1 NAME
+
+orbhistplot - Plot histogram of orbit residuals for derived objects
+
+=head1 SYNOPSIS
+
+orbhistplot [options]
+
+  -bins B : number of bins for histogram
+  --category C : select D/A/P/I/R data, default D (derivations)
+  --nn N : use only data from night number N, otherwise all
+  --ocnum N : use only data from observing cycle N, otherwise all
+
+=head1 DESCRIPTION
+
+Obtains residual data for specified orbits and plots histogram.
+
+=cut

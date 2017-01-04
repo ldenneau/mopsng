@@ -1,0 +1,198 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+# Just a stub for quick debugging.
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Tracklet;
+
+
+my $instance_name;
+my $nn;
+my $survey_mode;
+my $fuzzy;
+my $debug;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    'survey_mode=s' => \$survey_mode,
+    fuzzy => \$fuzzy,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => '--nn NIGHTNUM must be specified.') unless ($nn or @ARGV);
+my @tids = @ARGV;
+
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbname = $inst->dbname;
+my $dbh = $inst->dbh;
+my $BAD_STAMP_PROBABILITY = 0.11;   # magic
+my $upd_sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+update tracklets set probability=? where tracklet_id=?
+SQL
+
+my $sm_str = '';
+if ($survey_mode) {
+    $sm_str = "and f.survey_mode like '%$survey_mode%'";
+}
+
+# Get list of (pair) tracklets.
+my $sth;
+my %trks;
+
+if ($fuzzy) {
+    $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select
+    t.tracklet_id tracklet_id,
+    sum(1) ndet,
+    sum(if(dr.psf_quality*dr.ratio_bad*dr.f_pos > 0.5,1,0)) nfuzz,
+    max(if(dr.psf_quality*dr.ratio_bad*dr.f_pos > 0.5 and sqrt(moments_xx*moments_yy/(psf_major*psf_minor))<5,sqrt(moments_xx*moments_yy/(psf_major*psf_minor)),NULL)) as ffuzz
+from fields f
+    join tracklets t using(field_id)
+    join tracklet_attrib ta using(tracklet_id)
+    join detections d using(det_id)
+    join det_rawattr_v2 dr using(det_id)
+where f.nn=?
+and t.classification='N'
+and t.probability > $BAD_STAMP_PROBABILITY
+group by tracklet_id                                                                                  
+having ndet = 2 and ffuzz > 1.5                                                                      
+and nfuzz > ndet / 2                                                                                  
+order by ffuzz desc        
+SQL
+    $sth->execute($nn) or die $sth->errstr;
+    my $href;
+    while ($href = $sth->fetchrow_hashref) {
+        push @tids, $href->{tracklet_id};
+    }
+    printf STDERR "Found %d fuzzy tracklets.\n", scalar @tids;
+}
+
+if (@tids) {
+    foreach my $t (@tids) {
+        $t =~ s/^T//;       # strip leading T if present
+        $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select t.tracklet_id tid, d.det_id did, f.nn
+from detections d join tracklet_attrib ta using(det_id) 
+join tracklets t using(tracklet_id) 
+join fields f on t.field_id=f.field_id 
+where t.tracklet_id=?
+SQL
+        $sth->execute($t) or die $sth->errstr;
+        my $href;
+        while ($href = $sth->fetchrow_hashref) {
+            $trks{$href->{tid}}->{NN} = $href->{nn};
+            push @{$trks{$href->{tid}}->{DETS}}, $href->{did};
+        }
+    }
+}
+else {
+    $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select t.tracklet_id tid, d.det_id did, f.nn nn
+from detections d join tracklet_attrib ta using(det_id) 
+join tracklets t using(tracklet_id) 
+join fields f on t.field_id=f.field_id 
+where f.nn=?
+and t.classification='N'
+and t.probability > $BAD_STAMP_PROBABILITY
+$sm_str
+SQL
+    $sth->execute($nn) or die $sth->errstr;
+    my $href;
+    while ($href = $sth->fetchrow_hashref) {
+        $trks{$href->{tid}}->{NN} = $href->{nn};
+        push @{$trks{$href->{tid}}->{DETS}}, $href->{did};
+    }
+}
+
+#print Dumper(\%trks);
+
+# OK, now for each tracklet:
+# * skip if its length > 2
+# * skip unless both stamps exist
+# * mark low prob if wavelet X*Y <= 10
+printf STDERR "Processing %d tracklet(s).\n\n", scalar keys %trks;
+foreach my $tid (sort keys %trks) {
+    my $det_ids = $trks{$tid}->{DETS};
+    my $ndets = scalar @{$det_ids};
+#    next unless ($ndets == 2 || $debug);
+
+    my $num_good = 0;
+    my $file;
+    my $score;
+
+    print STDERR "T$tid\n";
+    foreach my $det_id (@{$det_ids}) {
+        $file = detid2stampfile($dbname, $trks{$tid}->{NN}, $det_id); 
+        $score = score_stamp($file);
+        print STDERR "  $det_id $score ($file)\n";
+        $num_good++ if $score > 1;
+    }
+
+    if ($num_good < $ndets) {
+#        my $trk = modct_retrieve($inst, trackletId => $tid) or die "can't retrieve tracklet ID $tid";
+        print STDERR "  T$tid => BAD (num_good=$num_good)\n";
+#        $trk->probability($BAD_STAMP_PROBABILITY) unless $debug;
+        if (!$debug) {
+            $upd_sth->execute($BAD_STAMP_PROBABILITY, $tid) or die $upd_sth->errstr;
+        }
+    }
+    else {
+        print STDERR "  T$tid => GOOD (num_good=$num_good)\n";
+    }
+}
+exit;
+
+
+sub detid2stampfile {
+    my ($dbname, $nn, $det_id) = @_;
+    my ($last) = $det_id =~ /(\d)$/; 
+    return "/data/mops13.0/stamp-store/stamps/special-stamps/$dbname-auto/$nn/$last/D$det_id.fits";
+}
+
+
+sub score_stamp {
+    my ($file) = @_;
+    if (!-r $file) {
+        return 998;
+    }
+    my $prod = 999;
+    if (!$debug) {
+        my $cmd = "BadStamper $file -b -999999";
+        print STDERR "    $cmd\n" if $debug;
+        my @res = `$cmd`;
+#        if (@res and $res[0] and $res[0] =~ /(\d+)\s+(\d+)\s*$/) {
+#            $prod = $1 * $2;
+#        }
+        if (@res and $res[0]) {
+            my @foo = split /\s+/, $res[0];
+            $prod = $foo[4];
+        }
+    }
+    else {
+        my $cmd = "BadStamper $file -v";
+        my @res = `$cmd`;
+        print STDERR "    $cmd\n" if $debug;
+        foreach (@res) {
+            s/^\s+|\s+$//g;
+            s|/.*/||;
+            s|^|    |;
+#            if (/x:(\d+)\s+y:(\d+)/i) {
+#                $prod = $1 * $2;
+#            }
+            if (/Fudge.*(\S+)$/i) {
+                $prod = $1;
+            }
+        }
+        print STDERR map { "$_\n" } @res;
+    }
+    return $prod;
+}

@@ -1,0 +1,54 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+
+
+my $instance_name;
+my $fromdb;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'fromdb=s' => \$fromdb,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-message => '--fromdb DBNAME is required') unless $fromdb;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbh = $inst->dbh;
+
+$dbh->do("delete from fields");
+my %seenfield;
+
+my $line;
+while ($line = <STDIN>) {
+    next if $line =~ /^#/;
+    chomp $line;
+    my ($det_id, $mjd, $ra_deg, $dec_deg, $appmag, $filter, $obscode, $sigra, $sigdec, $snr, $fwhm, $flags) = split /\s+/, $line;
+    my ($fpa_id, $detnum) = split '\.', $det_id;
+    my ($filter_id, $dummy) = split '\.', $filter;
+
+    # Copy field from specified database.
+    if (!$seenfield{$fpa_id}) {
+        if (!$dbh->selectrow_array("select fpa_id from $fromdb.fields where fpa_id=?", undef, $fpa_id)) {
+            warn "didn't find $fpa_id";
+        }
+        $dbh->do("insert into fields (select * from $fromdb.fields where fpa_id=?)", undef, $fpa_id) or die "didn't insert $fpa_id";
+        print "Created $fpa_id.\n";
+        $seenfield{$fpa_id} = 1;    # mark as inserted
+    }
+}
+$dbh->do("update fields set status='U', parent_id=NULL");
+print "Updated statuses and parents_ids.\n";
+
+
+exit;

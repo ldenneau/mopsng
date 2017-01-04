@@ -1,0 +1,148 @@
+#!/usr/bin/env python
+"""
+Parse TALCS observation logs.
+
+The input data is a flat ascii file of the format
+* The first line is a header.
+* Each other line is in SPACE separated columns.
+
+The columns are
+* fieldRA        RA of FoV center (radians)
+* fieldDec       Dec of FoV center (radians)
+* expMJD         MJD of the start of exposure
+* filter         char(1), used a filter_id
+* expTime        exposure time in seconds
+"""
+import MOPS.Field
+import MOPS.Instance
+from MOPS.Constants import DEG_PER_RAD as RAD2DEG
+
+# Constants
+MJD_OFFSET = 0                       # Offset to bring the dates to 2006
+
+
+
+
+def insertFields(instance, fileNames):
+    """
+    Given a MOPS instance and a list of file names, parse each file for field
+    specifications and insert each of them into the MOPS instance.
+
+    Each file is assumed to be in cronos.92 format (described above).
+    """
+    exposures = {}                      # [mjd: [ra, dec, mjd, expTime, filter]}
+
+    # Fetch the OBSCODE from the config file.
+    obscode = str(instance.config['site']['obscode'])
+
+    # Fetch the limiting mag from the config file
+    limitingMag = float(instance.config['site']['limiting_mag'])
+
+    
+    
+    for fileName in fileNames:
+        exposures.update(_parseFile(fileName, obscode, limitingMag))
+    # <-- end for
+    return(_insertFields(instance, exposures))
+
+
+def _parseFile(fileName, obscode, limitingMag):
+    """
+    Extract fieldRA, fieldDec, expDate, expTime, filter from fileName (in
+    TALCS format) and return a dict of the type
+        {'mjd': [ra, dec, mjd, expTime, filter]}
+    The idea behind the use of a dictionary is to ignore extra entries for the
+    same exposure (based on the fact that this telescope cannot observer >1
+    fields at the time). This should not be needed for TALCS but we do it anyway
+    as sanity check (is that silly?).
+    """
+    res = {}   # {'mjd': [ra, dec, mjd, expTime, filter]}
+    f = file(fileName)
+    line = f.readline()                 # SKIP the header.
+    line = f.readline().strip()
+    counter = 0
+    while(line):
+        (fieldRA, fieldDec, expTime, filter, expMJD) = line.split()
+        if(not res.has_key(expMJD)):
+            # We only care about the first letter of the filter name.
+            res[expMJD] = [float(expMJD) + MJD_OFFSET,  # MJD
+                           float(fieldRA),              # RA
+                           float(fieldDec),             # Dec
+                           round(float(expTime)),       # ExpTime
+                           filter[0],                   # filter
+                           obscode,
+                           limitingMag]
+        # <-- end if
+        counter = counter+1
+        # Read the next line.
+        line = f.readline().strip()
+    # <-- end while
+    print "Read %f lines" % (counter)
+    return(res)
+
+
+def _insertFields(instance, exposures):
+    """
+    Given a list of exposures, add the corresponding entries in the fields
+    table. Exposures is a dictionary of the form
+        {'mjd': [ra, dec, mjd, expTime, filter]}
+    """
+    cursor = instance.get_dbh().cursor()
+    
+    # Turn autocommit off.
+    # instance.get_dbh().disableAutocommit()
+
+    # create the Field instances.
+    fields = [MOPS.Field.Field.new(*e) for e in exposures.values()]
+
+    # Inser the fields.
+    err = map(lambda f: f.insert(instance.get_dbh()), fields)
+
+    # Commit the transaction.
+    instance.get_dbh().commit()
+    return
+
+
+
+
+if(__name__ == '__main__'):
+    import glob
+    import optparse
+    import os
+
+
+    # Constants
+    USAGE = """\
+Usage: insertTALCSFields.py --rootdir=<survey files root directory> \
+[--instance_name=<name of the MOPS DB instance>]"""
+
+
+    # Parse command line input.
+    parser = optparse.OptionParser(USAGE)
+    parser.add_option('--rootdir',
+                      dest='root_dir',
+                      type='string',
+                      help="look for data files in this directory.")
+    parser.add_option('--instance_name',
+                      dest='instance_name',
+                      type='string',
+                      help="name of the MOPS DB instance.")
+    (options, args) = parser.parse_args()
+
+    # Make sure that we have a root_dir value.
+    if(not options.root_dir or not os.path.exists(options.root_dir)):
+        parser.error('Missing root_dir!')
+    # <-- end if
+
+    # Get a hold of the current MOPS instance.
+    try:
+        instance = MOPS.Instance.Instance(dbname=options.instance_name or
+                                          os.environ['MOPS_DBINSTANCE'])
+    except:
+        parser.error('Cannot determine instance name.')
+    # <-- end try
+    
+    # Get all the files inside root_dir and pass them to the main routine.
+    insertFields(instance=instance,
+                 fileNames=glob.glob(os.path.join(options.root_dir, '*')))
+# <-- end if

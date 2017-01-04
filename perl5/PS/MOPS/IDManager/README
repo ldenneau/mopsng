@@ -1,0 +1,25 @@
+PS/MOPS/MITI version 0.01
+=========================
+
+This module reads and writes MITI (MOPS Interim Text Interchange)
+files.  MITI exists to provide a simple, high-precision text format for
+interchange of observation and detection data between MOPS Perl modules
+and Jeremy Kubica's tracklet finding and linking programs.
+
+INSTALLATION
+
+To install this module type the following:
+
+   perl Makefile.PL
+   make
+   make test
+   make install
+
+COPYRIGHT AND LICENCE
+
+Copyright (C) 2005 Larry Denneau, Jr., Institute for Astronomy, University
+of Hawaii.
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself. 
+

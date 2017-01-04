@@ -1,0 +1,208 @@
+#!/bin/env perl
+
+use strict;
+use warnings;
+use FileHandle;
+use Getopt::Long;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DX;
+use PS::MOPS::DC::Tracklet;
+
+
+use subs qw(
+    _out_track
+);
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => undef);
+
+# Start program here.
+my $NAME;           # root name of combined files (NAME.detections, NAME.orbits, etc.)
+my $help;
+GetOptions(
+    'name=s' => \$NAME,
+    help => \$help,
+) or pod2usage(2);
+
+die "--name unspecified\n" unless $NAME;
+
+# List of file roots.
+my @roots = (@ARGV or glob '*.sum');
+s/\.sum$// foreach @roots;
+
+
+# Now for each file root:
+# 1.  Open linked file to create table of clean objects.
+# 2.  Open tracks file and create lists of tracks by ID
+# 3.  Print detection lists using file number and MOPS L000000 ID.
+# 4.  Generate list or DB orbital parameters.
+
+my $fileno = 0;         # increment for each file so link IDs are unique
+my %all_linked_ids;     # table of linked obj IDs
+my $id;
+my $stuff;
+my $orb;
+
+unless (-d $NAME) {
+    system("mkdir $NAME") == 0 or die "can't create directory $NAME\n";
+}
+
+my $out_dets_fh = new FileHandle ">$NAME/$NAME.tracks";
+my $out_orbits_fh = new FileHandle ">$NAME/$NAME.orbits";
+
+my $dx_tracklet_fh = new FileHandle ">$NAME/$NAME.in.tracklet";
+my $dx_request_fh = new FileHandle ">$NAME/$NAME.in.request";
+my $dx_manifest_fh = new FileHandle ">$NAME/$NAME.in.manifest";
+
+foreach my $root (@roots) {
+    print STDERR "Processing file root $root...";
+
+    my %file_linked_ids;
+
+    # Get track listing for this file root.
+    my %tracks_ids;
+    my $tracks_fh = new FileHandle "$root.tracks";
+    while (<$tracks_fh>) {
+        chomp;
+        ($id, $stuff) = split;
+        push @{$tracks_ids{$id}}, $_;     # add to list for this file's track ID
+    }
+    close $tracks_fh;
+
+    my %linked_ids_tbl;
+    if (keys %tracks_ids) {
+        # Open list of linked objects.  For each object, fetch it out of the track
+        # listings for this file.
+        printf STDERR "%d linked objects.\n", scalar keys %tracks_ids;
+
+        my $linked_fh = new FileHandle "$root.linked";
+        my ($ssm_id, $link_id);
+        while (<$linked_fh>) {
+            chomp;
+            ($ssm_id, $link_id) = split;
+            next unless defined($link_id);
+
+            $linked_ids_tbl{$link_id} = 1;   # record this link ID
+            $id = sprintf("%03d", $fileno) . $link_id;
+            s/$link_id/$id/ foreach  @{$tracks_ids{$link_id}}; # replace orig ID with new ID
+
+            print $out_dets_fh join("\n", @{$tracks_ids{$link_id}}), "\n";
+            $orb = modcs_retrieve($inst, objectName => $ssm_id);
+            print $out_orbits_fh join(" ", 
+                $orb->q,
+                $orb->e,
+                $orb->i,
+                $orb->node,
+                $orb->argPeri,
+                $orb->timePeri,
+                $orb->hV,
+                $orb->epoch,
+                $id,
+            ), "\n";
+
+        }
+        close $linked_fh;
+
+
+        # Now do Milani DX conversions.  Read in the .sum file.  If a track appears
+        # in the linked table, then write it.
+        my %trk_tracklet_ids;
+        my $last_track_id = '';         # changes when we scan to new track
+        my $in_sum_fh = new FileHandle "$root.sum";
+        my $line;
+        my $track_id;
+        my $tracklet_id;
+        my $line_no;
+        while (defined($line = <$in_sum_fh>)) {
+            chomp $line;
+            ($track_id, $tracklet_id, $line_no) = split /\s+/, $line, 3;
+
+            if ($last_track_id and ($track_id ne $last_track_id)) {
+                if ($linked_ids_tbl{$last_track_id}) {
+                    $id = sprintf("%03d", $fileno) . $last_track_id;
+                    _out_track($dx_tracklet_fh, $dx_request_fh, $id, keys %trk_tracklet_ids);
+                }
+                %trk_tracklet_ids = ();
+            }
+            else {
+                $trk_tracklet_ids{$tracklet_id} = 1;
+            }
+            $last_track_id = $track_id;
+        }
+        if ($linked_ids_tbl{$last_track_id}) {
+            $id = sprintf("%03d", $fileno) . $last_track_id;
+            _out_track($dx_tracklet_fh, $dx_request_fh, $id, keys %trk_tracklet_ids);
+        }
+        close $in_sum_fh;
+
+
+        $fileno++;
+    }
+    else {
+        print STDERR "no linked objects in file $root.tracks.\n";
+    }
+}
+
+close $out_dets_fh;
+close $out_orbits_fh;
+
+
+# Close out DX stuff.
+close $dx_tracklet_fh;
+close $dx_request_fh;
+
+print $dx_manifest_fh <<"EOF";
+$NAME.in.manifest
+$NAME.in.tracklet
+$NAME.in.request
+EOF
+close $dx_manifest_fh;
+
+# Outta here.
+exit;
+
+#print join("\n", @roots), "\n";
+
+sub _out_track {
+    my ($tracklet_fh, $request_fh, $track_id, @tracklet_ids) = @_;
+    my @tracklets = map { modct_retrieve($inst, trackletId => $_) } @tracklet_ids;  # fetch all tracklets
+    my @detections; # flattened detection list
+    my $nobs;       # number observations
+    my $ntrk;       # number of tracklets
+    my $nn;         # number of nights observed
+
+    eval {
+        @tracklets = sort { $a->extEpoch <=> $b->extEpoch } @tracklets;     # sort by tracklet central time
+        foreach my $trk (@tracklets) {
+            my $oid = $track_id;                    # tracklet ID, will become temporary detId
+            foreach my $d (@{$trk->detections}) {
+                $d->detId($trk->trackletId);       # hijack detId for tracklet listing
+
+                #XXX hello
+                $d->objectName('N' . $trk->trackletId) unless $d->objectName;       # just for andrea's code
+                print $tracklet_fh modx_toDETECTION($d), "\n";
+            }
+
+            push @detections, @{$trk->detections};  # all all dets to list for this track
+        }
+
+        $nobs = scalar @detections;
+        $ntrk = scalar @tracklets;
+    #    $nn = _count_nights(\@detections);
+        $nn = 0;
+
+        print $request_fh modx_toIODREQUEST(
+            ID_OID => $track_id,
+            TRACKLETS_REF => \@tracklets,
+            N_OBS => $nobs,
+            N_NIGHTS => $nn,
+        ), "\n";
+    };
+    if ($@) {
+        die "Couldn't process track ID $track_id\n";
+    }
+}
+
+
+

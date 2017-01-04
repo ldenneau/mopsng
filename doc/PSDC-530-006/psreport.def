@@ -1,0 +1,49 @@
+% -- MAKETITLE --
+\def\maketitle{
+   \fancyhead{}
+   \fancyhead[L]{\theproject}
+   \fancyhead[R]{\thedocnumber-\theversion}
+   \fancyfoot[L]{\theshorttitle}
+   \fancyfoot[R]{\today}
+   \par
+   \begingroup
+   \newpage
+   \global\@topnum\z@        % Prevents figures from going at top of page.
+   \@maketitle
+   \endgroup
+   \let\maketitle\relax
+   \let\@maketitle\relax
+   \gdef\@thanks{}\gdef\@author{}\gdef\@title{}\let\thanks\relax
+   \pagestyle{fancy}
+}
+
+\def\@maketitle{
+  \pagenumbering{roman} 
+  \thispagestyle{empty} 
+  \unitlength 1.0in
+  \begin{picture}(0.0,0.0)(0.0,9.375)
+  \small
+
+  \put (7.50, 9.85){\makebox(0,0)[br]{\small      {\bf Pan-STARRS Document Control}}}
+  \put (7.50, 9.70){\makebox(0,0)[br]{\small      {\bf \thedocnumber-\theversion}}}
+
+  \put (0.50, 8.10){\makebox(0,0)[bl]{\small      {\fontA UNIVERSITY OF HAWAII AT MANOA}}}
+  \put (4.006, 8.30){\line(1,0){0.1}} % put the macron on Manoa
+  \put (0.50, 7.88){\makebox(0,0)[bl]{\scriptsize {\fontB Institute for Astrononmy}}}
+  \put (0.50, 7.83){\line(1,0){6.5}}
+  \put (0.50, 7.63){\makebox(0,0)[bl]{\small      {\bf Pan-STARRS Project Management System}}}
+
+  \put (3.75, 5.00){\makebox(0,0)[bc]{\Large {\bf \@title}}}
+
+  \put (3.75, 4.70){\makebox(0,0)[bc]{\small      {\bf \@author}}}
+  \put (3.75, 4.53){\makebox(0,0)[bc]{\small      {\bf \thegroup}}}
+  \put (3.75, 4.36){\makebox(0,0)[bc]{\small      {\bf \theorganization}}}
+  \put (3.75, 4.19){\makebox(0,0)[bc]{\small      {\bf \today}}}
+
+  \put (3.75, 1.26){\makebox(0,0)[bc]{\scriptsize {\bf \copyright Institute for Astronomy}}}
+  \put (3.75, 1.13){\makebox(0,0)[bc]{\scriptsize {\bf 2680 Woodlawn Drive, Honolulu, Hawaii 96822}}}
+  \put (3.75, 1.00){\makebox(0,0)[bc]{\scriptsize {\bf An Equal Opportunity/Affirmative Action Institution}}}
+  \end{picture}
+  \pagebreak 
+}                
+

@@ -1,0 +1,83 @@
+#!/usr/bin/env perl
+# $Id: diffdets 3129 2008-11-18 00:20:26Z denneau $
+
+use strict;
+use warnings;
+
+use Pod::Usage;
+use Getopt::Long;
+use FileHandle;
+use Astro::SLA;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::MITI;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Detection;
+
+
+use subs qw(
+    _out
+);
+
+my $inst;
+my $instance_name;
+my $help;
+my $verbose;
+my $mif;
+GetOptions(
+    mif => \$mif,
+    v => \$verbose,
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+
+my $inp_fh = new FileHandle(shift or "-");
+
+my $line;
+my %det;
+my %last_det;
+
+while (defined($line = <$inp_fh>)) {
+    next if $line =~ /^#/;
+    chomp $line;
+
+    print "# ", $line, "\n" if $verbose;
+
+    %det = miti_parse($line);
+    if (%last_det) {
+        _out_miti(\%det, \%last_det);
+    }
+    %last_det = %det;
+}
+exit;
+
+
+sub _out_miti {
+    my ($det1, $det0) = @_;
+    my $delta = slaDsep( 
+        $det0->{RA_DEG} / $DEG_PER_RAD,
+        $det0->{DEC_DEG} / $DEG_PER_RAD,
+        $det1->{RA_DEG} / $DEG_PER_RAD,
+        $det1->{DEC_DEG} / $DEG_PER_RAD
+    ) * $DEG_PER_RAD * 3600;    # cvt to arcsec
+    printf "%-12s %-12s %.4f\n",  $det0->{ID}, $det1->{ID}, $delta;
+}
+
+=head1 NAME
+
+diffdets - Program to compute deltas (in arcseconds) between successive detections
+
+=head1 SYNOPSIS
+
+diffdets [options] < input
+
+  --mif : input is MIF-D detections
+
+=head1 DESCRIPTION
+
+Coming soon.
+
+=cut
+

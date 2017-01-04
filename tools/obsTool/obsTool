@@ -1,0 +1,1340 @@
+#!/usr/bin/env perl
+# $Id: obsTool 3941 2010-03-12 19:10:25Z denneau $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Params::Validate;
+use File::Temp qw(tempfile);
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::MPC qw(:all);
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::JPLEPH;
+use PS::MOPS::Lib;
+
+
+# Globals.
+use subs qw(
+    get_mpc_dets
+);
+
+our $inst;              # MOPS simulation instance
+our %hilight_table;     # object names to hilight in plots
+
+# Ugly
+my $T_DEC = 'dec_deg';
+##if (modc_backend() eq 'mysql') {
+##    $T_DEC = 'dec_deg';
+##}
+##else {
+##    $T_DEC = 'DEC';
+##}
+
+
+my $LINESTYLES = <<"LINESTYLES";
+set style line 1 lt 1
+set style line 2 lt 2
+set style line 3 lt 3
+set style line 4 lt 4
+set style line 5 lt 5
+set style line 6 lt 6
+set style line 7 lt 7
+LINESTYLES
+
+
+
+my $instance_name;
+my $help;
+my $ocnum;
+my $opt_detections;
+my $opt_tracklets;
+my $mpcheck;            # for tracklet plot, maybe detections eventually
+my $field_id;
+my $mjd;
+my $mpc;
+my $miti;
+my $nodetIds = 0;  # 1 => show objectName when export MPC detections
+my $objprefix;
+my $maxhv;
+my $maxmag;
+my $moidfilter;
+my $motion;
+my $detsperdeg2;
+my $linkstuff;
+
+my $plot;
+my $density;
+my $hilightobj = '';
+my $title;
+my $noheader;
+my $nodelete;
+my $autoscale;
+my $show_filter;
+my $show_exposure_time;
+my $show_parent_id;
+
+my $leetle;     # small plot
+my $terminal;
+my $postscript;
+my $postscriptc;
+my $eps;
+my $epsc;
+my $png;
+my $nokey;
+my $verbose;
+
+GetOptions(
+    'instance=s' => \$instance_name,
+    ocnum => \$ocnum,
+    detections => \$opt_detections,
+    tracklets => \$opt_tracklets,
+    mpcheck => \$mpcheck,
+    mjd => \$mjd,
+    mpc => \$mpc,
+    miti => \$miti,
+    nodetIds => \$nodetIds,
+    'objprefix=s' => \$objprefix,
+    'maxhv=f' => \$maxhv,
+    'maxmag=f' => \$maxmag,
+    'maxmoid=f' => \$moidfilter,
+    motion => \$motion,
+    plot => \$plot,
+    'hilightobj=s' => \$hilightobj,
+    detsperdeg2 => \$detsperdeg2,
+    linkstuff => \$linkstuff,
+    density => \$density,
+    'title=s' => \$title,
+    autoscale => \$autoscale,
+    show_filter => \$show_filter,
+    show_exposure_time => \$show_exposure_time,
+    show_parent_id => \$show_parent_id,
+    noheader => \$noheader,
+    nodelete => \$nodelete,
+    leetle => \$leetle,
+    'terminal=s' => \$terminal,
+    postscript => \$postscript,
+    eps => \$eps,
+    postscriptc => \$postscriptc,
+    epsc => \$epsc,
+    nokey => \$nokey,
+    png => \$png,
+    help => \$help,
+    verbose => \$verbose,
+) or pod2usage(2);
+my @ids = @ARGV;
+pod2usage(-verbose => 2) if $help;
+pod2usage(3) if !@ids;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+my $OBSCODE = $mops_config->{site}->{obscode} || die "can't get obscode";
+my $field_shape = $mops_config->{site}->{field_shape} || 'circle';
+my $field_size_deg2 = $mops_config->{site}->{field_size_deg2};
+my $gmt_offset_hours = $mops_config->{site}->{gmt_offset_hours};
+
+
+# Scrub opts.
+$terminal = 'postscript solid' if $postscript or $eps;
+$terminal = 'postscript enhanced color solid' if $postscriptc or $epsc;
+if ($png) {
+    $terminal = 'png';
+    if ($leetle) {
+        $terminal .= " size 200,200 font arial 6";
+    }
+    else {
+        $terminal .= " size 800,600 font arial 8";
+    }
+}
+$opt_detections = 1 if $motion;  # --motion implies --detections
+
+
+# Parse hilighted objs.  We can concatenate them using
+# --hilightobj S000001,S000002,S000foo
+$hilight_table{$_} = 1 foreach split /,/, $hilightobj;
+
+
+sub _format_miti_obsdet {
+    # Output detection in MITI format.
+    my ($field, $det, $cheat) = @_;
+    my @stuff = ($det->detId, $field->epoch, $det->ra, $det->dec, $det->mag, $field->obscode);
+    push @stuff, ($det->objectName or 'XXXXXXX') if $cheat;
+    return join(" ", @stuff);
+}
+
+
+sub check_det_filter {
+    # Based on global options, decide whether this detection should be part
+    # of the output result set.  Return the det if so, undef otherwise.
+    my ($det) = @_;
+    my $yes = 1;
+    my $obj;
+
+    # Put filters here.
+    if ($maxhv && $det->objectName) {
+        # Filter on absolute magnitude.
+        $obj = modcs_retrieve($inst, objectName => $det->objectName) unless $obj;
+        $yes = 0 if $obj->hV >= $maxhv;
+    }
+
+    if ($yes && $moidfilter && $det->objectName) {
+        # need to trace back to obj and get moid_1.  Ugh.
+        $obj = modcs_retrieve($inst, objectName => $det->objectName) unless $obj;  # note: might have gotten obj from $maxhv
+        $yes = 0 if ($obj and (!$obj->moid_1 or $obj->moid_1 >= $moidfilter));
+    }
+
+    return $yes ? $det : undef;
+}
+
+
+# gnuplot linetype pointtype vars
+my $lt = 1;
+my $pt = 1;
+sub _plot {
+    # Use gnuplot to plot detection or field data.  A descriptor
+    # for the data to be plotted is passed in as data => [], which should
+    # be an arrayref of arrayrefs.  Each array is concatenated into a single
+    # inline plot for gnuplot using "plot '-'".
+    my %args = validate(@_, {
+        data => 1,      # array ref of array refs
+        xrange => 0,
+        yrange => 0,
+        cols => 0,
+        plot_title => 0,
+        titles => 0,
+        objlabels => 0,
+        shortlabels => 0,
+        center => 0,
+    });
+    my $xrange = defined($args{xrange}) ? "set xrange $args{xrange} reverse" : 'set xrange [] reverse';
+    my $yrange = defined($args{yrange}) ? "set yrange $args{yrange}" : '';
+    my $cols = $args{cols};
+    my $plot_title = ($args{plot_title} or "Untitled");
+
+    # Write data to tmp file; call gnuplot in bg; rm tmp file.
+    my ($fh, $filename) = tempfile('/tmp/obsToolXXXXX', SUFFIX => '.txt');
+    print $fh qq{set fontpath "/usr/lib/X11/fonts/TTF\n};
+    print $fh "set terminal $terminal\n" if $terminal;
+    print $fh "set nokey\n" if $nokey;
+
+    printf $fh <<"GNUPLOT";
+set size ratio -1
+set parametric
+$xrange
+$yrange
+set xlabel 'RA (deg)'
+set ylabel 'DEC (deg)'
+GNUPLOT
+
+    if ($args{objlabels}) {
+        foreach my $obj (@{$args{objlabels}}) {
+            printf $fh <<"LABEL", $obj->{objectName}, $obj->{ra}, $obj->{dec}, $obj->{ra}, $obj->{dec}, $obj->{ra}, $obj->{dec};
+set label "%s" at %f - 0.2, %f - 0.2
+set arrow from %f - 0.2, %f - 0.2 to %f, %f
+LABEL
+        }
+    }
+
+    if ($args{shortlabels}) {
+        foreach my $obj (@{$args{shortlabels}}) {
+            printf $fh <<"LABEL", $obj->{objectName}, $obj->{mag}, $obj->{ra}, $obj->{dec};
+set label "  %s (%.1f)" at %f, %f
+LABEL
+        }
+    }
+
+    printf $fh <<"GNUPLOT";
+plot \\
+GNUPLOT
+
+    if ($args{center}) {
+        printf $fh <<"GNUPLOT", @{$args{center}}[0,1,0,2];
+[0:6.28] (%f * cos(t) + %f), (%f * sin(t) + %f) lc 0 notitle, \\
+GNUPLOT
+    }
+
+    my $got_data;   # flag if we have any data to plot
+    my $last;       # indicates last iter through data list
+
+    my $n = 0;      # index through @{$args{data}} list
+    foreach my $d (@{$args{data}}) {
+        $last = ($d == $args{data}->[-1]);
+        my $got_data_this_pass = @{$d};             # any data for this array (might be empty -- no synth dets)_
+        $got_data = 1 if $got_data_this_pass;       # set if we have any data for any array
+
+        my $use_pt = $pt == 3 ? 6 : $pt;            # pt 3 is splotch, use circle with dot
+        if ($got_data_this_pass) {
+            my $title_str = $args{titles}->[$n] || '';
+            printf $fh <<"GNUPLOT", ($last ? '' : ',\\');
+"-" using $cols title '$title_str' lt $lt pt $use_pt%s
+GNUPLOT
+        }
+
+        $lt = $lt % 16 + 1;
+        $pt = $pt % 16 + 1;
+        $n++;
+    }
+
+    foreach my $d (@{$args{data}}) {
+        if (@{$d}) {
+            print $fh @{$d};
+            print $fh "e\n";    # end of data
+        }
+    }
+
+    close $fh;
+
+    if ($got_data) {
+        if ($terminal) {
+            system "gnuplot $filename";
+        }
+        else {
+            system "gnuplot -persist $filename";
+        }
+        (unlink $filename or warn "can't unlink $filename") unless $nodelete;
+    }
+}
+
+
+sub _plot_motion {
+    my %args = validate(@_, {
+        data => 1,      # array ref of array refs
+        xrange => 0,
+        yrange => 0,
+        cols => 0,
+        plot_title => 0,
+    });
+    my $xrange = defined($args{xrange}) ? "set xrange $args{xrange} reverse" : 'set xrange [] reverse';
+    my $yrange = defined($args{yrange}) ? "set yrange $args{yrange}" : '';
+    my $cols = $args{cols};
+    my $title = ($title or $args{title} or "Untitled");
+
+    # Write data to tmp file; call gnuplot in bg; rm tmp file.
+    my ($fh, $filename) = tempfile('/tmp/obsToolXXXXX', SUFFIX => '.txt');
+    print $fh "set terminal $terminal\n" if $terminal;
+    print $fh "set nokey\n" if $nokey;
+
+    print $fh <<"GNUPLOT";
+$LINESTYLES
+
+set size ratio -1
+$xrange
+$yrange
+set title '$title'
+set xlabel 'RA (deg)'
+set ylabel 'DEC (deg)'
+plot \\
+GNUPLOT
+
+    my $got_data;   # flag if we have any data to plot
+    my $last;       # indicates last iter through data list
+    my @dks;        # data keys
+
+    @dks = sort keys %{$args{data}};
+
+    foreach my $d (@dks) {
+        $last = ($d eq $dks[-1]);
+        $got_data = 1 if $args{data}->{$d};     # test we actually have some data
+
+        printf $fh <<"GNUPLOT", ($last ? '' : ',\\');
+"-" using $cols with vectors title '$d' ls $lt %s
+GNUPLOT
+
+        $lt = $lt % 7 + 1;
+    }
+
+    foreach my $d (@dks) {
+        print $fh @{$args{data}->{$d}};
+        print $fh "e\n";    # end of data
+    }
+
+    close $fh;
+
+    if ($got_data) {
+        if ($terminal) {
+            system "gnuplot $filename";
+        }
+        else {
+            system "gnuplot -persist $filename";
+        }
+        (unlink $filename or warn "can't unlink $filename") unless $nodelete;
+    }
+}
+
+
+sub _splot1 {
+    my ($opts, $data) = @_;
+    my $xrange = defined($opts->{xrange}) ? "set xrange $opts->{xrange} reverse" : 'set xrange [] reverse';
+    my $yrange = defined($opts->{yrange}) ? "set yrange $opts->{yrange}" : '';
+    my $cols = $opts->{cols};
+    my $title = ($title or $opts->{title} or "Untitled");
+
+    # Write data to tmp file; call gnuplot in bg; rm tmp file.
+    my ($fh, $filename) = tempfile('/tmp/obsToolXXXXX', SUFFIX => '.txt');
+    print $fh "set terminal $terminal\n" if $terminal;
+    print $fh "set nokey\n" if $nokey;
+    print $fh <<"GNUPLOT";
+set size ratio -1
+$xrange
+$yrange
+set xlabel 'RA (deg)'
+set ylabel 'DEC (deg)'
+#set view map
+splot "-" using $cols title '$title'
+
+GNUPLOT
+    print $fh @$data;
+    close $fh;
+    if ($terminal) {
+        system "gnuplot $filename";
+    }
+    else {
+        system "gnuplot -persist $filename";
+    }
+    (unlink $filename or warn "can't unlink $filename") unless $nodelete;
+}
+
+
+sub _splot2 {
+    my ($opts, $data) = @_;
+    my $xrange = defined($opts->{xrange}) ? "set xrange $opts->{xrange} reverse" : 'set xrange [] reverse';
+    my $yrange = defined($opts->{yrange}) ? "set yrange $opts->{yrange}" : '';
+    my $cols = $opts->{cols};
+    my $title = ($title or $opts->{title} or "Untitled");
+    my $field_side_deg;
+    if ($field_shape eq 'circle') {
+        $field_side_deg = 2 * sqrt($mops_config->{site}->{field_size_deg2} / $PI);
+    }
+    else {
+        $field_side_deg = sqrt($mops_config->{site}->{field_size_deg2});
+    }
+
+    # Write data to tmp file; call gnuplot in bg; rm tmp file.
+    my ($fh, $filename) = tempfile('/tmp/obsToolXXXXX', SUFFIX => '.txt');
+    print $fh "set terminal $terminal\n" if $terminal;
+    print $fh "set nokey\n" if $nokey;
+    print $fh <<"GNUPLOT";
+set size ratio -1
+$xrange
+$yrange
+set xlabel 'RA (deg)'
+set ylabel 'DEC (deg)'
+set pm3d map
+splot "-" title '$title'
+
+GNUPLOT
+
+    # Plot scan lines for contour plot.
+    my @stuff;
+    my $ra;
+    my $dec;
+    my $density;
+    my $width;
+    my $max_dec_deg = 88.0;             # don't scale for dec > this
+    foreach my $line (@$data) {
+        @stuff = split /\s+/, $line;
+        ($ra, $dec, $density) = @stuff[2, 3, 0];
+        if ($dec < $max_dec_deg) {
+            $width = $field_side_deg / cos($dec / $DEG_PER_RAD);
+        }
+        else {
+            $width = $field_side_deg / cos($max_dec_deg / $DEG_PER_RAD);
+        }
+
+        warn $line unless ($ra and $dec);
+        print $fh $ra - $width, " ", $dec + $width, " ", $density, "\n";
+        print $fh $ra + $width, " ", $dec + $width, " ", $density, "\n";
+        print $fh "\n"; # new scan line
+        print $fh $ra - $width, " ", $dec - $width, " ", $density, "\n";
+        print $fh $ra + $width, " ", $dec - $width, " ", $density, "\n";
+        print $fh "\n\n";   # new surface
+    }
+    close $fh;
+    if ($terminal) {
+        system "gnuplot $filename";
+    }
+    else {
+        system "gnuplot -persist $filename";
+    }
+    (unlink $filename or warn "can't unlink $filename") unless $nodelete;
+}
+
+
+sub _f {
+    # Format a floating-point value to the specified number of decimal places.
+    my ($val, $dec) = @_;
+    return sprintf "%.${dec}f", $val;
+}
+
+
+my $dbh = $inst->dbh;
+my $sth;
+my $line;
+my $header;
+my @header_fields;
+my @db_fields;
+my @data;
+my $sql;
+
+eval {
+    if (!$opt_detections && $ocnum) {  # display --ocnum summary; --detections forces det listing
+        my $where;
+
+        if ($ids[0] eq 'all') {
+#            $where = "where f.status is not NULL and f.status <> 'N'";
+            $where = "where f.status is not NULL";
+        }
+        else {
+            $where = "where f.status is not NULL and f.status <> 'N' and ocnum in (" . (join ",", @ids) . ")\n";
+        }
+
+        # Short summary of dates in a observing cycle with fields.
+        $sql = <<"SQL" or die "can't prepare SQL";
+select ocnum OCNUM, floor(epoch_mjd - 0.5 + $gmt_offset_hours / 24.) EPOCH, count(*) NUM,
+sum(if(f.status='K',1,0)) SLOW,
+sum(if(f.status='L',1,0)) FAST
+from `fields` f
+$where
+group by OCNUM, EPOCH
+order by OCNUM, EPOCH
+SQL
+        print STDERR $sql if $verbose;
+        $sth = $dbh->prepare($sql) or die "can't prepare SQL: $sql";
+
+        @header_fields = qw/
+            OC Epoch(MJD) Fields
+        /;
+        push @header_fields, 'Slow', 'Fast' if $linkstuff;
+        print '#' . join(" ", @header_fields), "\n" unless $noheader;
+
+        $sth->execute or die "can't execute SQL";
+        my $href;
+        while (defined($href = $sth->fetchrow_hashref)) {
+            if ($linkstuff) {
+                print join(" ", @{$href}{qw(OCNUM EPOCH NUM SLOW FAST)}), "\n";
+            }
+            else {
+                print join(" ", @{$href}{qw(OCNUM EPOCH NUM)}), "\n";
+            }
+        }
+    }
+    elsif (!$opt_detections && !$opt_tracklets) {
+        # List fields.  
+
+        my $and = '';
+        if ($mjd) {
+            $and =  '(' . join(' or ', map { "(f.epoch_mjd >= $_ and f.epoch_mjd < $_ + 1)" } @ids) . ')';
+        }
+        elsif ($ids[0] ne 'all') {
+            $and =  join ' ', map { "and f.field_id=$_" } @ids;
+        }
+
+        if ($objprefix) {
+            $objprefix = <<"FILTER";
+and d.object_name like '$objprefix%'
+FILTER
+        }
+        else {
+            $objprefix = '';
+        }
+
+        if ($maxmag) {
+            $maxmag = <<"FILTER";
+and d.mag < $maxmag
+FILTER
+        }
+        else {
+            $maxmag = '';
+        }
+
+        $sql = <<"SQL" or die "can't prepare SQL";
+select f.field_id FIELD_ID,
+    count(d.field_id) NUM_DETS,
+    f.epoch_mjd EPOCH,
+    f.ra_deg RA,
+    f.$T_DEC DECL,
+    f.survey_mode SURVEY_MODE,
+    f.filter_id FILTER_ID,
+    (f.time_stop - f.time_start) * 86400 EXPOSURE_TIME,
+    0 LIMITING_MAG,
+    f.obscode OBSCODE,
+    f.parent_id PARENT_ID
+from `fields` f left join detections d on (f.field_id=d.field_id)
+where 
+$and
+$objprefix
+$maxmag
+group by 
+    FIELD_ID,
+    EPOCH,
+    RA,
+    DECL,
+    SURVEY_MODE,
+    FILTER_ID,
+    EXPOSURE_TIME,
+    LIMITING_MAG,
+    OBSCODE
+order by EPOCH
+SQL
+#        print STDERR $sql if $verbose;
+        $mops_logger->info($sql);
+        $sth = $dbh->prepare($sql) or die "can't prepare SQL: $sql";
+        $sth->execute or die "can't execute SQL";
+        my $href;
+
+        if ($density or $plot) {
+            # Loop through results.
+            while (defined($href = $sth->fetchrow_hashref)) {
+                # If $detsperdeg2 is set, convert the number of detections to a density,
+                # using the configured field size.
+                if ($detsperdeg2) {
+                    $href->{NUM_DETS} /= $mops_config->{site}->{field_size_deg2};    # cvt to dets/deg2
+                }
+
+                push @data,
+                    join(" ", 
+                        @{$href}{qw(NUM_DETS EPOCH)},
+                        (sprintf "%.4f", $href->{RA}),
+                        (sprintf "%.4f", $href->{DECL}),
+                    ) . "\n";
+            }
+
+            die "NODATA" unless @data;      # bail if no data to plot
+
+            my %args;
+            if ($mjd and !$autoscale) {
+                $args{xrange} = '[0:360]';
+                $args{yrange} = '[-90:90]';
+            }
+            if ($density) {
+                $args{cols} = '3:4:1';
+                _splot2(\%args, \@data); }      # density plot of fields
+            else {
+                $args{data} = [\@data];
+                $args{cols} = '3:4';
+                $args{plot_title} = $title;
+                $args{titles} = ['Fields'];
+                _plot(%args);                   # basic scatter plot of fields
+            }
+        }
+        else {
+            @header_fields = qw(
+                FieldId NumDets Epoch RA DEC LimitingMag
+            );
+            print '#' . join(" ", @header_fields), "\n" unless $noheader;
+
+            my @stuff;
+            while (defined($href = $sth->fetchrow_hashref)) {
+                @stuff = (
+                    @{$href}{qw(FIELD_ID NUM_DETS)},
+                    (sprintf "%.5f", $href->{EPOCH}),
+                    (sprintf "%.4f", $href->{RA}),
+                    (sprintf "%.4f", $href->{DECL}),
+                    @{$href}{qw(LIMITING_MAG OBSCODE)}
+                );
+
+                if ($show_filter) {
+                    push @stuff, $href->{FILTER_ID};
+                }
+                if ($show_exposure_time) {
+                    push @stuff, sprintf "%.1f", $href->{EXPOSURE_TIME};
+                }
+                if ($show_parent_id) {
+                    push @stuff, ($href->{PARENT_ID} || 'NULL');
+                }
+
+                print join(" ", @stuff), "\n";
+            }
+        }
+    }
+    elsif ($opt_tracklets) {
+        my $field;
+        my $det_i;
+        my $det;
+        my $id;
+        my @newids;
+
+        # Plot tracklets terminating in specified field..
+        my @data_list;  # groups of detections (synth/nonsynth, etc.)
+        my @titles;     # titles for each data_list item
+        my @objlabels;
+        my @shortlabels;
+
+        foreach $id (@ids) {
+            my @data;
+            my @nonsynthetic;
+            my @hilight;
+            my @mpcheck;
+            $field = modcf_retrieve($inst, fieldId => $id) or die "can't find field $field_id";
+            $det_i = modcd_retrieve($inst, fieldId => $id, trackletOnly => 1);
+
+            while (defined($det = $det_i->next)) {
+                my $objname = $det->objectName;
+                if ((!$objprefix or $objname =~ $objprefix) and check_det_filter($det)) {
+                    if ($objname and exists($hilight_table{$objname})) {
+                        # Matches one of our hilighted objects.
+                        push @hilight, 
+                            join(" ", 
+                                $det->detId, $field->fieldId,
+                                $det->ra, $det->dec, $det->mag,
+                                $det->raSigma, $det->decSigma, $det->magSigma,
+                                $field->epoch,
+                            ) . "\n";
+                        push @objlabels, $det;
+                    }
+                    elsif (!$objname or ($objname eq 'FALSE' or $objname eq $MOPS_NONSYNTHETIC_OBJECT_NAME)) {
+                        push @nonsynthetic, 
+                            join(" ", 
+                                $det->detId, $field->fieldId,
+                                $det->ra, $det->dec, $det->mag,
+                                $det->raSigma, $det->decSigma, $det->magSigma,
+                                $field->epoch,
+                            ) . "\n";
+                    }
+                    else {
+                        push @data, 
+                            join(" ", 
+                                $det->detId, $field->fieldId,
+                                $det->ra, $det->dec, $det->mag,
+                                $det->raSigma, $det->decSigma, $det->magSigma,
+                                $field->epoch,
+                            ) . "\n";
+                    }
+                }
+            }
+
+            # If --mpcheck, then get stuff from MPC.
+            if ($mpcheck) {
+                my @mpcdata = get_mpc_dets($field);
+                foreach $det (@mpcdata) {
+                    push @mpcheck, 
+                            join(" ", 
+                                ("\"" . $det->{objectName} . "\""), $field->fieldId,
+                                $det->{ra}, $det->{dec}, $det->{mag},
+                                0, 0, 0,    # ra_sigma, dec_sigma, mag_sigma
+                                $field->epoch,
+                            ) . "\n";
+                    push @shortlabels, $det;
+                }
+            }
+
+            push @data_list, \@data;
+            push @titles, sprintf('Synthetic (%d)', scalar @data);
+            if (@nonsynthetic) {
+                push @data_list, \@nonsynthetic;
+                push @titles, sprintf('Nonsynthetic (%d)', scalar @nonsynthetic);
+            }
+            if (@mpcheck) {
+                push @data_list, \@mpcheck;
+                push @titles, sprintf('Known (%d)', scalar @mpcheck);
+            }
+            elsif (@hilight) {
+                push @data_list, \@hilight;
+                push @titles, "  $hilightobj";     # original cmd-line hilight string
+            }
+            push @titles, 'Detections' unless @titles;  # default title if still undef
+        }
+        if (@data_list) { 
+            my $dl;
+
+            # Alas, if $mjd, flatten list of detections.
+            if ($mjd) {
+                my @a = map { @{$_} } @data_list;
+                $dl = [\@a];
+            }
+            else {
+                $dl = \@data_list;
+            }
+            my @args = (
+                data => $dl,
+                cols => '3:4', 
+                plot_title => $title,
+                titles => \@titles,
+                objlabels => \@objlabels,
+                shortlabels => \@shortlabels,
+            );
+
+            if (($mops_config->{site}->{field_shape} || '') eq 'circle') {
+                my $fact = (sqrt($mops_config->{site}->{field_size_deg2} / $PI)) / cos($field->dec / $DEG_PER_RAD);
+                push @args, center => [$fact, $field->ra, $field->dec];
+            }
+            push @args, (xrange => '[0:360]', yrange => '[-90:90]') if ($mjd and !$autoscale);    # for full dates, use full RA/DEC range
+            _plot(@args);
+        }
+        else {
+            die "NODATA";      # bail if no data to plot
+        }
+    }
+
+
+    elsif ($opt_detections) {
+        my $field;
+        my $det_i;
+        my $det;
+        my $id;
+        my @newids;
+
+        if ($mjd) {
+            warn "--multiple MJDs not supported when --motion specified; using $ids[0]\n" if ($motion and @ids > 1);
+            warn "This will take a sec...\n";
+            my $res;
+            foreach $id (@ids) {
+                $res = $dbh->selectcol_arrayref(<<"SQL") or die "can't prepare SQL";
+select
+field_id
+from `fields`
+where epoch_mjd >= $id and epoch_mjd < $id + 1
+order by epoch_mjd
+SQL
+                push @newids, @{$res} if $res;
+            }
+            @ids = @newids; # use fetched field IDs
+            die "empty result set" unless @ids;
+        }
+        elsif ($ocnum) {    # --ocnums --detections.
+            my $res;
+            my $ocnum_str = '(' . join(', ', @ids) . ')';
+            foreach $id (@ids) {
+                $res = $dbh->selectcol_arrayref(<<"SQL") or die "can't prepare SQL";
+select
+field_id
+from `fields`
+where ocnum in $ocnum_str
+order by epoch_mjd
+SQL
+                push @newids, @{$res} if $res;
+            }
+            @ids = @newids; # use fetched field IDs
+            die "empty result set" unless @ids;
+        }
+
+        if ($objprefix) {
+            $objprefix = qr/^$objprefix/;  # filter detections by object name
+        }
+
+        if ($motion) {
+            # List/show detections, but include rate of motion.  Need to
+            # call JPLEPM for MJD, MJD + 1 to get rate of motion.  If $plot,
+            # then use vectors; otherwise print magnitude of motion.
+            # Duplicate all opt_detections code here until refactoring.
+            if ($plot) {
+                my $ephem_epoch;    # epoch for motion calculation
+                my %dk;         # holds arrays of dets for each object type
+
+                # Build list of detections.
+                my @dets;       # intermediate list of detections
+                foreach $id (@ids) {
+                    $field = modcf_retrieve($inst, fieldId => $id) or die "can't find field $field_id";
+                    $det_i = modcd_retrieve($inst, fieldId => $id);
+
+                    # Use first epoch we find as t0 for motion calculation.
+                    $ephem_epoch = $field->epoch unless $ephem_epoch;
+
+                    while (defined($det = $det_i->next)) {
+                        if ($det->objectName) {
+                            if ((!$objprefix or $det->objectName =~ $objprefix) and check_det_filter($det)) {
+                                push @dets, $det;
+                            }
+                        }
+                    }
+                }
+
+                # Calculate ephemerides for detections.
+                if (@dets) {
+                    my @objectNames = map { $_->objectName } @dets;
+                    my $ephems_epoch1 = jpleph_calcEphemerides(
+                        instance => $inst,
+                        objectNames => \@objectNames, 
+                        epoch => $ephem_epoch,
+                        obscode => $OBSCODE,
+                    );
+                    my $ephems_epoch2 = jpleph_calcEphemerides(
+                        instance => $inst,
+                        objectNames => \@objectNames, 
+                        epoch => ($ephem_epoch + 1),
+                        obscode => $OBSCODE,
+                    );
+
+                    # Build table of data for plot.
+                    my $n;          # tmp name placeholder
+                    my $objkey;     # object type key
+                    my $dra;        # delta RA
+                    my $ddec;       # delta DEC
+                    foreach $det (@dets) {
+                        $n = $det->objectName;
+                        if ($n and $n ne 'NS' and exists(${$ephems_epoch1}{$n}) and exists(${$ephems_epoch2}{$n})) {
+                            $dra = mopslib_dang($ephems_epoch2->{$n}->{ra}, $ephems_epoch1->{$n}->{ra});
+                            $ddec = mopslib_dang($ephems_epoch2->{$n}->{dec}, $ephems_epoch1->{$n}->{dec});
+
+                            $objkey = substr($n, 0, 2);     # get synthetic obj prefix
+                            push @{$dk{$objkey}},           # add to list for this prefix
+                                join(" ", 
+                                    $det->ra, $det->dec, $dra, $ddec,
+                                ) . "\n";
+                        }
+                        else {
+                            warn "couldn't get RA, DEC pair for $n\n";
+                        }
+                    }
+                }
+
+                die "NODATA" unless @dets;      # bail if no data to plot
+
+                # Build result for plot.
+                my @args = (
+                    data => \%dk,
+                    cols => '1:2:3:4', 
+                    plot_title => ($title or 'Detections'),
+                );
+                push @args, (xrange => '[0:360]', yrange => '[-90:90]') if ($mjd and !$autoscale);    # for full dates, use full RA/DEC range
+                _plot_motion(@args);
+            }
+            else {
+                my $ephem_epoch;
+                my %dk;         # holds arrays of dets for each object type
+
+                my @header_fields = qw(
+                    DetId FieldId RA DEC dRA dDEC Mag hV Epoch ObjectName
+                );
+                print join(" ", @header_fields), "\n" unless $noheader;
+
+                # Build list of detections.
+                my @dets;       # intermediate list of detections
+                foreach $id (@ids) {
+                    $field = modcf_retrieve($inst, fieldId => $id) or die "can't find field $field_id";
+                    $det_i = modcd_retrieve($inst, fieldId => $id);
+
+                    # Use first epoch we find as t0 for motion calculation.
+                    $ephem_epoch = $field->epoch unless $ephem_epoch;
+
+                    while (defined($det = $det_i->next)) {
+                        if ((!$objprefix or $det->objectName =~ $objprefix) and check_det_filter($det)) {
+                            push @dets, $det;
+                        }
+                    }
+                }
+
+                die "NODATA" unless @dets;      # bail if no data to plot
+
+                # Calculate ephemerides for detections.
+                if (@dets) {
+                    my @objectNames = map { $_->objectName } @dets;
+                    my $ephems_epoch1 = jpleph_calcEphemerides(
+                        instance => $inst,
+                        objectNames => \@objectNames, 
+                        epoch => $ephem_epoch,
+                        obscode => $OBSCODE,
+                    );
+                    my $ephems_epoch2 = jpleph_calcEphemerides(
+                        instance => $inst,
+                        objectNames => \@objectNames, 
+                        epoch => ($ephem_epoch + 1),
+                        obscode => $OBSCODE,
+                    );
+
+                    # Build table of data for plot.
+                    my $n;          # tmp name placeholder
+                    my $objkey;     # object type key
+                    my $dra;        # delta RA
+                    my $ddec;       # delta DEC
+
+                    foreach $det (@dets) {
+                        $n = $det->objectName;
+                        if ($n and $n ne 'NS' and exists(${$ephems_epoch1}{$n}) and exists(${$ephems_epoch2}{$n})) {
+                            $dra = mopslib_dang($ephems_epoch2->{$n}->{ra}, $ephems_epoch1->{$n}->{ra});
+                            $ddec = mopslib_dang($ephems_epoch2->{$n}->{dec}, $ephems_epoch1->{$n}->{dec});
+
+                            print join(" ", 
+                                    $det->detId, $field->fieldId,
+                                    _f($det->ra, 4), _f($det->dec, 4), 
+                                    _f($dra, 4), _f($ddec, 4), 
+                                    _f($det->mag, 2),
+                                    (_f(modcs_retrieve($inst, objectName => $det->objectName)->hV, 2) or "N/A"),
+                                    _f($field->epoch, 5), $det->objectName
+                                ), "\n";
+                        }
+                        else {
+                            warn "couldn't get RA, DEC pair for $n\n";
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            # not --motion
+            if ($plot) {
+                my @data_list;  # groups of detections (synth/nonsynth, etc.)
+                my @titles;     # titles for each data_list item
+                my @objlabels;
+                my @shortlabels;
+
+                foreach $id (@ids) {
+                    my @data;
+                    my @nonsynthetic;
+                    my @hilight;
+                    my @mpcheck;
+                    $field = modcf_retrieve($inst, fieldId => $id) or die "can't find field $field_id";
+                    $det_i = modcd_retrieve($inst, fieldId => $id);
+
+                    while (defined($det = $det_i->next)) {
+                        my $objname = $det->objectName;
+                        if ((!$objprefix or $objname =~ $objprefix) and check_det_filter($det)) {
+                            if ($objname and exists($hilight_table{$objname})) {
+                                # Matches one of our hilighted objects.
+                                push @hilight, 
+                                    join(" ", 
+                                        $det->detId, $field->fieldId,
+                                        $det->ra, $det->dec, $det->mag,
+                                        $det->raSigma, $det->decSigma, $det->magSigma,
+                                        $field->epoch,
+                                    ) . "\n";
+                                push @objlabels, $det;
+                            }
+                            elsif (!$objname or ($objname eq 'FALSE' or $objname eq $MOPS_NONSYNTHETIC_OBJECT_NAME)) {
+                                push @nonsynthetic, 
+                                    join(" ", 
+                                        $det->detId, $field->fieldId,
+                                        $det->ra, $det->dec, $det->mag,
+                                        $det->raSigma, $det->decSigma, $det->magSigma,
+                                        $field->epoch,
+                                    ) . "\n";
+                            }
+                            else {
+                                push @data, 
+                                    join(" ", 
+                                        $det->detId, $field->fieldId,
+                                        $det->ra, $det->dec, $det->mag,
+                                        $det->raSigma, $det->decSigma, $det->magSigma,
+                                        $field->epoch,
+                                    ) . "\n";
+                            }
+                        }
+                    }
+
+                    # If --mpcheck, then get stuff from MPC.
+                    if ($mpcheck) {
+                        my @mpcdata = get_mpc_dets($field);
+                        foreach $det (@mpcdata) {
+                            push @mpcheck, 
+                                    join(" ", 
+                                        ("\"" . $det->{objectName} . "\""), $field->fieldId,
+                                        $det->{ra}, $det->{dec}, $det->{mag},
+                                        0, 0, 0,    # ra_sigma, dec_sigma, mag_sigma
+                                        $field->epoch,
+                                    ) . "\n";
+                            push @shortlabels, $det;
+                        }
+                    }
+
+                    push @data_list, \@data;
+                    push @titles, sprintf('Synthetic (%d)', scalar @data);
+                    if (@nonsynthetic) {
+                        push @data_list, \@nonsynthetic;
+                        push @titles, sprintf('Nonsynthetic (%d)', scalar @nonsynthetic);
+                    }
+                    if (@mpcheck) {
+                        push @data_list, \@mpcheck;
+                        push @titles, sprintf('Known (%d)', scalar @mpcheck);
+                    }
+                    if (@hilight) {
+                        push @data_list, \@hilight;
+                        push @titles, "  $hilightobj";     # original cmd-line hilight string
+                    }
+                    push @titles, sprintf('Detections (%d)', scalar @titles) unless @titles;  # default title if still undef
+                }
+                if (@data_list) { 
+                    my $dl;
+
+                    # Alas, if $mjd, flatten list of detections.
+                    if ($mjd) {
+                        my @a = map { @{$_} } @data_list;
+                        $dl = [\@a];
+                    }
+                    else {
+                        $dl = \@data_list;
+                    }
+                    my @args = (
+                        data => $dl,
+                        cols => '3:4', 
+                        plot_title => $title,
+                        titles => \@titles,
+                        objlabels => \@objlabels,
+                        shortlabels => \@shortlabels,
+                    );
+
+                    if (($mops_config->{site}->{field_shape} || '') eq 'circle') {
+                        my $fact = (sqrt($mops_config->{site}->{field_size_deg2} / $PI)) / cos($field->dec / $DEG_PER_RAD);
+                        push @args, center => [$fact, $field->ra, $field->dec];
+                    }
+                    push @args, (xrange => '[0:360]', yrange => '[-90:90]') if ($mjd and !$autoscale);    # for full dates, use full RA/DEC range
+                    _plot(@args);
+                }
+                else {
+                    die "NODATA";      # bail if no data to plot
+                }
+            }
+            else {
+#                @header_fields = qw(
+#                    DetId Epoch_MJD RA_deg DEC_deg Mag ObsCode ObjectName
+#                );
+                @header_fields = qw(
+                    DetId FieldId RA DEC dRA dDEC Mag hV Epoch ObjectName
+                );
+                print '#' . join(" ", @header_fields), "\n" unless ($noheader or $mpc);
+
+                # No plot; just dump to screen
+                foreach $id (@ids) {
+                    $field = modcf_retrieve($inst, fieldId => $id) or die "can't find field $field_id";
+                    $det_i = modcd_retrieve($inst, fieldId => $id);
+                    my $obj;
+                    my $hV;
+
+                    while (defined($det = $det_i->next)) {
+                        if ((!$objprefix or $det->objectName =~ $objprefix) and check_det_filter($det)) {
+                            if ($mpc) {
+                                print mpc_format_obsdet($field, $det, !$nodetIds), "\n";
+                            }
+                            elsif ($miti) {
+                                print _format_miti_obsdet($field, $det, !$nodetIds), "\n";
+                            }
+                            elsif ($det->objectName) {
+                                $obj = modcs_retrieve($inst, objectName => $det->objectName);
+                                $hV = $obj ? _f($obj->hV, 2) : 'N/A';
+                                print join(" ", 
+                                        $det->detId, $field->fieldId,
+                                        _f($det->ra, 4), _f($det->dec, 4), _f($det->mag, 2),
+                                        $hV,
+                                        _f($field->epoch, 5), $det->objectName
+                                    ), "\n";
+                            }
+                            else {
+                                $hV = 'N/A';
+                                print join(" ", 
+                                        $det->detId, $field->fieldId,
+                                        _f($det->ra, 4), _f($det->dec, 4), _f($det->mag, 2),
+                                        $hV,
+                                        _f($field->epoch, 5), ($det->objectName || 'NS')
+                                    ), "\n";
+                            }
+                        }
+                    }
+                }
+            }
+
+        }
+    }
+};      # eval
+
+
+if ($@ =~ /NODATA/) {
+    warn "No data.\n";          # somebody died because there's no data to plot
+}
+else {
+    die $@ if $@;
+}
+exit;
+
+
+sub get_mpc_dets {
+    # Given a field ID, get nearby MPC known objects that could be in the field.
+    my ($field) = @_;
+    my $epoch_mjd = $field->epoch;
+    my $ra_deg = $field->ra;
+    my $dec_deg = $field->dec;
+    my @data;
+    my $radius_arcmin = 30;
+
+    # Set up for testing if object is in the field.
+    my $fov_size_deg;
+    if ($field_shape eq 'circle') {
+        $fov_size_deg = 2 * sqrt($field_size_deg2 / $PI);  # width of field
+    }
+    else {
+        $fov_size_deg = sqrt($field_size_deg2);            # width of field
+    }
+    $radius_arcmin = $fov_size_deg / 2 * 60;
+
+    # Get MPC data over the web.
+    open MPCHECK, "mpcheck --epoch_mjd=$epoch_mjd --obscode=$OBSCODE --ra_deg=$ra_deg --dec_deg=$dec_deg --radius_arcmin=$radius_arcmin --filter|";
+    my @stuff = <MPCHECK>;  # slurp all
+    close MPCHECK;
+
+
+    # Scrape!
+    my @items;
+    my $det;
+    my $in_field;
+    foreach my $line (@stuff) {
+        @items = split /\s+/, $line;
+        $det = {
+#            objectName => $items[0],        # IAU number
+            objectName => $items[1],        # MPC designation
+            ra => $items[2],
+            dec => $items[3],
+            mag => $items[4],
+        };
+
+        # Now only return stuff that's in the field.
+        if ($field_shape eq 'circle') {
+            if (mopslib_inField($field->ra, $field->dec, $fov_size_deg, $det->{ra}, $det->{dec})) {
+                $in_field = 1;
+            }
+        }
+        else {
+            if (mopslib_inSquareField($field->ra, $field->dec, $fov_size_deg, $det->{ra}, $det->{dec})) {
+                $in_field = 1;
+            }
+        }
+
+        if ($in_field) {
+            push @data, $det;
+        }
+    }
+
+
+    return @data;
+}
+
+
+=head1 NAME
+
+obsTool - Command-line tool to query PSMOPS field data (metadata)
+ 
+=head1 SYNOPSIS
+
+obsTool [--ocnum] [--detections]
+    [--mjd] [--mpc] [--plot|--density] [--motion]
+    [--objprefix PREFIX] [--maxhv MAXHV] [--maxmag MAXMAG] [--maxmoid MAX_MOID]
+    [--title "TITLE"]
+    [--terminal DEVICE] [--postscript|postscriptc|eps|epsc] [--png] [--nokey]
+    [--noheader] [--nodelete] [--help] [--verbose]
+    id1 id2 ...
+
+  --ocnum : summarize by MOPS observing cycle number (try 'obsTool --ocnum all')
+  --detections : list detections
+  --mjd : treat IDs as MJDs; fetch field/detections for each MJD, MJD + 1
+  --objprefix PREFIX : only fetch dets with objectName starting with PREFIX;
+    e.g. 'Sc', 'St7', 'S0', etc.
+  --maxHV MAXHV : only fetch objs with absolute mag less than MAXHV
+  --maxmag MAXMAG : only fetch dets with magnitude value less than MAXMAG
+  --maxmoid MAX_MOID : only fetch dets with orbit.moid_1 value less than MAX_MOID
+  --mpc : write detection output in MPC format
+  --miti : write detection output in MITI format
+  --nodetIds : write out object names instead of detection IDs when exporting MPC files
+  --detsperdeg2 : output density in detections per deg2
+  --linkstuff : emit linking summary with --ocnum (ugly)
+  --plot : output to gnuplot using 'plot'
+  --density : for field output, plot density of detections
+  --motion : (implies --detection) calculate and list/plot daily motion of objects
+  --title "TITLE" : use TITLE as plot title
+  --noheader : don't display header lines for plain text output
+  --nodelete : don't delete tmp gnuplot file
+  --autoscale : always autoscale RA and DEC (--mjd by default scales to full sky)
+  --terminal DEVICE : set gnuplot terminal to DEVICE; write output to stdout
+  --postscript|eps : abbreviation for "--terminal postscript"
+  --postscriptc|epsc : abbreviation for "--terminal 'postscript enhanced color'"
+  --png : abbreviation for "--terminal png"
+  --nokey : 'set nokey' in GNUPlot; hides key/legend
+  --verbose : print extra stuff, SQL statements
+  --help : show usage and examples in manpage format
+  id1 id2 ... : field IDs/MJDs to list; 'all' for all fields/dets
+
+=head1 DESCRIPTION
+
+obsTool is a sledgehammer/Swiss Army Knife that performs various querying
+of field data (metadata) and detection data in the PSMOPS database
+instance.  obsTool's actions depend on the switches used when invoked.
+Output is written to STDOUT.
+
+You might want to pipe the output through column(1) for tabular output.
+
+If you have an xterm open --plot or --density can be used to plot detections
+and field in a graphics window.  'plot' simply specifies an X/Y
+plot in RA/DEC of the specified data (either fields or detections).
+'density' applies to fields; detections are counted in fields
+and used as a Z value in a 3D plot.
+
+Daily motions of objects can be plotted or listed.  The JPL ephemeris
+generator is called for retrieved detections and motion is computed for
+one day.  This motion is used as the length of the arrows in the plot.
+
+The date or id specifier can go nearly anywhere where there is not
+an argument expected.  For example these are equivalent:
+
+  obsTool --mjd 53375 53373
+  obsTool 53375 --mjd 53374
+  obsTool 53375 53374 --mjd
+
+However when specifying a title or objprefix, the argument must
+immediately follow the switch:
+
+  obsTool --mjd --title "NEOs on MJD 53373" 53373
+
+Switches that expect arguments can be specified as follows:
+
+  obsTool --objprefix=St 5651
+  obsTool --obsprefix St 5651
+
+See the man page on Getopt::Long for more ('man Getopt::Long').
+
+Here are some other examples of obsTool invocation:
+
+obsTool all
+
+  List all fields in PSMOPS
+
+obsTool --ocnum all
+
+  Summarize fields by MOPS observing cycle number
+
+obsTool --mjd 53388
+
+  List all fields with epoch between MJD 53388 and 53389
+
+obsTool --detections --mpc 6666
+
+  List all detections for fieldId 6666, in MPC format
+
+obsTool --detections --mjd --mpc 53388
+
+  List all detections for MJD 53388, in MPC format
+
+obsTool --detections --plot 5309
+
+  Plot all detections in field 5309
+
+obsTool --detections --plot --objprefix Sc --mjd 53374
+
+  Plot all comets ('Sc') detections occurring during MJD 53374
+
+obsTool --detections --plot --objprefix S0 --maxmag 21.5 --mjd 53374
+
+  Plot all NEOs ('S0') detections brighter than magnitude 21.5 occurring during MJD 53374 
+
+obsTool --plot --mjd 53380 53381
+
+  Plot all field locations occurring during MJDs 53380 and 53381
+
+obsTool --detections 5944 5961
+
+  Plot all detections in field IDs 5944 and 5961
+
+obsTool --detections 5944 5961 --motion --objprefix S0
+
+  Plot detections of NEOs (S0) and their daily motions in field
+  IDs 5944 and 5961
+
+=head1 SEE ALSO
+
+PS::MOPS::MPC
+PS::MOPS::DC::Field
+PS::MOPS::DC::Detection
+
+=cut
+

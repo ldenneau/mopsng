@@ -1,0 +1,92 @@
+#!/usr/bin/env perl
+
+# $Id: filterCoarseEphem 1197 2006-07-28 03:56:47Z fpierfed $
+# Read in coarse ephemerides data; throw out erroneous data and
+# data above our magnitude threshold.
+
+use strict;
+use warnings;
+
+use FileHandle;
+use Getopt::Long;
+use File::Slurp;
+
+my $limiting_mag;
+my $help;
+my $rv;
+
+
+sub usage {
+    return <<"EOF";
+Usage: filtCoarseEphems [--limitingMag H] file1 file2 file3 ...
+  --limitingMag H : omit lines with magnitudes greater than H
+  file1 file2 file3 ... : input coarse ephemerides output (from genEphem)
+EOF
+}
+
+
+$rv = GetOptions(
+    'limitingMag=f' => \$limiting_mag,
+    help => \$help,
+);
+
+die usage() if !$rv or $help;
+
+my @files = @ARGV;
+die "hack: exactly 3 files must be specified\n" unless @files == 3;
+die usage() unless @files;
+
+my $ne = scalar @files;     # number of coarse ephems we need
+my @lines;
+
+# We're going to do this in two passes.  First pass is to count how many times each
+# object appears in our files.  Next pass is to write out only the objects
+# that appear the required number of times (once in each file), and have the
+# minimum mag.
+
+my $file;
+my ($str1, $str2, $str3);
+my (@line1, @line2, @line3);
+my $line;
+my %objmap;
+my @stuff;
+my $key;
+
+my ($objectName, $epoch, $ra, $dec, $mag);
+my @fhs;        # filehandles
+my $nf;         # num files
+
+foreach $file (@files) {
+    my $fh = new FileHandle;
+    open $fh, $file or die "can't open $file";
+    push @fhs, $fh;
+}
+$nf = scalar @files;
+
+my ($fh1, $fh2, $fh3);
+$fh1 = $fhs[0];
+$fh2 = $fhs[1];
+$fh3 = $fhs[2];
+
+printf STDERR "Reading files %s\n", join(" ", @files);
+while (1) {
+    $str1 = <$fh1>;
+    $str2 = <$fh2>;
+    $str3 = <$fh3>;
+    last unless ($str1 && $str2 && $str3);      # end of data if anybody undef
+    chomp $str1;
+    chomp $str2;
+    chomp $str3;
+    next if ($str1 =~ /ERROR/ || $str2 =~ /ERROR/ || $str3 =~ /ERROR/);   # JPLEPH error, skip
+    @line1 = split /\s+/, $str1;
+    @line2 = split /\s+/, $str2;
+    @line3 = split /\s+/, $str3;
+    next unless (@line1 == 5 && @line2 == 5 && @line3 == 5);     # funny data, skip
+    die "files out of sync" unless ($line1[0] eq $line2[0] and $line1[0] eq $line2[0]); # lines don't match
+    if ($line1[4] < $limiting_mag || $line2[4] < $limiting_mag || $line3[4] < $limiting_mag) {
+        print $str1, "\n";        # print object
+        print $str2, "\n";        # print object
+        print $str3, "\n";        # print object
+    }
+}
+

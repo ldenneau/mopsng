@@ -1,0 +1,35 @@
+#!/usr/bin/env perl
+# Convert MPC file to MITI format.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use PS::MOPS::MITI;
+use PS::MOPS::MPC qw(:all);
+
+
+my $line;
+my %miti;
+my $href;
+while (defined($line = <>)) {
+    next if $line =~ /^\s*$/;           # skip blank lines
+    $href = mpc_to_miti($line);         # get fmtted MPC line as MITI hash
+    print miti_format_hash(%{$href}) if $href;
+}
+
+=head1 NAME
+
+mpc2miti - Convert MITI file to MPC format via STDIN/STDOUT.
+
+=head1 SYNOPSIS
+
+mpc2miti < input > output
+
+=head1 DESCRIPTION
+
+Converts a MPC file to MOPS MITI format.  Many of the fields are ignored;
+only ID, epoch, RA, DEC, magnitude and obscode are output.
+
+=cut

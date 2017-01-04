@@ -1,0 +1,63 @@
+#!/usr/bin/env perl
+
+# Make a MITI detections file for astroclean of the specified density centered at the
+# specified RA/DEC.  The detections are created using a uniform grid across the FOV.
+
+# Usage:
+#   make_density RA_DEG DEC_DEG FOV_DEG DENSITY_PERDEG
+
+use warnings;
+use strict;
+
+use Math::Trig;
+use Astro::SLA;
+
+die "Usage: make_density RA_DEG DEC_DEG FOV_DEG DENSITY_PERDEG\n" unless @ARGV == 4;
+my ($RA_DEG, $DEC_DEG, $FOV_DEG, $DENSITY_PERDEG) = @ARGV;
+
+
+# Compute the X and Y spacing we need to achieve the desired density.  We
+# will compute points in a square in which the FOV is inscribed.
+
+my ($ra_tp_rad, $dec_tp_rad) = (deg2rad($RA_DEG), deg2rad($DEC_DEG));
+my $radius_rad = deg2rad($FOV_DEG / 2);
+my $num_pts = 
+    sqrt($FOV_DEG * $FOV_DEG             # area of square
+    * $DENSITY_PERDEG);
+
+my $spacing = $FOV_DEG / $num_pts;
+
+# Now create a grid of points with the specified spacing.  Any falls inside the FOV,
+# add to RA/DEC and emit.
+my ($x, $y);
+my ($tpx, $tpy);
+my ($ra, $dec);
+my $dummy_epoch = 53448;
+my $dummy_obscode = 'F51';
+my $mag;
+my $i = 1;
+for ($x = 0; $x < $num_pts; $x++) {
+    for ($y = 0; $y < $num_pts; $y++, $i++) {
+        $tpx = $x / $num_pts * 2 - 1;       # map X to -1, 1
+        $tpy = $y / $num_pts * 2 - 1;       # map Y to -1, 1
+
+        if ($tpx * $tpx + $tpy * $tpy <= 1) {
+            # It's in FOV.
+            slaDtp2s(
+                $tpx * $radius_rad, $tpy * $radius_rad, 
+                $ra_tp_rad, $dec_tp_rad,
+                $ra, $dec,
+            );
+
+            # Emit!
+            $ra = rad2deg($ra);
+            $dec = rad2deg($dec);
+            $mag = sprintf("%.3f", 18 + rand());
+            # FORMAT
+            # 1655765 53377.6523936111   0.00  0.00 15.0 568 S183onS 
+            print <<"EOF";
+$i $dummy_epoch $ra $dec $mag $dummy_obscode
+EOF
+        }
+    }
+}

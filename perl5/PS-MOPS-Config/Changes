@@ -1,0 +1,6 @@
+Revision history for Perl extension PS::MOPS::Config.
+
+0.01  Wed Mar  1 08:22:56 2006
+	- original version; created by h2xs 1.23 with options
+		-AX PS::MOPS::Config
+

@@ -1,0 +1,136 @@
+#!/usr/bin/env perl
+
+use strict;
+
+use Pod::Usage;
+use Getopt::Long;
+use File::Slurp;
+use Carp;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+
+
+# Options.
+my $inst;                   # MOPS instance
+my $instance_name;          # override instance name
+my $limiting_mag;
+my $help;
+
+# Default to the most likely rootdir, if it exists.
+# Start program here.
+my $result = GetOptions(
+    'instance=s' => \$instance_name,
+    'limiting_mag=f' => \$limiting_mag,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+pod2usage(2) if $help or !@ARGV;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+$limiting_mag ||= $mops_config->{site}->{limiting_mag};
+$limiting_mag ||= 22.0;
+
+
+# Globals.
+my @default_de = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+sub process_line {
+    # Given a line from SCH file, extract fields into a hash.  Return 
+    # a reference to the hash.
+    my $line = $_[0];
+    my $fields = {};
+
+    # Manufacture some fields.  Format is
+    # ID
+    # EPOCH_MJD_UTC (time of exposure midpoint)
+    # RA_DEG
+    # DEC_DEG
+    # EXPOSURE_TIME_SEC
+    # FILTER_ID (g/r/i/z/y/w)
+    # OBSCODE
+    # SURVEY_MODE (no spaces allowed)
+    my ($ID, $EPOCH_MJD_UTC, $RA_DEG, $DEC_DEG, $EXPOSURE_TIME_SEC, $FILTER_ID, $OBSCODE, $SURVEY_MODE) = split /\s+/, $line;
+
+    my $field = PS::MOPS::DC::Field->new(
+        $inst,
+        epoch => $EPOCH_MJD_UTC,
+        ra => $RA_DEG,
+        dec => $DEC_DEG,
+        timeStart => ($EPOCH_MJD_UTC - $EXPOSURE_TIME_SEC / 86400),
+        timeStop => ($EPOCH_MJD_UTC + $EXPOSURE_TIME_SEC / 86400),
+        filter => $FILTER_ID,
+        surveyMode => $SURVEY_MODE,
+        limitingMag => $limiting_mag,
+        obscode => $OBSCODE,
+        raSigma => 0,
+        decSigma => 0,
+        de => \@default_de,
+        raSigma => 0,
+        decSigma => 0,
+    );
+
+    my $id = $field->insert;
+    if ($id) {
+        print STDERR join(' ', 'FIELD', $field->fieldId, $fields->{OBJECT}, 
+            sprintf('%.8f', $field->epoch),
+            sprintf('%.8f', $field->ra),
+            sprintf('%.8f', $field->dec), 
+            $field->filter, $field->surveyMode),
+            "\n";
+    }
+    else {
+        warn "could not insert field for ", $fields->{OBJECT}, "\n";
+    }
+} 
+
+
+foreach my $filename (@ARGV) {
+    print STDERR "Reading $filename.\n";
+    my $fh = new FileHandle $filename or die "can't open $filename";
+    my @lines = <$fh>;
+    chomp @lines;  
+    $fh->close;
+    for my $line (@lines) {
+        next if $line =~ /^#|^!/;
+        process_line($line);
+    }
+    print STDERR "File ", $filename, " processed.\n";
+}
+
+exit();
+
+
+=head1 NAME
+
+insertFields - Program to insert minimal site-independent field definitions
+
+=head1 SYNOPSIS
+
+insertFields [options] FILES
+
+  --help : show usage
+
+=head1 DESCRIPTION
+
+insertFields processes text files with whitespace-separated columns containing
+
+    EPOCH_MJD_UTC (time of exposure midpoint)
+    RA_DEG
+    DEC_DEG
+    EXPOSURE_TIME_SEC
+    FILTER_ID (g/r/i/z/y/w)
+    LIMITING_MAG (limiting mag in V)
+    OBSCODE
+    SURVEY_MODE (no spaces allowed)
+
+Lines beginning with a # or ! are ignored.
+
+=head1 NOTES
+
+LIMITING_MAG is always set to 24.5 for now, as there's no way to obtain it (yet).
+
+=cut

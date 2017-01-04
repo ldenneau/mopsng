@@ -1,0 +1,89 @@
+#!/usr/bin/perl
+# $Id$
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+use File::Temp;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::GCR qw(:all);
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::DerivedObject;
+
+
+# Forward sub declarations.
+use subs qw(
+);
+
+
+my $inst;
+my $instance_name;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbh = $inst->dbh;
+my @dets;
+
+foreach my $id (@ARGV) {
+    if ($id =~ /^T(\d+)/) {
+        my $tid = $1;
+        my $trk = modct_retrieve($inst, trackletId => $tid);
+        for my $det (@{$trk->detections}) {
+            push @dets, {
+                ra => $det->ra,
+                dec => $det->dec,
+                epoch => $det->epoch,
+            }
+        }
+    }
+    elsif ($id =~ /^D(\d+)/) {
+        my $det = modcd_retrieve($inst, detId => $1);
+        push @dets, {
+            ra => $det->ra,
+            dec => $det->dec,
+            epoch => $det->epoch,
+        }
+    }
+    else {
+        warn "Don't understand ID $id.\n";
+    }
+}
+
+my $gcr = PS::MOPS::GCR::compute_gcr(\@dets);
+printf "%.4f arcsec\n", $gcr;
+exit 0;
+
+=pod
+
+=head1 NAME
+
+calcgcr - Compute great-circle residuals of detections
+
+=head1 SYNOPSIS
+
+calcgcr [IDs...]
+
+  IDs: detection or tracklet IDs
+  --help : show man page
+
+=head1 DESCRIPTION
+
+Computes the GCR of the entire set of input detections, usually a list of detections by ID
+or a tracklet ID, e.g.
+
+calcgcr4 D123 D124 D125
+
+calcgcr4 T1238
+
+=cut

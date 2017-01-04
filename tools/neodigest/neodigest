@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# Wrap the invocation of the MPC digest tool. OBJ
+# can be a tracklet ID or derivedobject ID.
+
+MOPS_DBINSTANCE=$1
+OBJ=$2
+CONFIG=$3
+
+if [ "$CONFIG" = "" ]; then
+    CONFIG=digest2
+fi
+
+TEMP=`mktemp` || (echo "Can't make temp file." && exit)
+#mt --instance=$MOPS_DBINSTANCE --global_oid=$OBJ --mpc --xd $OBJ > $TEMP
+mt --instance=$MOPS_DBINSTANCE --mpc --xd $OBJ > $TEMP
+
+# Digest wants its datafiles in current directory, sigh.
+cd $MOPS_HOME/data/digest2
+digest2 --config $CONFIG.config $TEMP
+
+# Clean up.
+/bin/rm $TEMP

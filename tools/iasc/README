@@ -1,0 +1,50 @@
+To get chip processed image files with updated astrometry we have the postage stamp
+server make full image stamps for each chip. Then we download the files and change
+the names to remove the stuff that the pstamp server needs to add.
+
+The process is
+
+1. Make the destination directory. I have been using the date. For example
+    mkdir 20120412
+
+For each exposure
+    postreq <exp_name>
+    # wait for request to finish (check pstamp status page)
+    getit <fileset_name> <destdir>
+
+2. rsync the directory to /data/ipp022.0/ps1-outreach:
+	rsync -avz YYYYMMDD ipp@ipp0222:/data/ipp022.0/ps1-outreach/
+   To speed it up:
+	rsync -av YYYYMMDD ipp@ipp0222:/data/ipp022.0/ps1-outreach --exclude 'YYYYMMDD/*/*.tmp'
+
+3. The directory is visible to epo folks as
+	rsync://ipp0222.ifa.hawaii.edu/ps1-outreach/YYYYMMDD
+   Test it with:
+	rsync -avz rsync://ps1epo@ipp0222.ifa.hawaii.edu/ps1-outreach/20130308 .
+   Password can be found in ipp022:/etc/rsyncd.secrets
+
+4. Make sure that the smfs have been published to the datastore
+   ./check_if_smfs_have_been_published.py o6359g0309o o6359g0330o o6359g0351o o6359g0372o
+
+5. Tell the persons who made the request that all is good
+
+######
+For example
+    (ippc18:~/outreach) ./postreq o6029g0262o
+    running psmkreq --req_type byexp --stage chip --pixcenter --x 0 --y 0 --width 0 --height 0 --id o6029g0262o --req_name o6029g0262o.20120412T201043
+    running pstamptool -dbname ippRequestServer -dbserver ippc17 -label WEB -addreq -uri /home/panstarrs/bills/outreach/o6029g0262o.20120412T201043.fits
+    posted o6029g0262o.20120412T201043 req_id: 160657
+    results will be at http://datastore.ipp.ifa.hawaii.edu/pstampresults/o6029g0262o.20120412T201043
+
+    ./getit  o6029g0262o.20120412T201043 20120412
+    # lots of noise from dsget
+
+    # files are in 20120412/o6029g0262o
+    
+./check_if_smfs_have_been_published.py o6359g0309o o6359g0330o o6359g0351o o6359g0372o
+o6359g0309o: OK (2 published)
+o6359g0330o: OK (2 published)
+o6359g0351o: OK (2 published)
+o6359g0372o: OK (2 published)
+
+NOTE : the directory in which this is run needs to be globally visible via NFS.

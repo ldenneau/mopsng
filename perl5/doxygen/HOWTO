@@ -1,0 +1,7 @@
+This module generates Doxygen HTML files from a Perl source tree.
+Copy doxy-config and perl-doxy-config to this directory's parent directory
+(the perl5 directory in MOPS source), then
+
+  doxygen perl-doxy-config
+
+This will create an api directory with the generated documentation.

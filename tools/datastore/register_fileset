@@ -1,0 +1,318 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+register_fileset
+
+=head1 SYNOPSIS
+
+register_fileset --product PRODUCT --fileset --type TYPE
+
+  --product PRODUCT : datastore product name
+  --fileset FILESET : fileset in product dir
+  --type TYPE : datastore file type
+  --ds DIR : specify datastore root dir
+
+Examples:
+
+  register_fileset \
+    --add \
+    --product=mops-detectability-responses \
+    --fileset=psmops_test.54129 \
+    --type=mops_detectability_response
+
+  register_fileset \
+    --add \
+    --copy \
+    --product=mops-detectability-requests \
+    --fileset=psmops_test.54129 \
+    --type=mops_detectability_query
+
+  register_fileset \
+    --del \
+    --product=mops-detectability-requests \
+    --fileset=psmops_test.54129 \
+    --type=mops_detectability_query
+
+=head1 DESCRIPTION
+
+Register or unregister a fileset from the local datastore by updating
+appropriate index files.  When unregistering, delete the directory
+containing the fileset.
+
+=head1 BUGS
+
+Does not enforce validity of metadata items.
+
+=cut
+
+use strict;
+
+use Getopt::Long qw( GetOptions );
+use Pod::Usage qw( pod2usage );
+use Digest::MD5::File qw( file_md5_hex ); 
+
+use FileHandle;
+use File::Basename;
+use File::Copy;
+use File::Path;
+
+#use PS::DataStore::Server;
+
+
+# Globals.
+my $index_file = 'index.txt';
+my $date;
+
+use subs qw(
+    get_iso8601
+    show_usage
+);
+
+# Defaults.
+
+# Command-line switches.
+my $ds_dir = "$ENV{MOPS_HOME}/ds/dsroot";
+my $product;
+my $fileset;
+my $type;
+my $copy;
+#my $type = 'mops_detectability_query';
+my $add;
+my $del;
+my $help;
+GetOptions(
+    'add' => \$add,
+    'del' => \$del,
+    'copy' => \$copy,               # copy files
+    'product=s' => \$product,
+    'fileset=s' => \$fileset,
+    'type=s' => \$type,
+    'dsdir|ds=s' => \$ds_dir,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-msg => '--type=TYPE must be specified') unless ($type or $del);
+pod2usage(-msg => '--product=PRODUCT must be specified') unless $product;
+pod2usage(-msg => '--fileset=FILESET must be specified') unless $fileset;
+
+# Require one of add/del.
+pod2usage(-msg => "must specify either --add or --del") unless $add xor $del;
+pod2usage(-msg => "datastore not found at $ds_dir") unless stat("$ds_dir/$index_file");
+
+#my $ds = new PS::DataStore::Server;
+
+my $product_dir = "$ds_dir/$product";
+my $fileset_dir = "$product_dir/$fileset";
+
+# allow write for the mockup
+umask 0011;
+
+
+if ($del) {
+#    $ds->remove_fileset($product, $fileset);
+
+    if (stat("$fileset_dir/$index_file") == undef) {
+        print STDERR "$fileset_dir/$index_file does not exist.\n";
+        exit(3);
+    }
+
+    # When iterating through the product index below, we rememeber the
+    # fileset and time of the newest (assumes chrono order) fileset that is
+    # not the fileset we're deleting, just in case we have to update the
+    # root index.
+    my $last_fileset;
+    my $last_time;
+    my $product_fh;
+
+    # Read the product index into a buffer, minus $fileset's entry
+    $product_fh = new FileHandle "$product_dir/$index_file"
+        or die("Failed to open '$product_dir/$index_file' for reading");
+
+    my $buf;
+    while (<$product_fh>) {
+        my ($fs, $time, my $tmp) = split(/\|/, $_, 3);
+        $fs =~ s/^\s+|\s+$//;
+       
+        # skip the one we're removing
+        next if $fs eq $fileset;
+
+        # record the last one that wasn't the one we're removing
+        $last_fileset = $fs;
+        $last_time = $time;
+
+        $buf .= $_;
+    }
+    $product_fh->close();
+
+    # Write the new index
+    $product_fh = new FileHandle ">$product_dir/$index_file" 
+        or die("Failed to open $product_dir/$index_file for writing");
+    print $product_fh $buf;
+    $product_fh->close();
+    
+    # Remove the fileset index file
+    unlink("$fileset_dir/$index_file") or die("Failed to delete '$fileset_dir/$index_file'\n");
+
+    # Check the root index; if the fileset we just removed was the
+    # 'most_recent' one, then replace it.
+    my $doreplace = 0;
+    my $root_fh;
+
+    $root_fh = new FileHandle "$ds_dir/$index_file" 
+        or die("Failed to open '$ds_dir/$index_file' for reading\n");
+    $buf = '';
+
+    while (<$root_fh>) {
+        my ($prod, $oldrecent, $oldtime, $extra) = split(/\|/, $_, 4);
+        $prod =~ s/^\s+|\s+$//;
+        
+        if ($prod ne $product) {
+            $buf .= $_;
+            next;
+        }
+
+        if ($oldrecent ne $fileset) {
+            $buf .= $_;
+            next;
+        }
+        
+        $buf .= "$prod|$last_fileset|$last_time|$extra";
+        $doreplace = 1;
+    }
+    $root_fh->close();
+
+    # Write the new root index if needed
+    if ($doreplace) {
+        $root_fh = new FileHandle ">$ds_dir/$index_file"
+            or die("Failed to open '$ds_dir/$index_file' for writing\n");
+        
+        print $root_fh $buf;
+        $root_fh->close();
+    }
+    print STDERR "Removed $fileset from $product.\n";
+
+    # Delete files.
+    system('/bin/rm', '-rf', $fileset_dir) == 0 or print STDERR "Error removing $fileset_dir: $?";
+}
+else {
+    # Create product if necessary.
+    if (!-d $fileset_dir) {
+        eval {
+            mkpath($fileset_dir);
+        };
+        die $@ if $@;
+
+# Leave out of index file for now.
+#        my $product_index_fh = new FileHandle "$product_dir/index.txt";
+#        flock($fh, 2);
+#        my @lines = <$fh>;
+#        close($fh);
+
+        # Make directory for product, and add to index.txt.
+#    mops-detectability-requests|||mops_detectability_query|MOPS Detectability Queries
+    }
+
+
+    # Add fileset.
+    unless (stat("$fileset_dir/$index_file") == undef) {
+        print STDERR "Fileset '$fileset' already exists under $product.\n";
+        exit(4);
+    }
+
+    
+	# Create the fileset index
+    open(IO, ">", "$fileset_dir/$index_file") or die("Failed to open '$fileset_dir/$index_file' for writing");
+    print IO "# fileID      |bytes   |md5sum                          |type\n";
+    
+    # Read file data from STDIN
+    my $lineno = 0;
+
+#    while (<STDIN>) {
+    my $filename;
+    my @files = @ARGV;
+    if (!@files) {
+        # Try from fileset directory.
+        opendir FILESET_DIR, $fileset_dir or die "can't open $fileset_dir";
+        @files = grep {!/^\./ && !/^index/} readdir FILESET_DIR;       # not . or .. or index.txt
+        closedir FILESET_DIR;
+    }
+    die "No files to process.\n" unless @files;
+
+
+    foreach $filename (@files) {
+        $lineno++;
+    
+        my $basename = basename($filename);
+        if ($copy) {
+            copy($filename, "$fileset_dir/$basename") or die "can't copy $filename to $fileset_dir/$basename";
+        }
+
+        my @finfo = stat("$fileset_dir/$basename");
+        unless (@finfo) {
+            print STDERR "Line $lineno: referenced file ($fileset_dir/$basename) does not exist.\n";
+            next;
+        }
+
+        # Get MD5 sum
+        my $md5 = file_md5_hex("$fileset_dir/$basename");
+
+        # Write line to the fileset index
+        print IO "$basename|$finfo[7]|$md5|$type\n";
+    }
+
+    close(IO);
+    
+	
+    # Add reference to the new fileset to the product index
+
+	$date = get_iso8601() if not defined($date);
+
+	#FIXME this should probably be inserted in order!
+
+    my $indexstr = "$fileset|$date|$type|";
+    open(IO, ">>", "$product_dir/$index_file") or die("Failed to open $product_dir/$index_file\n");
+    print IO $indexstr, "\n";
+    close(IO);
+
+
+     # Update the root listing to reflect the new most-recent fileset
+    open(IO, "$ds_dir/$index_file") or die("Failed to open '$ds_dir/$index_file' for reading\n");
+    my $buf;
+    while (<IO>) {
+        my ($prod, $oldrecent, $oldtime, $extra) = split(/\|/, $_, 4);
+        $prod =~ s/^\s+|\s+$//;
+        
+        if ($prod ne $product) {
+            $buf .= $_;
+            next;
+        }
+
+        $buf .= "$prod|$fileset|$date|$extra";
+    }
+    close(IO);
+
+    if (!$buf) {
+        $buf .= "$product|$fileset|$date|$type|MOPS Detectability Queries\n";
+    }
+
+
+    # Write the new index
+    open(IO, ">", "$ds_dir/$index_file") or die("Failed to open '$ds_dir/$index_file' for writing\n");
+    print IO $buf;
+    close(IO);
+    
+    print STDERR "Added $fileset to $product.\n";
+}
+
+exit;
+
+
+# get the current UTC time in iso8601 format
+# this is used if no time parameter is specified
+sub get_iso8601() {
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+
+    #FIXME currently we just put Z at the end here, even though it's not UTC
+    return sprintf("%4d-%02d-%02dT%02d:%02d:%02dZ",
+        $year+1900, $mon+1, $mday, $hour, $min, $sec);
+}

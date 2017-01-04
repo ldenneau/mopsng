@@ -1,0 +1,82 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+
+use File::Slurp;
+use PS::MOPS::MITI;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Efficiency;
+
+
+use subs qw(
+    make_table
+    _dump
+);
+
+my $inst;
+my $instance_name;
+my $nn;
+my $start_nn;
+my $end_nn;
+my $oc;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=f' => \$nn,
+    'start_nn=f' => \$start_nn,
+    'end_nn=f' => \$end_nn,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbh = $inst->dbh;
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+
+my $max_link_days = $mops_config->{linkod}->{max_link_days} 
+    or $mops_logger->logdie("Can't get max_link_days");
+my $min_nights = $mops_config->{linkod}->{min_nights} 
+    or $mops_logger->logdie("Can't get min_nights");
+my $ut2local_hours = $mops_config->{site}->{gmt_offset_hours};
+$mops_logger->logdie("Can't get gmt_offset_hours") unless defined($ut2local_hours);
+
+if ($nn) {
+    $start_nn = $nn - $max_link_days;
+    $end_nn = $nn;
+}
+
+my $aref = modce_retrieveAvailableLinkages(
+    $inst,
+    ut2local_hours => $ut2local_hours,
+    min_nights => $min_nights,
+    start_nn => $start_nn,
+    end_nn => $end_nn,
+);
+
+foreach my $object_name (@{$aref}) {
+    print $object_name, "\n";
+}
+
+=head1 DESCRIPTION
+
+Output a list of SSM object names that could have been linked during the specified
+time interval.
+
+=head1 SYNOPSIS
+
+effFindAvail [options] 
+
+  --start_nn NN : starting night number
+  --end_nn NN : ending night number
+  --ocnum OC : specify OC number instead of start/end NN
+  --help : show man page
+
+=cut

@@ -1,0 +1,88 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Pod::Usage;
+use Getopt::Long;
+use FileHandle;
+use File::Temp qw(tempfile tmpnam);
+use Math::Trig;
+
+use Astro::SLA;
+use PS::MOPS::DX;
+
+
+my $epoch_mjd;          # date to calc ephemeris
+my $obscode;
+my $header;             # emit header
+my $debug;
+my $help;
+GetOptions(
+    'epoch_mjd=f' => \$epoch_mjd,
+    'obscode=s' => \$obscode,
+    'header' => \$header,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-message => "EPOCH_MJD_UTC is required.\n") unless $epoch_mjd;
+pod2usage(-message => "OBSCODE is required.\n") unless $obscode;
+
+my $orb_in = shift || pod2usage(-message => "orbitfile.des was not provided.\n");
+my ($dir) = File::Temp::tempdir(DIR => '/tmp', TEMPLATE => 'oorb.XXXXXX', CLEANUP => 1);
+my $foo;
+my $line;
+my $id;
+
+# Get ID of object to put in obs file.  These must match for this to work.
+$foo = new FileHandle $orb_in or die "can't open $orb_in";
+while ($line = <$foo>) {
+    if ($line =~ /^#/) {
+        next;
+    }
+    ($id) = split /\s+/, $line;
+}
+$foo->close();
+die "didn't get an orbit ID from $orb_in" unless $id;
+
+
+# Generate a temporary file containing the dummy DES observations.
+my $fh = new FileHandle ">$dir/obs.des" or die "can't create $dir/obs.des";
+print $fh <<"EOF";
+!!OID TIME OBS_TYPE RA DEC APPMAG FILTER OBSERVATORY RMS_RA RMS_DEC RMS_MAG S2N Secret_name
+$id $epoch_mjd O 0 0 0 w $obscode 0 0 0 0 NA
+EOF
+$fh->close;
+
+#print "oorb --conf=$ENV{MOPS_HOME}/config/oorb.conf --task=ephemeris --orb-in=$orb_in --obs-in=$dir/obs.des", "\n";
+system("oorb --conf=$ENV{MOPS_HOME}/config/oorb.conf --task=ephemeris --orb-in=$orb_in --obs-in=$dir/obs.des") == 0 or die "$?";
+
+exit;
+
+
+=head1 NAME
+
+oorbephem - Generate ephemerides of DES orbits using OpenOrb (oorb)
+
+=head1 SYNOPSIS
+
+oorbephem [options] --mjd DATE_MJD_UTC [orbitfile.des]
+
+  orbitfile.des : DES-formatted orbit
+  --mjd DATE_MJD_UTC : calculate ephemeris for specified UTC date   
+  --obscode OBSCODE : use OBSCODE as station/observatory code, default 568 (Mauna Kea)
+  infile : option input file; use STDIN if not specified
+
+Examples:
+
+  oorbephem --mjd 53377 --obscode=F51 infile.des 
+
+=head1 DESCRIPTION
+
+Package an invocation of OpenOrb to generate ephemerides given a Keplerian
+orbit.  We will use an undocumented capability of OpenOrb that will produce
+positions using epochs from a dummy observation file that we will generate
+on the fly.
+
+=cut

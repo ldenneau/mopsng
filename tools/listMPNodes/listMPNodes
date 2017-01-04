@@ -1,0 +1,53 @@
+#!/usr/bin/env perl
+
+# $Id: listMPNodes 1197 2006-07-28 03:56:47Z fpierfed $
+# Given an OC number, list all the MJDs required to generate
+# coarse ephemerides for this OC number.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use PS::MOPS::Config;
+
+
+my $number;
+my $help;
+GetOptions(
+    number => \$number,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $mops_config = PS::MOPS::Config->new('cluster');
+if ($number) {
+    print scalar @{$mops_config->{nodes}}, "\n";
+}
+else {
+    print join(" ", @{$mops_config->{nodes}}), "\n";
+}
+
+
+=head1 NAME
+
+listMPNodes - List multiprocessing nodes configured for use in MOPS
+
+=head1 SYNOPSIS
+
+listMPNodes [--number]
+
+  --number : list number of nodes only, not node names
+
+=head1 DESCRIPTION
+
+Returns a list of short hostnames that are listed in the MOPS master configuration
+las multiprocessing nodes.
+
+If --number is specified, only list the number of nodes, not their names.
+
+=head1 SEE ALSO
+
+PS::MOPS::Config
+
+=cut

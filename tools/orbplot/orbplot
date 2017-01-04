@@ -1,0 +1,158 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Pod::Usage;
+use Getopt::Long;
+
+
+my $NEO_q_limit = 1.3;      # < 1.3AU => NEO
+
+# Start program here.
+my $show_ssm_type;
+my $x = 'a';
+my $terminal = 'png';
+my $xrange;
+my $xsize = 1024;
+my $ysize = 768;
+my $showneos;
+my $help;
+GetOptions(
+    show_ssm_type => \$show_ssm_type,
+    'x=s' => \$x,
+    'xrange=f' => \$xrange,
+    'terminal=s' => \$terminal,
+    'xsize=s' => \$xsize,
+    'ysize=s' => \$ysize,
+    'showneos' => \$showneos,
+    help => \$help,
+) or pod2usage(2);
+
+# Scrub opts.
+$terminal = 'postscript solid' 
+    if ($terminal eq 'postsscript' or $terminal eq 'eps');
+$terminal = 'postscript enhanced color solid' 
+    if ($terminal eq 'postscriptc' or $terminal eq 'epsc');
+
+my $size_str = '';
+if ($terminal eq 'png') {
+    $size_str = "size $xsize, $ysize font arial 12"
+}
+
+print <<"EOF";
+set fontpath "/usr/lib/X11/fonts/TTF"
+set terminal $terminal $size_str
+set yrange [0:1]
+EOF
+
+$xrange = $xrange ? "set xrange [0:$xrange]\n" : '';
+
+
+# Slurp input.
+my $line;
+my @lines = <>;
+chomp @lines;
+
+# Organize by ssm type.
+
+my ($a, $e, $q);
+my $objname;
+my $buf = '';
+my $numorb = 0;
+
+my @elems;      # orbital elements each input line
+my $type;       # type of element for each iteration
+my %types;      # map of lists of orbital elems
+my %bufs;       # map of gnuplot output buffers for each type
+my @showneolist;   # list of NEOs to show
+
+foreach $line (@lines) {
+    @elems = split /\s+/, $line;
+    ($q, $e, $objname) = @elems[0, 1, -2];
+
+    if ($show_ssm_type) {
+        $type = $elems[-1];                 # last item in line
+    }
+    else {
+        $type = 'SSM';                      # dummy type
+    }
+    push @{$types{$type}}, \@elems;
+
+    if ($x eq 'q') {
+        $bufs{$type} .= join(", ", $q, $e) . "\n";
+        $numorb++;
+    }
+    else {
+        if ($e < 1) {
+            $a = $q / (1 - $e);
+            $bufs{$type} .= join(", ", $a, $e) . "\n";
+	    $numorb++;
+        }
+        if ($showneos && $q < $NEO_q_limit) {
+            push @showneolist, [$a, $e, $objname];
+        }
+    }
+
+}
+
+
+if ($showneos) {
+    foreach my $thing (@showneolist) {
+        printf <<"EOF", @{$thing}[2, 0, 1];
+set label " %s" at %f, %f font 'arial,9'
+EOF
+    }
+}
+
+
+my $title_str = join ', ', map { qq{"-" using 1:2 title '$_' with points pt 7 ps 2 } } sort keys %types;
+
+if ($x eq 'a') {
+#set terminal postscript enhanced color solid
+    print <<"EOF";
+set title 'Semi-Major Axis (a) vs. Eccentricity (e), $numorb Orbits'
+${xrange}set xlabel 'Semi-Major Axis (a), AU'
+set ylabel 'Eccentricity (e)'
+plot \\
+1 - $NEO_q_limit / x title 'q=$NEO_q_limit AU', \\
+$title_str
+EOF
+} 
+else {
+    print <<"EOF";
+set title 'Perihelion Distance (q) vs. Eccentricity (e), $numorb Orbits'
+set xlabel 'Perihelion Distance (q), AU'
+set ylabel 'Eccentricity (e)'
+plot \\
+$title_str
+EOF
+}
+
+print map { qq{$bufs{$_}e\n} } sort keys %types;
+#print $buf;
+#print <<"EOF";          # end of plot
+#e
+#EOF
+
+
+
+=head1 NAME
+
+orbplot - Plot orbital distributions
+
+=head1 SYNOPSIS
+
+orbplot [options] [--help]
+
+  x XAXIS : what to plot on X axis (q, a); default 'a'
+  show_ssm_type : input data last column is ssmType prefix (S0, S1, ...)
+  xrange RANGE : plot x data in range 0..RANGE
+  terminal TERMTYPE : specify gnuplot terminal type 
+
+=head1 DESCRIPTION
+
+orbplot creates a gnuplot scatter plot of orbital distributions.  Takes
+input from STDIN (for now).
+
+=cut

@@ -1,0 +1,25 @@
+PS/MOPS/DC/Instance version 0.01
+==================================
+
+This module manages filesystem and database services for a MOPS
+instance (simulation).
+
+INSTALLATION
+
+To install this module type the following:
+
+   perl Makefile.PL LIB=$MOPS_HOME/lib/perl5
+   make
+   make test
+   make install
+
+DEPENDENCIES
+
+This module requires these other modules and libraries:
+
+  PS::MOPS::Log
+  DBI
+
+COPYRIGHT AND LICENCE
+
+Copyright (C) 2004 Institute for Astronomy, University of Hawaii

@@ -1,0 +1,33 @@
+
+2004 June 16
+Robert Jedicke
+
+60277 Centaur-like orbits for objects that all have V_Opposition < 24.5
+that might be detected by PanSTARRS.  The orbit and absolute model
+comes from Jedicke & Herron (1997).
+
+The dataset was created using RJ's CreateFakeCentaur routine.
+
+Columns are:
+
+id a e i O w M H MOID POpik
+
+The last two columns are currently set to zero.
+id= see below
+a = semi-major axis (AU)
+e = eccentricity
+i = inclination (deg)
+O = longitude of ascending node (deg)
+w = longitude of perihelion (deg)
+M = anomaly at epoch (deg)
+MOID = Minimum Orbital Impact Distance (AU)
+POpik = Opik collision probability with Earth
+
+The id within file fakecentaurs.v245 is Cnnnnn 
+where C means Centaur and nnnnn is the base-62
+number (line) of the entry starting at 0.  
+So the 11th object in the file is C0000b.
+
+The Epoch of all orbits was MJD=52860.0.
+
+

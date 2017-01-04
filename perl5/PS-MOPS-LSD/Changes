@@ -1,0 +1,6 @@
+Revision history for Perl extension PS::MOPS::LSD.
+
+0.01  Wed Jul  2 07:53:41 2008
+	- original version; created by h2xs 1.23 with options
+		-AX PS::MOPS::LSD
+

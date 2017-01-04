@@ -1,0 +1,5 @@
+#!/bin/sh
+
+# Under no-condor, condor_wait is a no-op.
+
+echo "Hi!"

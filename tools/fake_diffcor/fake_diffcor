@@ -1,0 +1,72 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::MITI;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::Orbit;
+
+
+# Options.
+my $inst;
+my $instance_name;
+my $help;
+
+
+use subs qw(
+    _modulate_orbit
+    _out
+);
+
+
+# Program arguments.
+my $iod_filename;
+my $tracks_filename;
+my $out_filename;
+
+# Options.  Mimic mopsdiffcor options, even though they're non-operational.
+my $debug;
+my $verbose;
+my $fallback_iod;
+my $covariance;
+my $report_all;
+my $threshold_arcseconds;
+GetOptions(
+    debug => \$debug,
+    verbose => \$verbose,
+    'fallback_iod=f' => \$fallback_iod,
+    covariance => \$covariance,
+    report_all => \$report_all,
+    'threshold_arcseconds=f' => \$threshold_arcseconds,
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+($iod_filename, $tracks_filename, $out_filename) = @ARGV;
+pod2usage(2) unless ($iod_filename && $tracks_filename && $out_filename);
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_logger = $inst->getLogger;
+
+
+# Just regurgitate the IODs, rewriting the orbit code to 'D0'.
+my $iod_fh = new FileHandle $iod_filename or die "can't open $iod_filename";
+my $out_fh = new FileHandle ">$out_filename" or die "can't open $out_filename for writing";
+my $orb;
+my $line;
+
+while ($line = <$iod_fh>) {
+    $orb = modco_deserialize($inst, $line);
+    if ($orb) {
+        $orb->convCode('D9');
+        print $out_fh $orb->serialize(), "\n";
+    }
+}
+exit;

@@ -1,0 +1,184 @@
+#!/usr/bin/env perl
+# Query MPChecker for known objects in field.
+
+use strict;
+use warnings;
+
+use FileHandle;
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+#use PS::MOPS::MITI;
+#use PS::MOPS::MPC qw(:all);
+#use URI::Escape;
+
+use HTTP::Request::Common qw(POST);
+use LWP::UserAgent;
+use Astro::Time;
+
+
+use subs qw(filter_pre);
+
+
+# Options
+my $instance_name;
+my $inst;
+my $field_id;
+my $mag_limit = 20;
+my $radius_arcmin = 90;         # 1.5deg radius, PS1 FOV
+my $insert_html;                # insert special form HTML in output
+my $object_name;                # required for HTML injection
+my $html;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'field_id=s' => \$field_id,
+    'mag_limit=f' => \$mag_limit,
+    'radius_arcmin=f' => \$radius_arcmin,
+    insert_html => \$insert_html,
+    'object_name=s' => \$object_name,
+    html => \$html,
+) or pod2usage(2);
+pod2usage(-msg => 'Field ID is required.') unless $field_id;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+
+
+my $field = modcf_retrieve($inst, fieldId => $field_id) 
+    or die "can't retrieve field ID $field_id";
+my $epoch_mjd = $field->epoch;
+my $obscode = $field->obscode;
+my $ra_deg = $field->ra;
+my $dec_deg = $field->dec;
+
+
+my %form;
+
+# Convert date to year/month/day.
+my ($day, $month, $year, $utfraction) = Astro::Time::mjd2cal($epoch_mjd);
+
+# Convert RA/dec to sexagesimal.  MPC requires leading hours/degrees to be two digits if < 10.
+my $ra_sx;
+my $dec_sx;
+{
+    local $Astro::Time::StrZero = 2;
+    $ra_sx = Astro::Time::turn2str(Astro::Time::deg2turn($ra_deg), 'H', 4, ' ');
+    $dec_sx = Astro::Time::turn2str(Astro::Time::deg2turn($dec_deg), 'D', 4, ' ');
+}
+
+%form = (
+    which => 'pos',
+    TextArea => '',
+    radius => $radius_arcmin,       # arcmin
+    limit => $mag_limit,            # limiting mag
+    'sort' => 'd',                  # sort by increasing distance
+    ra => $ra_sx,
+    decl => $dec_sx,
+    mot => 'd',                     # motion in deg/day
+    tmot => 't',                    # total (not separate RA/Dec) motions
+    pdes => 'u',                    # output designations in unpacked form
+    needed => 'n',                  # numbered objects only
+    ps => 'n',                      # don't include planets and irregular outer satellites
+    type => 'p',                    # plain HTML
+#        type => 'm',                   # MPES-aware (whatever that is)
+);
+$form{year} = $year;
+$form{month} = sprintf "%02d", $month;
+$form{day} = $day + $utfraction;
+$form{oc} = $obscode;
+
+my $url = 'http://www.minorplanetcenter.net/cgi-bin/mpcheck.cgi';
+my $ua = LWP::UserAgent->new(timeout => 600);
+$ua->agent("Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.8.1.1) Gecko/20061208 Firefox/2.0.0.1");
+my $response = $ua->post(
+    $url,
+    \%form,
+);
+my $body = $response->content;
+if ($insert_html && $object_name) {
+    my $stuff = <<"STUFF";
+<body>
+<form action="mpcheck.html" method="POST">
+<input type="hidden" name="objectName" value="$object_name">
+V = <input name="mag_limit" value="$mag_limit"> 
+Radius (arcmin) = <input name="radius_arcmin" value="$radius_arcmin">
+<input type="submit" value="Resubmit">
+</form>
+<p>
+STUFF
+    $body =~ s/<body>/$stuff/i;
+}
+
+# If --html is set, don't filter; just emit the HTML.
+if (!$html) {
+    # asteroid_number name ra_deg dec_deg h_V
+    $body = filter_pre($body);
+}
+
+print $body;
+exit;
+
+
+sub parse_line {
+    my $line = $_[0];
+    my $number_and_name = substr($line, 0, 24);
+    my $ra_str = substr($line, 25, 10);
+    my $dec_str = substr($line, 36, 10);
+    my $mag_str = substr($line, 47, 5);
+
+    # Clean up stuff.
+    if ($number_and_name =~ /^\s*\((\d+)\) (.*)/) {
+        my $number = $1;
+        my $name = $2;
+        $name =~ s/\s*//g;
+        my $ra_deg = turn2deg(str2turn($ra_str, 'H'));
+        my $dec_deg = turn2deg(str2turn($dec_str, 'D'));
+        return join(' ', $number, $name, $ra_deg, $dec_deg, $mag_str);
+    }
+    else {
+        return '';
+    }
+}
+
+
+sub filter_pre {
+    # Filter interesting stuff from MPChecker output.  This is totally dependent
+    # on our reverse-engineered understanding of their output format; if the format
+    # changes, then things become broken.
+    my $html = $_[0];
+    my @results;
+    if ($html =~ m|<pre>(.*)</pre>|s) {
+        my @lines = split /\n/, $1;
+        foreach my $line (@lines) {
+            if ($line =~ /^\s*\(\d+\)/) {       # looks like asteroid number
+                push @results, parse_line($line);
+            }
+        }
+    }
+
+    my $header = 'NUMBER NAME RA_DEG DEC_DEG MAG';
+    return join("\n", $header, grep { $_ } @results) . "\n";
+}
+
+
+=head1 NAME
+
+mpcheckfield - Query MPC MPChecker WWW service for known objects in a PS field
+
+=head1 SYNOPSIS
+
+mpcheckfield --field_id=ID [options]
+
+  --html : emit HTML output instead of plain text
+  --field_id ID : date of interest, required
+  --mag_limit : V-magitude limit for search, default 20
+
+=head1 DESCRIPTION
+
+Query MPChecker for known objects in field.
+
+=cut

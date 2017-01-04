@@ -1,0 +1,16 @@
+#!/bin/sh
+
+MOPS_DBNAME=$1
+OID=$2
+
+# temporary dir for work
+DIR=`mktemp -d /tmp/neoburn.XXXXXXX`
+pushd $DIR > /dev/null
+
+mt --instance=$MOPS_DBNAME --global_oid=$OID --xd $OID > detections.des
+oorb --task=ranging --conf=$MOPS_HOME/config/oorb.conf.neo_probability --obs-in=detections.des --orb-out=orbits.orb > /dev/null
+oorb --conf=$MOPS_HOME/config/oorb.conf.neo_probability --task=classification --orb-in=orbits.orb
+#oorb --conf=$MOPS_HOME/config/oorb.conf.neo_probability --task=classification_apriori --orb-in=orbits.orb
+
+popd > /dev/null
+/bin/rm -rf $DIR

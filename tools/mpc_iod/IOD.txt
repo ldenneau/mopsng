@@ -1,0 +1,89 @@
+HELP INFORMATION FOR IOD (Updated 2008 Mar. 24)
+
+Usage:
+
+   IOD [flags] < [observation file] > [elements file]
+
+Version 13 of IOD supports the following optional command-line flags
+(some of which have relevance only for debugging purposes):
+
+-quitpass=n Quit after pass n of the orbit solution code.  Passes are
+            numbered 1, 2, 3 and 4.
+-all        Output all orbit solutions found.
+-strict     Suppress additional book-keeping information beyond the epoch
+            on output orbits.  Additional information is: r.m.s. residual
+            in seconds of arc; number of observations; observed arc in
+            days; flag to indicate which routine generated the orbit;
+            orbit number; total number of orbits; up to three flags (H = 
+            large scatter in H values from observations, U = unusual
+            orbit and S = suspicious orbit); uncertainty in H.
+-onesol     Output only one orbit solution per object.  Omitting this
+            flag will cause additional orbits to be output if multiple
+            solutions exist.
+-badh[=]    Output orbits with large scatter in H determination to
+            BadH.<runname>.  As on option, you can specify a value above
+            which orbits will be flagged.
+-runname=<runname>  Name the log and statistic files.  If omitted, log and
+            statistics files are named *.txt. 
+-logfile    Output LogFile.<runname>, containing statistics on the run.
+-statfiles  Output various log files: ZeroSol.<runname> contains a list of
+            objects for which no orbits were obtained; and MSolution.<runname>
+            contains a list of objects for which multiple orbits were
+            output.  The file MSolution.<runname> is not created if -all 
+            is selected.
+-statfiles= Output various specified log files, as a comma-separated list.
+            The options are zero and multiple, for ZeroSol.<runname> and
+            MSolution.<runname>, respectively.  The file MSolution.<runname>
+            is not created if -all is selected.
+-done       Create file done.<runname> when IOD finishes.
+-nocalc     Scan the observations file, but don't calculate any orbits.
+            Also sets -logfile.
+-quitnum=   Don't calculate any more orbits after the given number: e.g.,
+            "-quitnum=100" only calculates orbits for the first 100
+            objects and then quits.
+-debug      Switch on debug mode.  Best used only for troubleshooting
+            small numbers of objects as a *lot* of output is generated.
+            Also sets -logfile and -statfiles.
+-config=    Specify location of config file.  Values specified in config
+            file override hard-coded values in program or specified via
+            environment variables or -defile/-helpfile flags.  Use caution
+            when using this option to override hard-coded default values.
+-defile=    Specify location of DE405 datafile.  Overrides MPCIOD_DATA
+            environment variable.
+-helpfile=  Specify location of this help text.  Overrides MPCIOD_HELP
+            environment variable.
+-version    Display IOD version information.
+
+Log and stat files are created in the current directory.
+
+The order of the command-line flags is not important.
+
+Flag names must not be abbreviated.
+
+
+Config file format:
+  Entries consist of a keyword, an equals sign and a string or numeric
+value.
+  Configurable keywords are as follows (they take numeric values unless
+otherwise specified):
+
+MaxTNOMotion  Values of the daily motion <= specified value are treated
+                as distant objects, i.e., Jupiter Trojans and beyond
+                (default = 0.12 deg/day).
+MaxdHV        Values of H scatter greater than specified value cause orbit
+                to be flagged "H" (default = 0.6 mag.).
+MaxRMS        Residual r.m.s. greater than specified value during orbit
+                computation cause orbit to be rejected (default = 0.20").
+MaxMVRMS      Residual r.m.s. greater than specified value during MV orbit
+                computation cause orbit to be rejected (default = 0.20").
+SuspRMS       Residual r.m.s. greater than specified value in orbits
+                accepted for output buffering cause orbit to be flagged
+                as "S" (default = 0.10").
+UnusualRMS    Residual r.m.s. greater than specified value in orbits
+                accepted for output buffering cause orbit to be flagged
+                as "U" (default = 0.08").
+defile        Full pathname to DE405 datafile (string).
+helpfile      Full pathname to this help text (string).
+
+Keywords are not case-sensitive.  Comment lines, if desired, begin with
+"!".  Non-comment lines lacking an "=" or value are ignored.

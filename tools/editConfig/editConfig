@@ -1,0 +1,146 @@
+#!/usr/bin/env perl
+# $Id: identifyOrbits 1776 2007-08-13 02:48:42Z denneau $
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Slurp;
+use File::Temp;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Config;
+
+
+
+# Globals.
+my $inst;
+my $instance_name;
+my $install;
+my $dump;
+my $check;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    install => \$install,
+    'dump' => \$dump,
+    check => \$check,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $dbname = $inst->dbname;
+
+# Set up some stuff.
+my $config_filename;
+my $raw_config_file;
+my $raw_config_db;
+
+my $using_local_config = 1;         # set if using a sim's config and not the global one
+$config_filename = $inst->getEnvironment('CONFIGDIR') . '/master.cf';
+if (!-e $config_filename) {
+    $config_filename = "$ENV{MOPS_HOME}/config/master.cf";
+    $using_local_config = 0;        # nope, using global config
+}
+$raw_config_file = read_file($config_filename);
+
+
+if ($install) {
+    # Perform some search-replace on template items.
+    $raw_config_file =~ s/\$DBNAME\b/$dbname/mg;
+
+    modcfg_insert($inst, $raw_config_file);
+    print STDERR "Configuration successfully loaded to database.\n";
+    exit 0;
+}
+elsif ($check or $dump) {
+    $raw_config_db = modcfg_retrieve($inst);
+    my $different = 0;
+    if ($raw_config_db ne $raw_config_file) {
+        $different = 1;
+    }
+
+    if ($check) {
+        print STDERR $different ? 
+            "DB configuration differs from file.\n" : 
+            "DB configuration is the same.\n";
+        exit $different;
+    }
+
+    # Dump DB version of config.
+    print $raw_config_db;
+}
+else {
+    # Edit!
+    $raw_config_db = modcfg_retrieve($inst);        # get current config
+    my $temp_fh = new File::Temp();                 # temp file handle for current config
+    my $temp_filename = $temp_fh->filename;         # get assigned filename
+    print $temp_fh $raw_config_db;                  # write config
+    $temp_fh->close();
+
+    if ($ENV{EDITOR}) {
+        if (system($ENV{EDITOR}, $temp_filename) != 0) {
+            die "Edit failed: $?";
+        }
+
+        if (-s $temp_filename == 0) {
+            die "New config is empty.  Not installing.\n"
+        }
+
+        # Check that the files differ.  If so, install the new file.
+        my $current_config = modcfg_retrieve($inst);
+        my $new_config = read_file($temp_filename);
+        if ($current_config ne $new_config) {
+            # Perform some search-replace on template items.
+            $new_config =~ s/\$DBNAME\b/$dbname/mg;
+
+            modcfg_insert($inst, $new_config);
+            print STDERR "New configuration successfully loaded to database.\n";
+
+            # Copy config to master.cf for current simulation.
+            if ($using_local_config) {
+                my $copy_fh = new FileHandle ">$config_filename";
+                print $copy_fh $new_config;
+                $copy_fh->close();
+                print STDERR "New configuration successfully copied to $config_filename.\n";
+            }
+        }
+        else {
+            print STDERR "Configs are the same.  Not installing.\n";
+        }
+    }
+    else {
+        die "EDITOR not specified in environment.\n";
+    }
+}
+
+
+
+
+=head1 NAME
+
+editConfig - edit, show or install MOPS config into database
+
+=head1 SYNOPSIS
+
+editConfig [options]
+
+  --dump : show current config
+  --install : install config from files into DB without editing
+  --check : compare DB against file for consistency
+
+editConfig --dump       # show current config in DB
+editConfig --install    # install config from file
+editConfig --check
+
+=head1 DESCRIPTION
+
+Use editConfig to install or dump a MOPS configuration.
+
+=end code
+

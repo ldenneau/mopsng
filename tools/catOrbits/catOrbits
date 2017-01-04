@@ -1,0 +1,440 @@
+#!/usr/bin/env perl
+
+# catOrbits
+# query SSM orbits/derived Objects in MOPSDC and write out information, such as orbital elements, IDs, etc.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Temp qw(tmpnam);
+use File::Slurp;
+use Astro::Time;
+use Data::Dumper;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::MITI;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::Orbit;
+use PS::MOPS::DC::Known;
+use PS::MOPS::DC::Shape;
+use PS::MOPS::DC::DerivedObject;
+use PS::MOPS::DX;
+
+
+use subs qw(print_dets elems2str get_ssm_type);
+
+
+my $instance_name;
+my $ssm;
+my $shape;
+my $derived;
+my $derivedobjectId;
+my $known;
+my $covariance;
+my $orbit_id;
+my $show_ssm_type;
+my $all;
+my $neos;
+my $nonsynthetic;
+my $classification;
+my $resid;
+my $detections;
+my $updated_since;
+my $header;
+my $sortby;
+my $html;
+my $format = 'DES';
+my $file;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    ssm => \$ssm,
+    shape => \$shape,
+    derived => \$derived,
+    derivedobject_id => \$derivedobjectId,
+    known => \$known,
+    covariance => \$covariance,
+    orbit_id => \$orbit_id,
+    show_ssm_type => \$show_ssm_type,
+    all => \$all,
+    neos => \$neos,
+    nonsynthetic => \$nonsynthetic,
+    resid => \$resid,
+    classification => \$classification,
+    detections => \$detections,
+    'updated_since=s' => \$updated_since,
+    header => \$header,
+    'sortby=s' => \$sortby,
+    html => \$html,
+    'file=s' => \$file,
+    'format=s' => \$format,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+
+if (!@ARGV && !$derived && !$ssm && !$file) {
+    $ssm = 1;
+    warn "catOrbits without arguments is deprecated; use 'catOrbits --ssm'\n"
+}
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+
+
+my $orb_i;  # iterator object
+my $orb;
+
+if ($format eq 'MITI') {
+    my @header = qw[ q_AU e i_deg node_deg argPeri_deg timePeri_MJD hV epoch_MJD objectName ];
+    push @header, 'resid_arcsec' if $resid;
+    push @header, qw(
+        g p period_days amp_mag a_km b_km c_km beta_deg lambda_deg pha_a ph_d ph_k
+    ) if $shape;        # add shape fields
+
+    if ($header) {
+      print join(" ", @header), "\n";
+    }
+}
+elsif ($format eq 'COM' or $format eq 'DES') {
+    print $PS::MOPS::DX::header_ORBIT, "\n";
+}
+
+if (@ARGV or $file) {
+    # Process a list of object names from various inputs.
+    my @names;
+    if ($file) {
+        # File input
+        if ($file eq '-') {   # read STDIN
+            @names = <>;
+        }
+        else {
+            @names = read_file($file);
+        }
+        chomp @names;   # toss line endings
+    }
+    else {
+        # Names specified on cmd line or single opt.
+        @names = @ARGV;
+    }
+    foreach my $name (@names) {
+        my $sh;         # provisional shape holder
+        my $dobj;
+        if ($derivedobjectId) {
+            # name is a DerivedObjectID
+            $dobj = modcdo_retrieve($inst, derivedobjectId => $name);       # retrieve derived obj
+            $orb = modco_retrieve($inst, orbitId => $dobj->orbitId);   # retrieve orbit def
+            $orb->{objectName} = $dobj->{objectName};           # hackery
+        }
+        elsif ($known) {
+            # name is a known object ID
+            $orb = modck_lookup($inst, knownName => $name);   # retrieve orbit def
+            # make orbit-like object.
+            $orb = {
+                objectName => $name,
+                q => $orb->{q},
+                e => $orb->{e},
+                i => $orb->{i},
+                node => $orb->{node},
+                argPeri => $orb->{arg_peri},
+                timePeri => $orb->{time_peri},
+                epoch => $orb->{epoch},
+                hV => $orb->{h_v},
+            }
+        }
+        elsif ($orbit_id) {
+            # name is a numeric orbit ID
+            $orb = modco_retrieve($inst, orbitId => $name);   # retrieve orbit def
+            $orb->{objectName} = $name;
+        }
+        elsif ($name =~ /^L\w+$/) {
+            $dobj = modcdo_retrieve($inst, objectName => $name);       # retrieve derived obj
+            $orb = modco_retrieve($inst, orbitId => $dobj->orbitId);   # retrieve orbit def
+            $orb->{objectName} = $dobj->{objectName};           # hackery
+        }
+        elsif ($name =~ /^\d+$/) {
+            # numeric, looks like orbit_id
+            $orb = modco_retrieve($inst, orbitId => $name);
+            $orb->{objectName} ||= "O$name";
+        }
+        else {
+            $orb = modcs_retrieve($inst, objectName => $name); # retrieve SSM object
+            $sh = modcsh_retrieve($inst, ssmId => $orb->ssmId) if ($shape);
+        }
+
+        if ($detections) {
+            print_dets($dobj) if $dobj;
+        }
+        else {
+            print elems2str($format, $orb, $sh) if $orb;
+        }
+    }
+}
+elsif ($ssm) {
+    # Dump all SSM objects.
+    if ($shape) {
+        my @orbs;
+        my $sh;
+        $orb_i = modcs_retrieve($inst, all => 1);
+        while (defined($orb = $orb_i->next)) {
+            push @orbs, $orb;
+        }
+
+        foreach $orb (@orbs) {
+            $sh = modcsh_retrieve($inst, ssmId => $orb->ssmId) if ($shape);
+            print elems2str($format, $orb, $sh) if $orb;
+        }
+    }
+    else {
+        $orb_i = modcs_retrieve($inst, all => 1);
+        while (defined($orb = $orb_i->next)) {
+            print elems2str($format, $orb);
+        }
+    }
+}
+elsif ($derived) {
+    # Dump all derived objects.
+    my $do_i;
+    my $do;
+    my @args = (
+        orderBy => $sortby,
+#        derived => 1,           # join with dobj table; retrieve dobj names
+        all => 1,
+    );
+    my @where;
+    my $where_str = '';
+
+    if ($neos) {
+        push @where, 'o.q < 1.3';   # restrict search to NEOs
+    }
+    if ($nonsynthetic) {
+        push @where, "do.classification='$MOPS_EFF_NONSYNTHETIC'";   # nonsynthetic
+    }
+    $where_str = join(' AND ', @where);
+    push @args, orbit_where => $where_str if $where_str;
+    push @args, updated_since => $updated_since if $updated_since;
+
+    my @dos;
+    $do_i = modcdo_retrieve($inst, @args);
+    while (defined($do = $do_i->next)) {
+        push @dos, $do;
+    }
+
+    my @orbs;
+    foreach $do (@dos) {
+        $orb = modco_retrieve($inst, orbitId => $do->orbitId);
+        # If show_ssm_type is turned on, fetch SSM prefix.
+        if ($show_ssm_type) {
+            $orb->{ssmType} = get_ssm_type($do->ssmId);
+        }
+        if ($classification) {
+            if ($do->classification eq $MOPS_EFF_CLEAN) {
+                $orb->{classification} = modcs_ssmId2objectName($inst, $do->ssmId);
+            }
+            elsif ($do->classification eq $MOPS_EFF_MIXED) {
+                $orb->{classification} = 'MIXED';
+            }
+            elsif ($do->classification eq $MOPS_EFF_BAD) {
+                $orb->{classification} = 'BAD';
+            }
+            elsif ($do->classification eq $MOPS_EFF_NONSYNTHETIC) {
+                $orb->{classification} = 'NS';
+            }
+        }
+        $orb->{objectName} = $do->{objectName};           # hackery
+        push @orbs, $orb;
+    }
+
+    # If NEOs were requested, sort by q.
+    if ($neos) {
+        @orbs = sort { $a->{q} <=> $b->{q} } @orbs;
+    }
+    print elems2str($format, $_) foreach @orbs;
+}
+else {
+    pod2usage(2);
+}
+
+exit;
+
+
+sub print_dets {
+    my ($dobj) = @_;
+    foreach my $det ($dobj->fetchDetections) {
+        print miti_format_det($det, $dobj->objectName);
+    }
+}
+
+
+sub elems2str {
+    # Take a list of orbital elements and print them to STDOUT in the requested format.  Currently
+    # we support MITI and Milani DX 'COM'.
+    my ($format, $orb, $sh) = @_;
+    my $orbstr;
+    if (!$orb) {
+        warn "bogus orb";
+        return;
+    }
+#    eval {
+        if ($format eq 'MITI') {
+            $orbstr = join " ", 
+                $orb->q, 
+                $orb->e, 
+                $orb->i, 
+                $orb->node, 
+                $orb->argPeri, 
+                $orb->timePeri, 
+                $orb->hV, 
+                $orb->epoch, 
+                $orb->objectName;
+            if ($resid) {
+                $orbstr .= " " . (defined($orb->residual) ? $orb->residual : 'N/A');
+            }
+            if ($classification) {
+                $orbstr .= " " . $orb->{classification};       # more hackery
+            }
+            if ($show_ssm_type) {
+                $orbstr .= " " . $orb->{ssmType};       # more hackery
+            }
+
+            if ($sh) {
+                $orbstr .= " " . join " ", 
+                    $sh->g,
+                    $sh->p,
+                    $sh->period_d,
+                    $sh->amp_mag,
+                    $sh->a_km,
+                    $sh->b_km,
+                    $sh->c_km,
+                    $sh->beta_deg,
+                    $sh->lambda_deg,
+                    $sh->ph_a,
+                    $sh->ph_d,
+                    $sh->ph_k;
+            }
+        }
+        elsif ($format eq 'COM' or $format eq 'DES') {
+            $orbstr = modx_toORBIT($orb);
+        }
+        elsif ($format eq 'MIF') {
+            my $mif_str = 'MIF-O';
+            my $cov_str = '';
+            if (($derived or $orb->objectName =~ /^L/) and $covariance and @{$orb->covariance}) {
+                $cov_str = ' ' . join(' ',
+                    @{$orb->covariance}
+                );
+                $mif_str = 'MIF-OC';
+            }
+
+            $orbstr = join(' ', 
+                $mif_str,
+                $orb->objectName,
+                $orb->q, 
+                $orb->e, 
+                $orb->i, 
+                $orb->node, 
+                $orb->argPeri, 
+                $orb->timePeri, 
+                $orb->epoch, 
+                $orb->hV, 
+                'undef',    # chiSq
+                'undef',    # MOID1
+                $orb->{arcLength_days} || 'undef',    # arclen
+                ($derived ? $orb->convCode : 'S'),        # convCode
+            ) . $cov_str;
+        }
+        else {
+            die "Unknown format: $format";
+        }
+#    };
+#    if ($@) {
+#        print "wha? ", Dumper($orb);
+#    }
+    return $orbstr . "\n";
+}
+
+
+sub get_ssm_type {
+    my ($ssmId) = @_;
+    if ($ssmId) {
+        my $ssm = modcs_retrieve($inst, ssmId => $ssmId);
+        return substr($ssm->objectName, 0, 2);
+    }
+    return 'N';     # no ssmId, so non-synthetic
+}
+
+=head1 NAME
+ 
+catOrbits - Query SSM and derived orbits in MOPSDC and write out information
+ 
+=head1 SYNOPSIS
+ 
+catOrbits [options] [objectName]
+
+  --ssm : dump all SSM orbits
+  --shape : dump only SSM objs with shape definitions
+  --derived : dump all unmerged derived orbits
+  --derivedobject_id : interpret objectName as a DerivedObjectID
+  --covariance : emit square root covariance matrix for MIF objects
+  --show_ssm_type : append SSM prefix for derived objects, or 'X' for non-synthetic
+  --all : dump all derived orbits, merged and unmerged
+  --neos : dump all NEOs
+  --nonsynthetic : dump all nonsynthetic orbits
+  --resid : append residual (arcsec) to each output line
+  --classification : append MOPS classification (SSM ID, NS, BAD)
+  --detections : dump detections attributed to orbit in MITI format
+  --updated_since "TIMESPEC" : fetch derived objects updated since TIMESPEC (YYYY-MM-DD HH:MM:SS)
+  --header : print header before all data
+  --format FMT : print using specified format; e.g. MITI, COM
+  --sortby S : sort by value in S (orbit_id default, otherwise q, e, etc.)
+  --html : output in tabular HTML format
+  --file FILE : get objectNames from file
+  --help : show man page
+  objectName : return objects named NAME
+
+=head1 DESCRIPTION
+
+catOrbits queries the MOPSDC data collection and writes out data about
+each orbit found that matches query specifications.  The output data is
+written to STDOUT.  Typically output from this script will be piped into
+ephemeris generation code, such as genEphem.
+
+For each orbit obtained, the output is written as follows (units in
+parentheses):
+
+    q(AU)   e   i(deg)  node(deg)   argPeri(deg)   timePeri(deg)   epoch(MJD)  hV  objectName
+
+where
+
+    q : perihelion distance, in AU
+    e : eccentricity
+    i : inclination, in degrees
+    node : longitude of ascending node, in degrees
+    argPeri : argument of perihelion, in degrees
+    timePeri : time of perihelion, MJD
+    epoch : epoch or osculation, MJD
+    objectName : PSMOPS objectName (designation)
+
+If --shape and --ssm are specified, then SSM orbits and their shape definitions are
+printed.  The shape parameters are put on the same line, following orbital
+parameters.
+
+    g : something
+    p : some other thing
+    amp_mag : amplitude of delta mag
+    a_km
+    b_km
+    c_km
+    beta_deg
+    lambda_deg
+    ph_a
+    ph_d
+    ph_k
+
+=head1 NOTES
+
+The output list is not sorted (currently).
+ 
+=cut
+

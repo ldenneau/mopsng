@@ -1,0 +1,146 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+eon - End-of-night MOPS processing
+
+=head1 SYNOPSIS
+
+eon [options]
+
+  --help : show man page
+
+=head1 DESCRIPTION
+
+EON performs a sequence of end-of-night (EON) processes that 1) are
+dependent on various concurrency constraints within the MOPS database
+and thus require serial processing, or 2) are appropriate at the end of
+a night, such as object labeling or export.
+
+Newly created or modified (via attribution) objects are placed into the
+EON queue with a status of 'N'.  Objects may retired mid-queue using a
+status of 'X'.  Otherwise queue objects have their status changed at
+each step indicating that objects are ready for the next phase of EON
+processing.
+
+The current EON processing steps are:
+
+=item ORBITID
+
+Type-2 orbit identification, in which objects in the queue are compared
+element-wise with existing derived objects.  Identification candidates are
+then tested using orbit determination.  Successful identifcations cause the
+child object that is in the queue to be retired ('X') and the parent to be 
+inserted into the queue mid-stream with status 'P' (ready for precovery).
+
+=item PRECOV
+
+Tracklet precovery of recently modified or created derived objects.
+PRECOV walks backwards in time and attempts to associate unattributed
+tracklets with queue objects.  The theory of operation for PRECOV is
+beyond this documentation and can be found in the PRECOV man page.
+
+=item EXPORT
+
+Currently unimplemented.  Prep of MOPS data for MPC export.
+
+=head1 EXIT VALUE
+
+EON exits with the following values:
+
+  0 - successful completion
+  other - internal failure
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::EONQueue;
+
+use subs qw(
+    run_job
+    flush_queue
+);
+
+
+# Globals.
+my $inst;
+my $instance_name;
+my $nn;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => '--nn=NIGHTNUM is required') unless $nn;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+my $model = $inst->dbname;
+my $dir = $inst->makeNNDir(NN => $nn, SUBSYS => 'eon');
+chdir $dir or $mops_logger->logdie("EON: can't chdir to $dir");
+
+
+run_job('orbitid', 'ORBITID');
+run_job('panda --precov', 'PRECOV');
+run_job('postfit', 'POSTFIT');
+run_job('killTracklets', 'KILLTRACKLETS');
+
+# Moved to end of TRACKLET processing.
+#run_job("nightly_digests --nn=$nn", 'DIGEST2') if $mops_config->{main}->{enable_digest};
+#run_job("submit_stamps --fuzzy --quads --derived --nn=$nn", 'STAMPS') if $mops_config->{main}->{enable_stamps};
+
+if ($mops_config->{main}->{enable_known}) {
+    run_job("KNOWN_LOCAL --nn=$nn", 'KNOWN_LOCAL');
+    run_job("submit_stamps --derived --known --nn=$nn", 'STAMPS');
+    run_job("neodigest --known_pairs --nn=$nn", 'NEODIGEST');
+}
+
+#run_job("mpc_coverage --nn=$nn --instance $model --cc 'psmops\@gmail.com cssfield\@lpl.arizona.edu'", 'SKYCOVERAGE') if $mops_config->{main}->{enable_coverage};
+
+if(-e "$ENV{MOPS_HOME}/bin/mpc-export-eon") { run_job('mpc-export-eon','EXPORT'); }
+
+run_job("alertupdate.py --nn=$nn --instance $model", 'UPDATE AQUEUE TABLE') if $mops_config->{main}->{enable_alert};
+run_job("alertcheck.py", 'EXECUTE RULES') if $mops_config->{main}->{enable_alert};
+run_job("alertsubmit.py", 'PUBLISH ALERTS') if $mops_config->{main}->{enable_alert};
+
+unless ($mops_config->{debug}->{eon_no_flush}) {
+    flush_queue();
+}
+exit;
+
+
+sub run_job {   
+    # Run the specified command string via system(), and exit with an
+    # error if the command did not execute successfully (0 or 1).
+    my ($job_str, $subsys) = @_;
+    my $rv;
+    my $exit_code;
+
+    $0 = "EON $subsys";
+    $rv = system($job_str);
+    $exit_code = $rv ? ($? >> 8) : 0;
+    if ($exit_code != 0) {
+        $mops_logger->logdie("subcommand $job_str failed: $exit_code");
+    }
+    $inst->forget_dbh();            # job might take a long time; force DB reconnect
+}
+
+
+sub flush_queue {
+    # Empty the EON queue of objects.
+    modcq_flush($inst);     # everything!
+}
+

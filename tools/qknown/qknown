@@ -1,0 +1,338 @@
+#!/usr/bin/env perl
+# vim: sw=4 ts=4 ai
+
+=head1 NAME
+
+qknown - Report objects in a FOV at some given time
+
+=head1 SYNOPSIS
+
+qknown [options] EPOCH_MJD_UTC OBSCODE RA_DEG DEC_DEG
+
+  Required:
+    EPOCH_MJD_UTC : time of observation [MJD, UTC]
+    OBSCODE : MPC observatory code
+    RA_DEG, DEC_DEG : Right ascension, desclination of boresight [deg]
+    RADIUS_DEG : Radius from center to consider [deg]
+
+  Options:
+  --mag_limit=LIMIT : only objects with V < LIMIT, default V < 20
+  --radius_deg=DIST : only objects within DIST degrees of position, default 0.1 deg
+  --prep : just compute and store the ephemeris file (usually under cron)
+  --quick : real quick, just use approximate positions from nominal pos and velocity, default NO
+  --cleanup=FLAG : 1 to clean up temp directory, 0 not (default 1)
+  --help : show manpage
+
+=head1 EXAMPLES
+
+  qknown 57072.7180324 F51 140 +15
+
+  qknown --mag_limit=22 --radius_deg=1.5 57072.7180324 F51 140 +15
+
+  qknown --mag_limit=22 --radius_deg=1.5 -- 57072.7180324 F51 140 -15
+
+  qknown --quick 57072.7180324 F51 140 +15
+
+  qknown --prep 57072.7180324
+
+=head1 DESCRIPTION
+
+Emits a list of asteroids near an (RA,DEC) at a given MJD UTC.  This is 
+done using a recent MPC catalog (mpc.des and mpc.sqlite) and propagating
+the orbits to the specified time.  Then positions near the (RA,DEC) within
+a specified radius and brighter than the specified magnitude limit are
+emitted.
+
+nearast generates an intermediate 2-body form of the positions that can
+be used to generate quick-look positions that can then be used to find
+the set of asteroids that need to be n-body propagated to get precise
+positions.  The quicklook file should be preserved if multiple requests
+are performed for a single night so that ephemerides for the entire
+catalog do not have to be generated.  When pre-computed 2-body ephemerides
+are available, a search using the ~700,000-object MPC catalog takes about
+10 seconds.
+
+=head1 BUGS
+
+If DEC is negative, you must use the GNU convention of "--" to separate
+options from arguments, e.g.
+
+  qknown --mag_limit=22 --radius_deg=1.5 -- 57072.7180324 F51 140 -15
+
+=head1 FILES
+
+This code is adapted from the ATLAS environment. You'll need the
+following files in the current directory.
+
+oorb.nbody.conf
+oorb.2body.conf
+mpc.des
+mpc.sqlite3
+
+=cut
+
+use strict;
+use warnings;
+
+use Cwd;
+use FileHandle;
+use File::Slurp;
+use File::Temp qw/tempdir/;
+use Astro::Time;
+use Astro::SLA;
+use DBI;                # for SQLite
+
+# Template for Perl scripts.
+use Getopt::Long;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::MPC qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Tracklet;
+
+
+my $instance_name;
+my $mag_limit = 20;
+my $radius_deg = .1;
+my $prep;
+my $cleanup = 1;
+my $quick = 0;
+my $help;
+my $verbose;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'mag_limit=f' => \$mag_limit,
+    'radius_deg=f' => \$radius_deg,
+    'prep' => \$prep,
+    'cleanup=i' => \$cleanup,
+    quick => \$quick,
+    help => \$help,
+    verbose => \$verbose,
+) or pod2usage(2);
+pod2usage(-msg => "--instance=NAME is required") unless $instance_name;
+pod2usage(-verbose => 3) unless @ARGV;
+
+
+my $epoch_mjd_utc;
+my $obscode;
+my $fra_deg;
+my $fdec_deg;
+my @dets;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name) or die "can't connect to $instance_name";
+
+my $thing = $ARGV[0];       # see what this is
+if ($thing =~ /^T(\d+)$/) {
+    warn "--prep ignored when tracklet ID specified.\n" if $prep;
+    $prep = undef;
+    my $tracklet_id = $1;
+    my $trk = modct_retrieve($inst, trackletId => $tracklet_id) or die "can't retrieve tracklet ID $tracklet_id";
+    @dets = @{$trk->detections};
+    my $det0 = $dets[0];
+    $epoch_mjd_utc = $det0->epoch;
+    $obscode = $det0->obscode;
+    $fra_deg = $det0->ra;
+    $fdec_deg = $det0->dec;
+}
+elsif ($prep) {
+    $epoch_mjd_utc = shift or pod2usage(-msg => "--epoch_mjd_utc not specified.");
+}
+else {
+    $epoch_mjd_utc = shift or pod2usage(-msg => "--epoch_mjd_utc not specified.");
+    $obscode = shift or pod2usage(-msg => "--obscode not specified.");
+    $fra_deg = shift or pod2usage(-msg => "--ra_deg not specified.");
+    $fdec_deg = shift or pod2usage(-msg => "--dec_deg not specified.");
+
+    push @dets, {
+        epoch => $epoch_mjd_utc,
+        obscode => $obscode,
+        ra => $fra_deg,
+        dec => $fdec_deg,
+    };
+}
+
+
+my $DEGPERRAD = 57.295779513;
+my $rtest = $radius_deg + 1.0;      # 1 degree of slop 
+my $vtest = $mag_limit + 0.25;      # 0.25 mag slop/lightcurve variation
+
+# Plan:
+# 1. Look for int(mjd) ephemerides. This will be a file 2-body propagated
+# to the current night, containing RA/DEC/MAG/dRA/dDEC.  If not found, 
+# create it.
+#
+# 2. Estimate position using RA/DEC/dRA/dDEC.  Determine how many are
+# near the field position.
+#
+# 3. N-body propagate the near asteroids to the specified time.
+#
+# 4. If matching to a catalog is desired, try colmerge.
+
+
+# Setup.
+my ($nn) = int($epoch_mjd_utc);
+my $t0 = time;
+my $oorb_2body_conf = "$ENV{MOPS_HOME}/config/oorb.2body.conf";
+my $oorb_nbody_conf = "$ENV{MOPS_HOME}/config/oorb.nbody.conf";
+die "$oorb_2body_conf does not exit" unless -r $oorb_2body_conf;
+die "$oorb_nbody_conf does not exit" unless -r $oorb_nbody_conf;
+my $OORB_DATA = $ENV{OORB_DATA} || "$ENV{MOPS_HOME}/data/oorb";
+die "OORB_DATA is not set" unless -d $OORB_DATA;
+$ENV{OORB_DATA} = $OORB_DATA;
+
+my $mpc_des = "$ENV{MOPS_HOME}/data/mpcorb/mpc.des";
+die "$mpc_des does not exit" unless -r $mpc_des;
+my $mpc_sqlite3 = "$ENV{MOPS_HOME}/data/mpcorb/mpc.sqlite3";
+die "$mpc_sqlite3 does not exit" unless -r $mpc_sqlite3;
+
+# 1. Look for int(mjd) ephemerides.
+my $dbname = $inst->dbname;
+my $base_ephem = "$ENV{MOPS_HOME}/var/$dbname/eph/$nn.eph";
+if (!-e $base_ephem or $prep) {
+    print STDERR "$base_ephem does not exist, creating...\n";
+    my ($tmp_orb) = "$ENV{MOPS_HOME}/var/$dbname/eph/.$nn.des";
+    my ($tmp_eph) = "$ENV{MOPS_HOME}/var/$dbname/eph/.$nn.eph";
+    system("oorb --conf=$oorb_2body_conf --task=propagation --epoch-mjd-utc=$nn --orb-in=$mpc_des --orb-out=$tmp_orb") == 0
+        or die "oorb propagation for $tmp_orb failed.\n";
+    system("oorb --conf=$oorb_2body_conf --task=ephemeris --code=500 --orb-in=$tmp_orb | awk '{print \$1,\$2,\$3,\$5,\$6,\$8,\$9,\$10}' > $tmp_eph") == 0
+        or die "oorb ephemeris for $tmp_eph failed.\n";
+    rename($tmp_eph, $base_ephem) or die "could not rename $tmp_eph to $base_ephem.\n";
+    unlink($tmp_orb) or warn "could not remove $tmp_orb.\n";
+}
+if ($prep) {
+    print STDERR "$base_ephem saved.\n";
+    exit 0;
+}
+
+
+# 2. Compute approximate positions from .eph file. We're simply
+# going to use the position for the NN of the file and interpolate
+# to the new time.
+##Designation Code MJD_UTC/UT1 RA Dec dRA/dt dDec/dt VMag
+#1 500 57063.0000000000 283.6798573574 -24.3016712614 0.3761055961 0.0026566491 9.1176943174
+my @all = grep !/^#Designation/, read_file($base_ephem);
+printf STDERR "Read ephemeris file...(%.1f sec)\n", time - $t0 if $verbose;
+my @keep;   # objects to keep
+my ($id, $obscode0, $mjd0, $ra0, $dec0, $dradt0, $ddecdt0, $v);
+my ($nra, $ndec);
+for my $line (@all) {
+    ($id, $obscode0, $mjd0, $ra0, $dec0, $dradt0, $ddecdt0, $v) = split /\s+/, $line;
+    $nra = $ra0 + ($epoch_mjd_utc - $nn) * $dradt0; 
+    $ndec = $dec0 + ($epoch_mjd_utc - $nn) * $ddecdt0; 
+
+    if ($v < $vtest and dist($nra, $ndec, $fra_deg, $fdec_deg) < $rtest) {
+        push @keep, [ $id, $obscode0, $mjd0, $ra0, $dec0, $dradt0, $ddecdt0, $v ];
+    }
+}
+printf STDERR "Found %d candidate asteroids (%.1f sec).\n", scalar @keep, (time - $t0) if $verbose;
+
+
+# 3. Compute n-body ephemerides for the candidates.
+my ($dir) = tempdir(CLEANUP => $cleanup);
+my $oldwd = getcwd;
+chdir $dir or die "can't cd to $dir";
+
+# Create orbit file.
+eval {
+    my $match = 0;
+    if (!$quick) {
+        my $fh = new FileHandle ">mpc.des" or die "can't create orbit file";
+        print $fh "!!OID FORMAT q e i Omega argperi t_p H t_0 INDEX N_PAR MOID COMPCODE\n";
+
+        # Add our nearby orbits.
+        printf STDERR "Retrieving orbits...(%.1f sec)\n", time - $t0;
+        my $dbh = DBI->connect("dbi:SQLite:dbname=$mpc_sqlite3","","") or die "can't open orbit database $mpc_sqlite3: " . DBI->errstr;
+        my $sth = $dbh->prepare("select * from object where id=?") or die "can't prepare SQL for select: " . $dbh->errstr;
+        for my $idstuff (@keep) {
+            my $id = $idstuff->[0];
+            $sth->execute($id) or die "execute failed: " . $sth->errstr;
+            my ($aid, $name, $number, $desig, $q_au, $e, $i_deg, $node_deg, $argperi_deg, $timeperi_mjd_utc, $epoch_mjd_utc, $h_V) = $sth->fetchrow_array();
+            if (!defined($aid)) {
+                warn "Did not retrieve an orbit for $id.\n" if $verbose;
+                next;
+            }
+            if (!defined($h_V)) {
+                warn "Did not retrieve an h_V for $id.\n" if $verbose;
+                $h_V = 10;  # comet probably
+            }
+            print $fh join(' ', $id, 'COM', $q_au, $e, $i_deg, $node_deg, $argperi_deg, $timeperi_mjd_utc, $h_V, $epoch_mjd_utc, 1, 6, -1, 'CATEXP'), "\n";
+        }
+        $sth->finish;
+        $fh->close;
+        print STDERR "done.\n";
+
+        for my $det (@dets) {
+            # Compute ephemerides, and emit only those within our field.
+            printf STDERR "Propagating (%.1f sec).\n", (time - $t0) if $verbose;
+            my $tmp_orb = "$det->{epoch}.des";
+
+            my @stuff;
+            if (1) {
+                system("oorb --conf=$oorb_nbody_conf --task=propagation --epoch-mjd-utc=$det->{epoch} --orb-in=mpc.des --orb-out=$tmp_orb") == 0
+                    or die "oorb propagation for $tmp_orb failed.\n";
+
+                # Emit ID, RA, DEC, MAG, OBSCODE
+                printf STDERR "Ephemerizing (%.1f sec).\n", (time - $t0) if $verbose;
+                @stuff = `oorb --conf=$oorb_nbody_conf --task=ephemeris --code=$obscode --orb-in=$tmp_orb | awk '{printf "%s %.6f %s %.6f %+.6f %.2f\\n",\$1,\$3,\$2,\$5,\$6,\$10}'`;
+            }
+            else {
+                @stuff = `cat mpc.des | ephem --mjd=$det->{epoch} --obscode=$obscode`;
+            }
+
+            my $dist;
+            my $epoch;
+            my $didhead;
+            foreach my $line (@stuff) {
+                ($id, $epoch, $obscode, $nra, $ndec, $v) = split /\s+/, $line;
+                $dist = dist($nra, $ndec, $det->{ra}, $det->{dec});
+                if ($dist < $radius_deg) {
+                    if (!$didhead) {
+                        print join(' ', qw(ID EPOCH_MJD_UTC OBSCODE RA_DEG DEC_DEG V FC_DIST_ARCSEC)), "\n";
+                        $didhead = 1;
+                    }
+                    print join(' ', $id, $epoch, $obscode, $nra, $ndec, $v, sprintf("%.2f", $dist * 3600)), "\n";
+                    $match++;
+                }
+            }
+            print "\n";
+        }
+    }
+    else {
+        for my $det (@dets) {
+            # Compute ephemerides, and emit only those within our field.
+            my $didhead;
+            for my $idstuff (@keep) {
+                my ($id, $obscode0, $mjd0, $ra0, $dec0, $dradt0, $ddecdt0, $v) = @{$idstuff};
+                my $dist;
+                my $epoch;
+                my $dt = $det->{epoch} - $mjd0;     # time from ref pos to this detection
+                ($nra, $ndec) = ($ra0 + $dradt0 * $dt, $dec0 + $ddecdt0 * $dt);
+                $dist = dist($nra, $ndec, $det->{ra}, $det->{dec});
+                if ($dist < $radius_deg) {
+                    if (!$didhead) {
+                        print join(' ', qw(ID EPOCH_MJD_UTC OBSCODE RA_DEG DEC_DEG V FC_DIST_ARCSEC)), "\n";
+                        $didhead = 1;
+                    }
+                    print join(' ', $id, $det->{epoch}, $obscode0, $nra, $ndec, $v, sprintf("%.2f", $dist * 3600)), "\n";
+                    $match++;
+                }
+            }
+            print "\n";
+        }
+     }
+     if ($match == 0) {
+        printf "No matches found within %.2f arcmin brighter than V=%.1f\n", $radius_deg * 60, $mag_limit;
+     }
+};
+chdir $oldwd or die "can't restore working directory $oldwd.\n";
+die $@ if $@;
+exit;
+
+
+sub dist {
+    my ($ara_rad, $adec_rad, $fra_rad, $fdec_rad) = map { $_ / $DEGPERRAD } @_;
+    my $dist = slaDsep($ara_rad, $adec_rad, $fra_rad, $fdec_rad);
+    return $dist * $DEGPERRAD;
+}

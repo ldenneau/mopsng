@@ -1,0 +1,35 @@
+#!/bin/sh
+
+# -e echo, -x stop on err
+set -e -x
+
+PATH=/home/denneau/tr/tools/denneau/sqi:$PATH
+
+FPAS=`/bin/ls o*o`
+PARENT=`/bin/ls o*o | tail -1`
+echo Processing parent $PARENT.
+
+for fpa_id in $FPAS
+do
+    extractSMF $fpa_id > $fpa_id.dets
+done
+cat o*.dets > all.dets
+
+# All dets in a single file.  Remove stationaries.  
+astroclean file all.dets outtype 1 stationrad .0003 clean_file nonstationary.dets
+
+# Ingest our files.  Then we will extract and clean linear features and 
+# dense areas.
+for fpa_id in $FPAS
+do
+    echo Ingesting $fpa_id.
+    ingestSMF $fpa_id --nsfile nonstationary.dets
+    echo "select d.det_id, d.epoch_mjd, d.ra_deg, d.dec_deg, d.mag, 'F51', 'NS', '-1', '-1' from detections d join fields f using(field_id) where f.fpa_id='$fpa_id' and s2n > 7" | mopsql > $fpa_id.dets
+
+    echo Cleaning $fpa_id.
+    astroclean file $fpa_id.dets outtype 1 clean_file $fpa_id.line.dets linesupport 10 
+    astroclean file $fpa_id.line.dets outtype 1 clean_file $fpa_id.density.dets density 10000 Dradius .01
+    postclean $fpa_id $fpa_id.density.dets
+done
+
+echo Done with $FPAS.

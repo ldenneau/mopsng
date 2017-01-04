@@ -1,0 +1,186 @@
+#!/usr/bin/env perl
+
+# $Id: selectTracklets 1972 2007-10-12 02:42:33Z denneau $
+# select tracklets from MOPSDC for LinkTracklets processing
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Temp qw(tmpnam);
+use Astro::Time;
+
+use PS::MOPS::Lib;
+use PS::MOPS::MPC qw(:all);
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::Instance;
+
+
+my $inst;
+my $instance_name;
+my $all;
+my $ra;
+my $dec;
+my $roi;
+my $ocnum;
+my $mjd;
+my $mpc;
+my $miti;
+my $tracklet_ids;
+my $oid;
+
+# Diagnostic/testing.
+my $objPrefix;
+my $cheat;
+my $want_pure;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'all' => \$all,
+    'ra=f' => \$ra,
+    'dec=f' => \$dec,
+    'roi=f' => \$roi,
+    'ocnum=i' => \$ocnum,
+    'mjd=s' => \$mjd,
+    'objPrefix=s' => \$objPrefix,
+    'tracklet_ids=s' => \$tracklet_ids,
+    'oid=s' => \$oid,
+    mpc => \$mpc,
+    miti => \$miti,
+    cheat => \$cheat,
+    pure => \$want_pure,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+
+# Invocation rules: if tracklet_ids only specified, that's OK.  Otherwise we need --all or RA/DEC limits,
+# and $ocnum or $mjd;
+unless ($tracklet_ids) {
+    pod2usage(3) unless ($all or (!$all and defined($ra) and defined($dec) and $roi));    # NOTE: zero RA/DEC allowed
+    pod2usage(3) unless ($ocnum or $mjd);
+}
+
+warn "--ocnum is not suppored yet" if $ocnum;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+
+
+sub _mapobjname {
+    # Return an object name suitable for linkTracklets processing.  If the
+    # object name is empty or 'FALSE', just return a space character.
+    my ($name) = @_;
+    $name = ' ' if (!$name or $name eq 'FALSE');
+    return $name ;      # return original name
+}
+
+
+sub _is_pure {
+    # Return 1 if the specified track is "pure"; that is, does not
+    # contain false detections.
+    my ($trk) = @_;
+    my %objs;       # object names for this tracklet
+    my $det;
+    foreach my $det (@{$trk->detections}) {
+        return 0 if $det->objectName eq 'FALSE';
+    }
+    return 1;
+}
+
+
+sub _format_det_miti {
+    # Output tracklet in MITI format.
+    my ($det) = @_;
+    return join("\t", $det->detId, $det->epoch, $det->ra, $det->dec, $det->mag, $det->obscode);
+}
+
+
+sub _format_miti {
+    # Output tracklet in MITI format.
+    my ($trk, $cheat) = @_;
+    my @stuff;
+    my @lines;
+    my $field;
+
+    for my $det (@{$trk->detections}) {
+        my $field = $det->getField or die "can't get field for detId " . $det->detId;
+        @stuff = ($trk->trackletId, $det->epoch, $det->ra, $det->dec, $det->mag, $field->obscode);
+        push @stuff, _mapobjname($det->objectName) if $cheat;
+        push @lines, join("\t", @stuff);
+    }
+    return @lines;
+}
+
+
+my $trk_i;
+my $trk;
+my $det;
+
+
+if ($tracklet_ids) {
+    my @ids = split /\D+/, $tracklet_ids;
+    my $trk;
+    foreach my $id (@ids) {
+        $trk = modct_retrieve($inst, trackletId => $id);
+        foreach my $det (@{$trk->detections}) {
+            if ($oid) {
+                $det->detId($oid);
+            }
+            print join("\n", _format_det_miti($det)), "\n";
+        }
+    }
+}
+else {
+    if ($objPrefix) {
+        # Diagnostic/testing.
+    ##    $trk_i = modct_selectTracklets($inst, mjd => $mjd, objPrefix => $objPrefix);
+        $trk_i = modct_selectTracklets($inst, mjd => $mjd);
+        die "need to filter objprefix here";
+    }
+    else {
+        # Normal processing.
+        $trk_i = modct_selectTracklets($inst, mjd => $mjd);
+    }
+    while ($trk = $trk_i->next) {
+        # Check that tracklet is in our ROI.
+        next if $want_pure and !_is_pure($trk);       # skip non-pure tracklet
+
+        if ($all or mopslib_inField($ra, $dec, $roi, $trk->extRA, $trk->extDEC)) {
+            if ($mpc) {
+                print join("\n", mpc_format_tracklet($trk, $cheat)), "\n";
+            }
+            else {
+                # MITI (MOPS interim text interchange)
+                print join("\n", _format_miti($trk, $cheat)), "\n";
+            }
+        }
+    }
+}
+
+=head1 NAME
+
+selectTracklets - Select tracklets from MOPSDC and output in useable LinkTracklets format
+ 
+=head1 SYNOPSIS
+ 
+selectTracklets [--mjd date_mjd] [--ocnum oc_num] [--help] --ra ra_deg --dec dec_deg --roi roi_deg
+
+  --mjd date_mjd : select all tracklets within (date_mjd, date_mjd+lunar_period)
+  --ocnum oc_num : select all tracklets withing MOPS observing cycle num
+  --all : select all detections on specified days; disregard RA/DEC window
+  --ra ra_deg : RA of field center, in degrees
+  --dec dec_deg : DEC of field center, in degrees
+  --roi roi_deg : length of square ROI side, in degrees
+  --mpc : write output in MPC format
+  --miti : write output in MITI format
+  --cheat : append objectName to detections
+  --pure : write out pure (no false detections) tracklets only
+  --help : show help
+
+=head1 DESCRIPTION
+
+SelectTracklets outputs all tracklets that have an extRA and extDEC
+(extrapolated RA and DEC) that fall within the specified field.
+
+=cut
+

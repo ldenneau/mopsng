@@ -1,0 +1,4 @@
+hostname = mops01
+backend = mysql
+username = mopspipe
+password = epip

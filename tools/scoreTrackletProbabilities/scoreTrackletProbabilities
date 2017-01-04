@@ -1,0 +1,268 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+scoreTrackletProbabilities - Compute tracklet probabilities
+
+=head1 SYNOPSIS
+
+scoreTracklets [--nn=NIGHT_NUM] [--help] [TRACKLET_IDs]
+
+  TRACKLET_IDS : individual tracklet IDs to score
+  --nn NIGHT_NUM : night number to process, or all data if unspecified
+  --ssm : include Solar System model in DES manifest
+  --help : display man page
+
+=head1 DESCRIPTION
+
+Computes a complicated, cheesy and empirical likelihood that a tracklet
+is of a real object based on its morphology.
+
+=cut
+
+use strict;
+use warnings;
+
+use FileHandle;
+use Getopt::Long;
+use Pod::Usage;
+use List::Util qw(min max sum);
+use Math::Trig;
+use POSIX qw(fmod);
+use Astro::SLA;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Tracklet;
+
+my $nn;
+my $survey_mode;
+my $debug;
+my $vartest;
+my $verbose;
+my $qual;           # examine PSF_QUALITY
+my @in_tids;
+my $test;
+GetOptions(
+    'nn=i' => \$nn,
+    qual => \$qual,
+    verbose => \$verbose,
+    'survey_mode=s' => \$survey_mode,
+    vartest => \$vartest,
+    debug => \$debug,
+    test => \$test,
+) or pod2usage(2);
+@in_tids = @ARGV;
+pod2usage(-msg => '--nn is required') unless ($nn || @in_tids);
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => undef);
+my $logger = $inst->getLogger;
+my $dbh = $inst->dbh;
+my $sql;
+my $line;
+my $tid;
+my $det_id;
+
+
+# Scoring global, from Peter Veres's work.
+#my $FAST_PX_THRESH = 5.25;
+my $FAST_PX_THRESH = 6.00;
+my $VERY_FAST_PX_THRESH = 7.0;
+my $SLOW_VEL_THRESH = 0.1;
+my $MIN_S2N = 10;
+my $MIN_PSF_QUALITY = .85;
+
+# See http://svn.pan-starrs.ifa.hawaii.edu/trac/ipp/wiki/CMF_PS1_V3
+# FLAGS
+my $ON_SPIKE = 0x2000_0000;
+my $ON_GHOST = 0x4000_0000;
+
+# FLAGS2
+my $ON_SPIKE2 = 0x0000_0008;        # flags2
+my $ON_STARCORE = 0x0000_0010;      # flags2
+my $ON_BURNTOOL = 0x0000_0020;      # flags2
+my $DIFF_WITH_DOUBLE = 0x0000_0002; # flags2
+
+# Prep a statement to get morph params.
+my $drsth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select 
+    dr.peak peak,
+    dr.sky sky,
+    dr.chin chin,
+    dr.pstar pstar,
+    dr.preal preal,
+    dr.star star,
+    dr.dstar dstar,
+    dr.mstar mstar,
+    dr.dirty dirty,
+    dr.vtflags vtflags,
+    (f.time_stop - f.time_start) * 86400 exptime_sec, 
+    f.de10 pxspc, 
+    f.pa_deg pa_deg,
+    d.s2n s2n
+from fields f 
+join detections d using(field_id) 
+join det_rawattr_v3 dr using(det_id)
+where d.det_id=?
+SQL
+
+my $substh;
+if ($debug) {
+    $substh = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select distinct desig from export.mpc_sub where dbname=? and tracklet_id=? limit 1
+SQL
+}
+
+
+# All tracklets.
+my $tref;
+if (@in_tids) {
+    $tref = \@in_tids;
+}
+else {
+    my $sm = '';
+    if ($survey_mode) {
+        $sm = "and survey_mode like '\%$survey_mode\%'";
+    }
+    print STDERR "Fetching tracklets for night $nn.\n" if $verbose;
+    $tref = $dbh->selectcol_arrayref("select tracklet_id from tracklets t ignore index(classification) join fields f using (field_id) where f.nn=$nn and t.classification='N' $sm");
+    $logger->info(sprintf "SCORETRACKLETPROBABILITIES: %s tracklets", scalar @{$tref});
+    printf STDERR "Found %d tracklets.\n", scalar @{$tref} if $verbose;
+}
+
+print "TID NDET KNOWN VTOT PROB TS2N SUB\n" if $debug;
+
+foreach my $tid (@{$tref}) {
+    my $trk = modct_retrieve($inst, trackletId => $tid);
+    my $prob = analyze($trk);
+
+    if (!$debug) {
+        $trk->probability($prob);
+    } 
+}
+
+$drsth->finish;
+$substh->finish if $substh;
+exit;
+
+
+sub avg {
+    return (sum @_) / @_;
+}
+
+
+sub analyze {
+    my ($trk) = @_;
+    my %raw;
+    my $dets = $trk->detections;
+
+    # Get raw attr data.
+    foreach my $det (@{$dets}) {
+        $drsth->execute($det->detId);
+        $raw{$det->detId} = $drsth->fetchrow_hashref();
+    }
+
+    my $final_prob = 1;
+    if ($vartest) {
+        my $real_prob = analyze_real($trk, $dets, \%raw);
+        my $burn_prob = analyze_burn($trk, $dets, \%raw);
+        my $resid_prob = analyze_resid($trk, $dets, \%raw);
+        my $varstar_prob = analyze_varstar($trk, $dets, \%raw);
+        $final_prob = $real_prob * (1 - $burn_prob) * (1 - $varstar_prob) * (1 - $resid_prob);
+        printf "  T%s: %.4f B=$burn_prob\n", $trk->trackletId, $final_prob if $verbose;
+    } else {
+        my $real_prob = analyze_real($trk, $dets, \%raw);
+        printf "  T%s: %.4f\n", $trk->trackletId, $final_prob if $verbose;
+        $final_prob = $real_prob;
+    }
+
+    if ($debug) {
+        my $k = 'NA';
+        if ($trk->knownId) {
+            ($k) = $dbh->selectrow_array('select known_name from known where known_id=?', undef, $trk->knownId);
+        }
+        # print "TID NDET KNOWN VTOT PROB TS2N SUB\n" if $debug;
+        my $ndets = scalar @{$dets};
+        my $desig = 'NA';
+        if ($debug) {
+            $substh->execute($inst->dbname, $trk->trackletId) or die $substh->errstr;
+            ($desig) = ($substh->fetchrow_array() || 'NA');
+        }
+
+        print join(' ', $trk->trackletId, $ndets, $k, (map { sprintf "%.3f", $_ } $trk->vTot, $final_prob, avg(map { $_->{s2n} } @{$dets})), $desig), "\n";
+    }
+
+    return $final_prob;
+}
+
+
+sub analyze_real {
+    my ($trk, $dref, $rref) = @_;
+    my $prob = 1;
+
+    # For a quad: take the three highest preals and three highest
+    # pstars and compute the sum of the product (preal * (1 - pstar)).
+    if (scalar keys %{$rref} == 4) {
+        my @preal;
+        my @pstar;
+        for my $d (values %{$rref}) {
+          push @preal, $d->{preal};
+          push @pstar, $d->{pstar};
+        }
+        # Take first three elements after reverse sorting.
+        @preal = sort { $b <=> $a } @preal;
+        @pstar = sort { $b <=> $a } @pstar;
+        @preal = @preal[0,1,2];
+        @pstar = @pstar[0,1,2];
+        for my $i (0..2) {
+            $prob *= $preal[$i] * (1 - $pstar[$i]);
+        }
+    } else {
+        foreach my $r (values %{$rref}) {
+            $prob *= $r->{preal} * (1 - $r->{pstar});
+        }
+    }
+    return $prob;
+}
+
+
+sub analyze_burn {
+    my ($trk, $dref, $rref) = @_;
+    my $nburn = 0;
+
+    # For a quad: if at least two detections have burned defined
+    # then call the tracklet "burned".
+    foreach my $r (values %{$rref}) {
+        $nburn++ if ($r->{vtflags} || '') =~ /B/;
+    }
+    return $nburn >= 2;
+}
+
+
+sub analyze_resid {
+    my ($trk, $dref, $rref) = @_;
+    my $nresid = 0;
+
+    # For a quad: if at least two detections have burned defined
+    # then call the tracklet "burned".
+    foreach my $r (values %{$rref}) {
+        $nresid++ if ($r->{vtflags} || '') =~ /R/;
+    }
+    return $nresid >= 2;
+}
+
+
+sub analyze_varstar {
+    my ($trk, $dref, $rref) = @_;
+    my $nvarstar = 0;
+
+    # For a quad: if at least two detections have burned defined
+    # then call the tracklet "burned".
+    foreach my $r (values %{$rref}) {
+        $nvarstar++ if ($r->{vtflags} || '') =~ /V/;
+    }
+    return $nvarstar >= 2;
+}
+
+

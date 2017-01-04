@@ -1,0 +1,4 @@
+#time oorb --conf=/home/mops/MOPS_DEVEL/config/oorb.conf --task=ephemeris --code=703 --epoch-mjd-tt=55506.360210 --orb-in=orbits.des > RV19E67.out
+#head oorb.out | pf 1 2 3 5 6 10| column -t
+oorb --conf=/home/mops/MOPS_DEVEL/config/oorb.conf --task=propagation --epoch-mjd-utc=55735.514864 --orb-in=32451.des --orb-out=32451p.des
+oorb --conf=/home/mops/MOPS_DEVEL/config/oorb.conf --task=ephemeris --obscode=F51 --orb-in=32451p.des | pf 1-10

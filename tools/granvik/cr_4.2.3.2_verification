@@ -1,0 +1,53 @@
+#!/bin/bash
+ 
+# Verification test for CR 4.2.3.2 (attribution accuracy)
+# Mikael Granvik  07/24/2008
+
+USERNAME="granvik"
+STUB="cr_4232_verification"
+INSTANCE_NAME="psmops_${USERNAME}_cr_test_sim"
+
+echo "1..1"
+
+# Query attr accuracy:
+attracc=`echo \
+"
+select
+  truncate(clean/found,5) attr_accuracy
+from (
+  select
+    sum(if(sub_classification<>'X',1,0)) found,
+    sum(if(sub_classification='C',1,0)) clean
+  from (
+    select
+      h.classification sub_classification
+    from
+      history h, history_attributions ha
+    where 
+      h.event_type = 'A'
+      and h.event_id = ha.event_id
+      and ha.ephemeris_uncertainty < 15 # arcsec!?
+  ) as sub 
+) effacc
+" | \
+mysql -umops -pmops -hschmopc01 $INSTANCE_NAME`
+
+if [[ $1 == "--result" ]]
+    then
+    echo $attracc
+fi
+
+# Remove header from result and convert to integer so that poor Bash
+# understands what we want:
+attracc=${attracc#attr_accuracy}
+attracc=`echo "$attracc * 100000" | bc`
+attracc=${attracc/.*/}
+
+# Check whether the 99.9% criterion is met:
+if (( $attracc > "99900" )) ; then
+    echo "ok 1 - ${STUB}"
+else
+    echo "not ok 1 - ${STUB}"
+fi
+
+exit

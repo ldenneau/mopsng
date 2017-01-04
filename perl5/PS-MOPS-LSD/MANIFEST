@@ -1,0 +1,6 @@
+Changes
+Makefile.PL
+MANIFEST
+README
+t/PS-MOPS-LSD.t
+lib/PS/MOPS/LSD.pm

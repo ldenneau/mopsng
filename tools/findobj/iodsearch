@@ -1,0 +1,53 @@
+#!/bin/bash
+
+# Given a MOPS DB name and a tracklet ID, fit a ranging orbit to the tracklet
+# and search for detections near the orbit's predicted positions within a
+# 14-day window.
+
+# Use this script from a web program.
+
+MODEL=$1
+ID=$2
+
+source /home/mops/MOPS_STABLE/bin/mops_env $MODEL
+
+TEMPDIR=`mktemp -d /tmp/iodsearchXXXXXXXX`
+WD=`pwd`
+cd $TEMPDIR
+
+# Emit DES observations for our tracklet(s).
+echo Observations:
+/bin/rm -f $ID.des
+echo mt --xd $ID 
+mt --xd $ID | tee -a $ID.des
+echo
+
+# Generate a population of orbits using ranging.  The first orbit is the highest-likelihood orbit.
+echo Ranging:
+echo oorb --conf=/home/mops/MOPS_STABLE/config/oorb.conf.neo_probability --task=ranging --obs-in=$ID.des --orb-out=$ID.iods.orb
+oorb --conf=/home/mops/MOPS_STABLE/config/oorb.conf.neo_probability --task=ranging --obs-in=$ID.des --orb-out=$ID.iods.orb
+grep '^#' $ID.iods.orb > $ID.iod.orb
+grep -v '^#' $ID.iods.orb | head -1 >> $ID.iod.orb
+echo
+
+# Convert the OORB orbit to DES so we can use findobj.
+echo Convert to DES orbit:
+echo /home/denneau/MOPS/3RDPARTY/oorb/main/oorb --conf=/home/mops/MOPS_STABLE/config/oorb.conf --task=orb2des --orb-in=$ID.iod.orb --orb-out=$ID.iod.des
+/home/denneau/MOPS/3RDPARTY/oorb/main/oorb --conf=/home/mops/MOPS_STABLE/config/oorb.conf --task=orb2des --orb-in=$ID.iod.orb --orb-out=$ID.iod.des
+cat $ID.iod.des | nicedes | column -t
+echo
+
+# Findobj it.
+echo findobj:
+echo findobj --window=14 --det $ID.iod.des 
+findobj --window=14 --det $ID.iod.des | column -t
+
+
+# Ephemerides.
+echo
+echo Ephemerides:
+/home/denneau/MOPS/3RDPARTY/oorb/main/oorb --conf=/home/mops/MOPS_STABLE/config/oorb.conf --code=F51 --task=ephemeris --epoch-mjd-tt=56000 --timespan=+2 --step=.01 --orb-in=$ID.iod.orb 
+
+# Cleanup.
+cd $WD
+/bin/rm -rf $TEMPDIR

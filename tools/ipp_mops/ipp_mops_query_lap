@@ -1,0 +1,238 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+ipp_mops_query - query disposition of IPP-MOPS filesets
+
+=head1 SYNOPSIS
+
+ipp_mops_query [options] --chunks 'CHUNK1 CHUNK2'
+ipp_mops_query [options] --nn NIGHTNUM
+ipp_mops_query --name 'o5437g0023o'
+ipp_mops_query --date 2010 09 26
+
+  --chunks CHUNK1 CHUNK2 : show files with matching chunk names fragments
+  --nn NIGHTNUM : show files for night NIGHTNUM
+  --name NAME : show files with matching exposure name
+  --date DATE : show files for date DATE, 'today' or 'today-2' allowed
+  --summary : summary IPP <-> MOPS differences
+  --fullnames : show full file paths
+
+=head1 DESCRIPTION
+
+Given a search specification, list files staged in the MOPS_STAGE
+repository from the IPP-MOPS datastore.  Indicate whether files exist
+on the MOPS side so that they can be ingested.
+
+Examples:
+
+ipp_mops_query --name 'o5437g0023o'
+ipp_mops_query --chunk 132.OSS.A1 132.OSS.A2
+ipp_mops_query --date 2010 09 26
+ipp_mops_query --summary --today
+ipp_mops_query --summary --nn 55467 --chunk M31
+
+=cut
+
+use strict;
+use warnings;
+
+use File::Basename;
+use Getopt::Long;
+use Pod::Usage;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::IPPDB;
+use PS::MOPS::Lib qw(:all);
+
+
+our $F51_GMT_OFFSET_HOURS = -10;                    # PS1 HST - GMT
+#our $STAGE_DIR = '/data/mops01.0/MOPS_STAGE/diff/IPP-MOPS';     # XXX config it?
+our $STAGE_DIR = '/data/mops01.0/MOPS_STAGE/lap/IPP-MOPS';     # XXX config it?
+our $IGNORE = 'qtfocus|stare|pointing';             # ignore exposures with these comments
+
+my $debug;
+my $chunk;
+my $name;
+my $nn;
+my $summary;
+my $fullnames;
+my $help;
+my $date;
+GetOptions(
+    debug => \$debug,
+    chunk => \$chunk,
+    name => \$name,
+    'nn=i' => \$nn,
+    date => \$date,
+    summary => \$summary,
+    fullnames => \$fullnames,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+
+my $dbh = PS::MOPS::IPPDB::dbh();
+my @exp_names;
+my %exp_data;
+my $exp;
+my %seen;
+my $href;
+
+
+# If the first arg looks like a date, set $date.
+if (@ARGV and ($ARGV[0] =~ /^20\d\d/ or $ARGV[0] =~ /^today/)) {
+    $date = 1;      # looks like date
+}
+
+if ($date) {
+    # The following code lets us say
+    #   ipp_mops_query 2010 9 26
+    # and converts this to 2010-09-26
+    my $date_str;
+    my @datestuff;
+
+    if ($ARGV[0] =~ /^today(.*)/) {
+        my $t0 = time;
+        if ($1) {
+            $t0 += $1 * 86400;
+        }
+
+        my @t = localtime($t0);
+        $date_str = sprintf("%4d-%02d-%02d", $t[5] + 1900, $t[4] + 1, $t[3]);
+    }
+    else {
+        $date_str = join('-', @ARGV);    # want 2010-03-07 e.g.
+        @datestuff = split /-/, $date_str;
+        $date_str = sprintf("%4d-%02d-%02d", @datestuff);
+    }
+
+    # List all exposures for specified night.
+    my $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select exp_name, comment from rawExp 
+where (not comment regexp('$IGNORE')) and exp_type='OBJECT' and (dateobs between '$date_str' and adddate('$date_str', 1))
+order by exp_name
+SQL
+    $sth->execute or die $sth->errstr;
+    while ($href = $sth->fetchrow_hashref) {
+        unless ($seen{$href->{exp_name}}++) {
+            push @exp_names, $href->{exp_name};
+            $exp_data{$href->{exp_name}} = $href->{comment};
+        }
+    }
+}
+elsif ($chunk) {
+    my $sql;
+    foreach my $chunk_fragment (@ARGV) {
+        # Select exposures in the IPP rawExp table matching the chunk name fragmenets.
+        #my $re = quotemeta($chunk_fragment);
+        my $re = $chunk_fragment;
+        my $nn_str = '';
+        if ($nn) {
+            my $tjdfrag = 'o' . (int($nn - 50000) + 1);
+            $nn_str = "and exp_name regexp('^$tjdfrag')";
+        }
+        my $sql = <<"SQL";
+select exp_name, comment from rawExp 
+where (not comment regexp('$IGNORE')) and exp_type='OBJECT' and comment like '%$re%' $nn_str
+order by exp_name
+SQL
+        my $sth = $dbh->prepare($sql) or die $dbh->errstr;
+        $sth->execute or die $sth->errstr;
+        while ($href = $sth->fetchrow_hashref) {
+            unless ($seen{$href->{exp_name}}++) {
+                push @exp_names, $href->{exp_name};
+                $exp_data{$href->{exp_name}} = $href->{comment};
+            }
+        }
+    }
+}
+elsif ($nn) {
+    # List all exposures for specified night.
+    my $tjdfrag = 'o' . (int($nn - 50000) + 1);
+    my $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select exp_name, comment from rawExp 
+where (not comment regexp('$IGNORE')) and exp_type='OBJECT' and exp_name regexp('^$tjdfrag')
+order by exp_name
+SQL
+    $sth->execute or die $sth->errstr;
+    while ($href = $sth->fetchrow_hashref) {
+        unless ($seen{$href->{exp_name}}++) {
+            push @exp_names, $href->{exp_name};
+            $exp_data{$href->{exp_name}} = $href->{comment};
+        }
+    }
+}
+elsif ($name) {
+    foreach my $name (@ARGV) {
+        # List all exposures for specified night.
+        my $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select exp_name, comment from rawExp 
+where (not comment regexp('$IGNORE')) and exp_type='OBJECT' and exp_name regexp('^$name')
+order by exp_name
+SQL
+        $sth->execute or die $sth->errstr;
+        while ($href = $sth->fetchrow_hashref) {
+            unless ($seen{$href->{exp_name}}++) {
+                push @exp_names, $href->{exp_name};
+                $exp_data{$href->{exp_name}} = $href->{comment};
+            }
+        }
+    }
+}
+else {
+    pod2usage(-verbose => 3);
+}
+
+# Got our data from IPP rawExp table.
+my %in_mops = find_mops(@exp_names);
+if ($fullnames) {
+    print map { $in_mops{$_}->{FULL} . "\n" } grep { $in_mops{$_} } @exp_names if @exp_names;
+}
+elsif ($summary) {
+    print "MOPS IPP COMMENT\n";
+    printf "%s %s %s\n", ($in_mops{$_}->{TARGET} || 'UNFOUND'), $_, $exp_data{$_} foreach @exp_names;
+}
+else {
+    print join(' ', grep { $in_mops{$_}->{TARGET} } @exp_names), "\n" if @exp_names;
+}
+
+exit;
+
+sub find_mops {
+    # Given a list of exposures, find them in MOPS land and return
+    # a hash whose keys are found exposures.
+    my (@exp_names) = @_;
+    my %found;
+    my $mjd;
+    my $nn;
+    my $ocnum;
+    my $path;
+    my $target;
+
+    # Convert exp_name to a nn and ocnum to find file.
+    foreach $exp (@exp_names) {
+        if ($exp =~ /^o(\d\d\d\d)/) {
+            $mjd = 50000 + $1;
+            $nn = $mjd - 1;
+            $ocnum = mopslib_mjd2ocnum($mjd);
+            $path = "$STAGE_DIR/$ocnum/$nn/$exp";
+            if (-l $path) {
+                $target = readlink($path);
+                $target =~ s|^.*/||;
+                $found{$exp} = {
+                    FULL => $path,
+                    TARGET => $target,
+                };      # found file
+            }
+        }
+        else {
+            $found{$exp} = {
+                FULL => '???',
+                TARGET => '???',
+            };           # unknown file
+        }
+    }
+
+    return %found;
+}

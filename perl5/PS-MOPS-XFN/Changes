@@ -1,0 +1,6 @@
+Revision history for Perl extension PS::MOPS::XFN.
+
+0.01  Fri Sep 30 16:26:06 2005
+	- original version; created by h2xs 1.23 with options
+		-AX PS::MOPS::XFN
+

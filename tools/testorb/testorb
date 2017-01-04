@@ -1,0 +1,152 @@
+#!/usr/bin/perl
+# $Id$
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+use File::Temp;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DX;
+use PS::MOPS::DC::DerivedObject;
+use PS::MOPS::DC::Tracklet;
+
+
+# Forward sub declarations.
+use subs qw(
+);
+
+
+my $inst;
+my $instance_name;
+
+my $iod;
+my $iod_program;
+my $iod_threshold_arcsec;
+
+my $diffcor_program;
+my $diffcor_threshold_arcsec;
+
+my $covariance;
+my $no_cleanup;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    iod => \$iod,
+    'iod_program=s' => \$iod_program,
+    'iod_threshold_arcsec=f' => \$iod_threshold_arcsec,
+    'diffcor_program=s' => \$diffcor_program,
+    covariance => \$covariance,
+    no_cleanup => \$no_cleanup,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help or !@ARGV;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+
+# Configuration.
+$iod_threshold_arcsec ||= $mops_config->{linkod}->{iod_threshold_arcsec}
+    or die "can't get iod_threshold_arcsec";
+
+$diffcor_threshold_arcsec ||= $mops_config->{linkod}->{diffcor_threshold_arcsec}
+    or die "can't get diffcor_threshold_arcsec";
+
+my $id;
+my @tracklets;
+foreach $id (@ARGV) {
+    if ($id =~ /^\d+$/) {
+        # Numeric ID, so assume tracklet ID
+        my $trk = modct_retrieve($inst, trackletId => $id);
+        die("Couldn't fetch tracklet $id") unless $trk;
+        push @tracklets, $trk;
+    }
+    elsif ($id =~ /^L/) {
+        my $do = modcdo_retrieve($inst, objectName => $id);
+        die("Couldn't fetch derived object $id") unless $do;
+        push @tracklets, $do->fetchTracklets();
+    }
+    elsif ($id =~ /=/) {
+        # Looks like track ID, so split on = into tracklet IDs.
+        push @tracklets, modct_retrieve($inst, trackletId => $_) foreach split /=/, $id;
+    }
+    else {
+        die("Unknown ID $id");
+    }
+}
+
+# Output all tracklets to a tmp DES file.
+my $root = 'FOO';
+my $tempdir;
+my $oldwd = getcwd;
+if ($no_cleanup) {
+    $tempdir = File::Temp::tempdir('tmp.testorb.XXXX', CLEANUP => 0);
+}
+else {
+    $tempdir = File::Temp::tempdir('/tmp/XXXXXXXX', CLEANUP => 1);
+}
+my $fh;
+
+chdir $tempdir or die "can't chdir to $tempdir";
+$fh = new FileHandle(">$root.tracks");
+my $det;
+foreach $det (sort { $a->epoch <=> $b->epoch } map { @{$_->detections} } @tracklets) {
+    $det->detId($root);
+    print $fh modx_toDETECTION($det), "\n";
+}
+close $fh;
+
+$fh = new FileHandle(">$root.sum");
+print $fh 'FOO', ' ', $_->trackletId, "\n" foreach @tracklets;
+close $fh;
+
+# Generate input files for OD.
+my $cmd = 'dxlt2iodreq';
+system($cmd, "$root.sum") == 0 or die "$cmd failed: $?";
+
+# Now invoke orbit determination.
+
+$iod_program ||= $mops_config->{orbit_determination}->{iod_program};
+$diffcor_program ||= $mops_config->{orbit_determination}->{diffcor_program};
+
+if ($iod) {
+    system($iod_program, $root) == 0 or die "$iod_program failed: $?";
+}
+else {
+    $covariance =  $covariance ? '--covariance' : '';
+    $cmd = "$iod_program $root | tee $root.iod | $diffcor_program $covariance - $root.tracks $root.orbits > testorb.stdout; cat $root.orbits";
+    system($cmd) == 0 or die "OD failed: $cmd\n$?";
+}
+chdir $oldwd or warn "can't restore old working directory $oldwd";
+exit 0;
+
+=pod
+
+=head1 NAME
+
+testorb - test orbit determination on a set of tracklets or a derived object and tracklet
+
+=head1 SYNOPSIS
+
+testorb [options] TRACKLET_ID1 TRACKLET_ID2 ...
+
+  --iod : compute IOD only
+  --iod_program : override IOD program from config
+  --covariance : emit covariance matrix
+  --com : emit orbit in DES cometary format, otherwise MOPS MIF-O/MIF-OC
+  --help : show man page
+
+=head1 DESCRIPTION
+
+Compute an orbit from the specified tracklet IDs and emit the computed orbit in
+MIF-O format.  The emitted orbit can then be piped to ephem using
+
+  testorb ID1 ID2 ID2 | ephem --mjd 54100 --obscode 568
+
+=cut

@@ -1,0 +1,105 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::MITI;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::Orbit;
+
+
+# Options.
+my $inst;
+my $instance_name;
+my $help;
+
+
+use subs qw(
+    _modulate_orbit
+    _out
+);
+
+
+# Start program here.
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+pod2usage(2) unless @ARGV;              # no files specified
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_logger = $inst->getLogger;
+my $filename = shift;                   
+
+my $last_link_id = '';                  # obj name of previous line; tells us we're on new object
+my @current_detections;                 # accumulated list of detections for a track
+my %current_object_names;               # accumulated detection object names for a track
+my $line;
+
+my $fh = new FileHandle $filename or die "can't open $filename";
+while ($line = <$fh>) {
+    my %items = miti_parse($line);
+    unless ($items{OBJECT_NAME}) {
+        warn "can't get fake IOD for anonymous detection ID " . $items{ID} . "\n";
+        next;
+    }
+
+    if (!$line or ($last_link_id and ($items{ID} ne $last_link_id))) {
+        # process current object, then start a new one.
+        _out();
+
+        @current_detections = ();
+        %current_object_names = ();
+        $last_link_id = $items{ID};
+    }
+    else {
+        # repeat ID, so keep accumulating.
+        push @current_detections, \%items;
+        $current_object_names{$items{OBJECT_NAME}} = 1;       # keep track of different detetion object names
+        $last_link_id = $items{ID};
+    }
+}
+_out();
+exit;
+
+
+sub _out {
+    if (keys %current_object_names == 1) {
+        # single object, so look up in SSM table and emit orbit.
+        my $name = $current_detections[0]->{OBJECT_NAME};
+        my $id = $current_detections[0]->{ID};
+        my $ssm = modcs_retrieve($inst, objectName => $name);
+        $ssm = _modulate_orbit($ssm);
+        my $fake_rms = sprintf("%.6f", 0.1 + abs(mopslib_rndGaussian(0, .1)));
+#        print miti_format_orbit($ssm), " ", join(" ", $id, $fake_rms), "\n";
+
+        my $orb = PS::MOPS::DC::Orbit->new($inst,
+            orbitId => $id,
+            objectName => $id,
+            q => $ssm->q,
+            e => $ssm->e,
+            i => $ssm->i,
+            node => $ssm->node,
+            argPeri => $ssm->argPeri,
+            timePeri => $ssm->timePeri,
+            hV => $ssm->hV,
+            epoch => $ssm->epoch,
+            residual => 0.0001,          # default almost zero residual
+            convCode => 'I',
+        );
+        print $orb->serialize(), "\n";
+    }
+}
+
+
+sub _modulate_orbit {
+    my $ssm = shift;
+    return $ssm;
+}
+

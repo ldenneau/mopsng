@@ -1,0 +1,83 @@
+#!/usr/bin/env python
+
+"""
+Read in a MIF-O or DES orbit and compute an ephemeris uncertainty.
+"""
+
+import sys
+import os
+import optparse
+import numpy
+import ssd
+
+import MOPS.Instance
+import MOPS.DerivedObject
+import MOPS.Field
+
+
+USAGE = """\
+Usage: object_ephm [options] --field_id=ID OBJECT_NAME
+
+    OBJECT_NAME : MOPS derived object name
+    --field_id ID : field ID to show
+    --help : show this manpage
+
+Show a plot of this object in the specified field, including
+information about the ephemeris uncertainty.
+"""
+
+if __name__ == "__main__": 
+    # Get user input (tracks file) and make sure that it exists.
+    parser = optparse.OptionParser(USAGE)
+    parser.add_option('--field_id',
+                      dest='field_id',
+                      type='int',
+                      help="field to use for prediction")
+    parser.add_option('--orbit_id',
+                      dest='orbit_id',
+                      type='int',
+                      help="orbit to predict")
+    parser.add_option('--instance',
+                      dest='instance_name',
+                      type='string',
+                      help="MOPS database instance name")
+
+    # Ger the command line options and also whatever is passed on STDIN.
+    options, args = parser.parse_args()
+
+    # Make sure that we have what we need.
+    if not options.field_id:
+        parser.error('--field_id=ID must be specified.')
+
+    inst = MOPS.Instance.Instance(dbname=options.instance_name or os.environ['MOPS_DBINSTANCE'])
+    dbh = inst.get_dbh()
+
+    field = MOPS.Field.Field.fetch(dbh, field_id=options.field_id)
+    eph_obscode = field.obscode
+    eph_mjds = numpy.array([field.mjd])
+
+    if options.orbit_id:
+        o = MOPS.Orbit.Orbit.retrieve(dbh, options.orbit_id)
+    else:
+        if len(args) < 1:
+            parser.error('OBJECT_NAME must be specified.')
+
+        dobj = MOPS.DerivedObject.DerivedObject.fetch(dbh, derivedObjectName=args[0])
+        o = dobj.orbit
+
+    orbit_elems = numpy.array([
+        o.q, o.e, o.i, o.node, o.argPeri, o.timePeri
+    ])
+
+    eph = ssd.ephemerides(
+        orbit_elems,
+        o.epoch,
+        eph_mjds,
+        eph_obscode,
+        o.h_v,
+        covariance=o.src
+    )
+    
+    print " ".join(['RA_DEG', 'DEC_DEG', 'MAG', 'EPOCH_MJD', 'RA_SIG_ARCSEC', 'DEC_SIG_ARCSEC', 'UNC_SMAA_ARCSEC', 'UNC_SMIA_ARCSEC', 'UNC_PA_DEG'])
+    for res in eph:
+        print " ".join([("%f" % x) for x in res])

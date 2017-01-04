@@ -1,0 +1,23 @@
+==================================================
+Source Code Distribution of neos
+
+Software produced by: The Auton Lab, www.autonlab.org
+Copyright (C) Carnegie Mellon University
+==================================================
+
+This package contains the source code needed to build neos.  The
+main application is in the neos/ subdirectory.  The other directories
+contain supporting library code.
+
+To build neos:
+
+cd neos
+make t=fast   
+
+Note: running make without arguments will build a debug version of the
+software.
+
+Documentation on running the software as well as example datasets
+should be available in the neos/ subdirectory. 
+
+

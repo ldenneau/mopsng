@@ -1,0 +1,8 @@
+IPP forgot to implement the 30 JUN 2012 leap second, and as a result,
+all MJDOBS are reported one second earlier then actual.  This is true
+only for exposures observed between 56136 < epoch_mjd < 56241 (MOPS
+night numbers 56135-56239 inclusive) that were processed before 09
+NOV 2012 UT.
+
+Need to generate a script to update all detection epochs, as the std
+SQL takes too long.

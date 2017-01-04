@@ -1,0 +1,137 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+=head1 NAME
+
+devcoords - script to print device coordinates of MOPS tracklets and detections
+
+=head1 SYNOPSIS
+
+devcoords ID1 [ID2 ...]
+
+  ID: detection or tracklet descriptor, e.g. T11853293, D11853293
+
+=head1 DESCRIPTION
+
+This program calls John Tonry's pscoords program to compute device
+coordinates given a PS1 exposure definition and detection position
+in RA/DEC.  The OTA and cell IDs are emitted, as is the position within
+a cell.
+
+=head1 FLAGS
+
+A flags column is emitted, indicating special information about the
+position based on knowledge of camera performance.  The flags are
+
+    N : nothing to report
+    C : crosstalk OTA/cell
+
+=head1 CROSSTALK
+
+Chris waters provided these rules for determining crosstalk candidates.
+
+    OTA2yXY3v <=> OTA3yXY3v
+    OTA4yXY3v <=> OTA5yXY3v
+
+    OTA2yXY5v <=> OTA2yXY6v
+    OTA5yXY5v <=> OTA5yXY6v
+
+=cut
+
+# Just a stub for quick debugging.
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+
+
+my $out = 'cell';   # can be OTA
+my $brief;
+my $instance_name;
+my $help;
+GetOptions(
+    brief => \$brief,
+    'out=s' => $out,
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+
+
+# Given a tracklet or detection specifier, report device coordinates for the detection
+# using John Tonry's pscoords.
+
+my @dets;
+my $header;
+foreach my $id (@ARGV) {
+    my $det;
+    if ($id =~ /^T(\d+)$/) {
+        my $trk = modct_retrieve($inst, trackletId => $1);
+        push @dets, @{$trk->detections};
+    }
+    elsif ($id =~ /^D(\d+)$/) {
+        $det = modcd_retrieve($inst, detId => $1);
+        push @dets, $det;
+    }
+    else {
+        warn qq{Don't understand id "$id".\n};
+        next;
+    }
+
+    unless ($header) {
+        if ($brief) {
+            print "OTA CELL X Y FLAGS\n";
+        }
+        else {
+            print "DET_ID RA_DEG DEC_DEG OTA CELL X Y FLAGS\n";
+        }
+        $header = 1;
+    }
+    for $det (@dets) {
+        my $stuff = pscoords($det);
+        my @foo = split /\s+/, $stuff;
+        my $flags = join('', make_flags(@foo));
+        if ($brief) {
+            print join(' ', @foo, $flags), "\n";
+        }
+        else {
+            print join(' ', $det->detId, sprintf("%.4f", $det->ra), sprintf("%.4f", $det->dec), @foo, $flags), "\n";
+        }
+    }
+}
+exit;
+
+
+sub pscoords {
+    my ($det) = @_;
+    my $field = modcf_retrieve($inst, fieldId => $det->fieldId);
+    my ($fra, $fdec, $fpa) = ($field->ra, $field->dec, $field->pa_deg);
+    my ($dra, $ddec) = ($det->ra, $det->dec);
+    my $cmd = "echo $dra $ddec | pscoords out=$out in=sky ra=$fra dec=$fdec pa=$fpa dx=0 dy=0 dpa=0 optics=ps";
+    return `$cmd`;
+}
+
+
+sub make_flags {
+    my @flags;
+    my ($ota, $cell, $x, $y) = @_; # pscoords output
+    if ($ota =~ /^[2345]/ and $cell =~ /^3/) {
+        push @flags, 'C';
+    }
+    elsif ($ota =~ /^2/ and $cell =~ /^[56]/) {
+        push @flags, 'C';
+    }
+    elsif ($ota =~ /^5/ and $cell =~ /^[56]/) {
+        push @flags, 'C';
+    }
+
+    return @flags || 'N';
+}

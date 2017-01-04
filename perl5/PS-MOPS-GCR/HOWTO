@@ -1,0 +1,21 @@
+need gcf dir with
+  gcf/gcf.c
+  gcf/gcf.h
+  gcf/Makefile.PL
+
+then
+
+  $ mkdir PS-MOPS-GCR
+  $ rsync gcf PS-MOPS-GCR
+  $ h2xs -O -n PS::MOPS::GCR ./PS-MOPS-GCR/gcf/gcf.h
+  # clean up PS-MOPS-GCR.xs
+  # edit Makefile.PL
+    MYEXTLIB => 'gcf/libgcf$(LIB_EXT)',
+
+sub MY::postamble {
+'
+$(MYEXTLIB): gcf/Makefile
+	cd gcf && $(MAKE) $(PASSTHRU)
+';
+}
+

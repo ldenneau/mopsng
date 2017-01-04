@@ -1,0 +1,6 @@
+Changes
+Makefile.PL
+MANIFEST
+README
+t/PS-MOPS-DX.t
+lib/PS/MOPS/DX.pm

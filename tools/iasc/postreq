@@ -1,0 +1,36 @@
+#!/usr/bin/env perl 
+
+# create a postage stamp request file to get full chip images for
+# a given exposure
+# post it to the server with label WEB
+
+use strict; 
+use warnings;
+use POSIX qw( strftime );
+
+my $exp_name = shift;
+die "need exposure name\n" if !$exp_name;
+
+my $datestr = strftime "%Y%m%dT%H%M%S", gmtime;
+
+# request name must be unique add datetime
+my $req_name = "$exp_name.$datestr";
+
+# make the request file
+my $cmd = "psmkreq --req_type byexp --stage chip --pixcenter --x 0 --y 0 --width 0 --height 0 --id $exp_name --req_name $req_name";
+
+print "running $cmd\n";
+my $rc = system $cmd;
+
+die "psmkreq failed" if $rc;
+
+# add the request to the database
+my $postcmd = "pstamptool -dbname ippRequestServer -dbserver ippc17 -label WEB -addreq -uri $ENV{PWD}/$req_name.fits";
+
+print "running $postcmd\n";
+
+my $req_id = `$postcmd`;
+chomp $req_id;
+
+print "posted $req_name req_id: $req_id\n";
+print "results will be at http://datastore.ipp.ifa.hawaii.edu/pstampresults/$req_name\n";

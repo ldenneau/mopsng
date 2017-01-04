@@ -1,0 +1,45 @@
+#!	/bin/bash
+
+usage () {
+	echo "Usage: $0 <jobname>"
+        echo " the directory ./jobname must exist already "
+        echo " and the file jobname.opt must be in . , if required"
+	exit 1
+}
+
+if [ $# -lt 1 ]
+then
+    echo 'no jobname supplied' >&2
+	usage
+fi
+
+DIR=pass1
+
+if test -d $DIR
+then
+    echo "directory $DIR ready" >&2
+else
+    echo 'directory $DIR not ready'>&2
+    usage
+fi
+
+cd $DIR
+echo $1 > jobname
+#time orbit_server.x < jobname > $1.cons
+orbit_server.x < jobname > $1.cons
+touch $1.err
+cd ..
+
+if test -f $DIR/$1.done
+then  
+#     /bin/mv $1.log $1.cons $1.done $1.err $1.secrep $DIR/
+#     /bin/cp -p $1.opt $DIR/
+#     if test -f $1.in2.tracklet ; then
+#        /bin/cp $1.in2.tracklet $DIR/
+#     fi
+     echo 'done job '$1 >&2
+#     ./sec_res $1
+else
+     echo 'problems with orbit_server, job '$1 >&2
+     exit 2
+fi

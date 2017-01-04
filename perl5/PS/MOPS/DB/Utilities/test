@@ -1,0 +1,10 @@
+#!/usr/bin/env perl
+
+use warnings;
+use strict;
+
+use PS::MOPS::DB::Utilities ':all';
+
+my $MOPS_HOME = $ENV{MOPS_HOME} || '';
+print modc_initialize("$MOPS_HOME/config/mops.config"), "\n";
+print modcv_full(), "\n";

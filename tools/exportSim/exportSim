@@ -1,0 +1,343 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use FileHandle;
+use Getopt::Long;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Instance;
+
+my $worry;
+my $ssm;
+my $phase = 1;
+my $ocnum;
+my $known;      # export specifically for KNOWN_SERVER processing
+my $name;       # job name to write, default MOPS instance name
+my $raw_tracks;
+GetOptions(
+    worry => \$worry,
+    ssm => \$ssm,
+    'phase=i' => \$phase,
+    known => \$known,
+    'name=s' => \$name,
+#    'ocnum=i' => \$ocnum,
+    raw_tracks => \$raw_tracks,
+) or pod2usage(2);
+#pod2usage(-message => '--ocnum is required') unless $ocnum;
+
+if ($known) {
+    $phase = 1;
+    $ssm = 1;
+};
+
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => undef);
+my $mops_config = $inst->getConfig('backend');
+my $DB_HOST = $mops_config->{backend}->{hostname} || die "can't get DB hostname";
+my $dbh = $inst->dbh;
+my $sql;
+my $line;
+my $cmd;
+my $tid;
+my $det_id;
+my $dbname = $inst->dbname;
+my $where = '';         # set to select results from certain fields.
+my $tracklet_fh;
+my @manifest_files;
+
+
+#print STDERR $dbname;
+print STDERR "You are asking for phase $phase in DB $dbname...\n";
+#exit
+
+$name ||= $dbname;          # default if not yet set
+
+
+
+if ($phase == 1 or $phase == 3) {
+
+# All tracklets.
+
+    print STDERR "Writing tracklets...";
+    $sql = "select ta.tracklet_id, ta.det_id from tracklet_attrib ta, detections d where ta.det_id=d.det_id";
+
+    push @manifest_files, "$name.in.tracklet_pointer";
+    $tracklet_fh = new FileHandle ">$name.in.tracklet_pointer";
+    print $tracklet_fh <<"HEADER";
+!!TRACKLET_ID DET_ID
+HEADER
+    close $tracklet_fh;
+    $cmd = qq{echo "$sql" | mysql -umops -pmops -h$DB_HOST $dbname | perl -ne 'print unless /^tracklet_id/' | sed 's/\t/ /g' >> $name.in.tracklet_pointer};
+    system $cmd;
+    print STDERR "done.\n";
+
+}
+
+
+if ($phase == 1) {
+
+# Detections.
+
+    print STDERR "Writing detections...";
+#    $sql = "select det_id, epoch_mjd, 'O', ra_deg, dec_deg, mag, filter_id, obscode, ra_sigma_deg * 3600, dec_sigma_deg * 3600, mag_sigma, s2n, object_name from detections d";
+    $sql = "select d.det_id, d.epoch_mjd, 'O', d.ra_deg, d.dec_deg, format(d.mag, 6), d.filter_id, d.obscode, d.ra_sigma_deg * 3600, d.dec_sigma_deg * 3600, d.mag_sigma, d.s2n, if(d.object_name is null, 'FALSE', d.object_name) from detections d";
+
+    push @manifest_files, "$name.in.detection";
+    my $det_fh = new FileHandle ">$name.in.detection";
+    print $det_fh <<"HEADER";
+!!OID TIME_MJD OBS_TYPE RA_DEG DEC_DEG APPMAG FILTER OBSERVATORY RA_RMS DEC_RMS MAG_RMS S2N SECRET
+HEADER
+    close $det_fh;
+    $cmd = qq{echo "$sql" | mysql -umops -pmops -h$DB_HOST $dbname | perl -ne 'print unless /^det_id/' | sed 's/\t/ /g' >> $name.in.detection};
+    #print $cmd, "\n";
+    system $cmd;
+    print STDERR "done.\n";
+
+# SSM.
+    if ($ssm) {
+        print STDERR "Writing SSM...";
+        push @manifest_files, "ssm.orbit";
+        system('catOrbits --ssm --format=COM > ssm.orbit');
+        print STDERR "done.\n";
+        warn $? if $?;
+    }
+
+
+
+# Unattributed ("leftover") tracklets.
+
+    print STDERR "Writing leftover tracklets...";
+    $sql = "select ta.tracklet_id, ta.det_id from tracklets t, tracklet_attrib ta, detections d where t.tracklet_id=ta.tracklet_id and ta.det_id=d.det_id and t.status='$TRACKLET_STATUS_UNATTRIBUTED'";
+
+    push @manifest_files, "$name.in.leftovers";
+    $tracklet_fh = new FileHandle ">$name.in.leftovers";
+    print $tracklet_fh <<"HEADER";
+!!TRACKLET_ID DET_ID
+HEADER
+    close $tracklet_fh;
+    $cmd = qq{echo "$sql" | mysql -umops -pmops -h$DB_HOST $dbname | perl -ne 'print unless /^tracklet_id/' | sed 's/\t/ /g' >> $name.in.leftovers};
+    #print $cmd, "\n";
+    system $cmd;
+    print STDERR "done.\n";
+
+}
+
+
+if ($phase == 2) {
+
+# Generate raw_tracks file.
+    if ($raw_tracks || !-f 'raw_tracks') {
+        print STDERR "Generating raw_tracks file...";
+        my $MOPS_VAR = $ENV{MOPS_VAR} || die "no \$MOPS_VAR in environment.\n";
+#    my $ocnum_str = sprintf "%03d", $ocnum;
+        system(qq(for i in `find $MOPS_VAR/lodctl -type f | grep tracks\$`; do cat \$i >> stuff; done; cut -d' ' -f1 stuff | uniq > raw_tracks; rm stuff));
+        print STDERR "done.\n";
+    }
+
+# Tracks and request header.
+    print STDERR "Counting detections in tracklets...";
+    my %ttable;
+    my $thang;
+
+    my $tt_fh = new FileHandle "$name.in.tracklet_pointer";
+    while ($thang = <$tt_fh>) {
+        ($tid, $det_id) = split ' ', $thang;
+        if (!exists($ttable{$tid})) {
+            $ttable{$tid} = 1;          # first time seen tracklet
+        }
+        else {
+            $ttable{$tid}++;            # inc num detections/tracklet
+        }
+    }
+    close $tt_fh;
+    print STDERR "done.\n";
+
+
+# Attributions.  To prevent duplication in reporting, we obtain the original
+# tracklets used to create the derived object and mark those tracks as seen 
+# so that the track reporter (below) does not report them.
+    my (@ids);
+    my $numd;
+    my $numt;
+    my $go;             # whether to print track or not.
+    
+    print STDERR "Writing attributions...";
+    my %seen_tracks_table;      # records tracks we have seen in attr
+    my ($id, $oid);
+
+    push @manifest_files, "$name.in.attributions";
+    my $attributions_fh = new FileHandle ">$name.in.attributions";
+    print $attributions_fh <<"HEADER";
+!!ID_OID NID TRACKLET_IDS OP_CODE N_OBS N_SOLUTIONS N_NIGHTS ARC_TYPE NO_RADAR PARAM(4)
+HEADER
+        my $do_ref = $dbh->selectcol_arrayref("select distinct h.derivedobject_id from history h where h.event_type in ('A', 'P') and h.classification <> 'X'");
+    foreach $id (@{$do_ref}) {
+        # Assemble linkage ID from all tracklet IDs.
+        @ids = @{$dbh->selectcol_arrayref('select tracklet_id from derivedobject_attrib where derivedobject_id=? order by tracklet_id', undef, $id)};
+        $oid = join('=', @ids);
+        
+        # Count detections.
+        $numt = scalar @ids;
+        $numd = 0;
+        $go = 1;
+        foreach (@ids) {
+            $det_id = $ttable{$_};
+            unless ($det_id) {
+                warn "Can't locate det_id for track $line\n";
+                $go = 0;
+                last;
+            }
+            $numd += $ttable{$_};
+        }
+        print $attributions_fh "$oid $numt " . join(' ', @ids) . " REQUEST_ORBIT $numd 0 0 0 0 0. 0. 0. 0.\n";
+
+        # Obtain the original creation tracklets.
+        @ids = @{$dbh->selectcol_arrayref('select hd.tracklet_id from history_derivations hd, history h where hd.event_id=h.event_id and h.derivedobject_id=? order by hd.tracklet_id', undef, $id)};
+        $oid = join('=', @ids);
+        $seen_tracks_table{$oid} = 1;       # mark this track as seen
+    }
+    close $attributions_fh;
+    print STDERR "done.\n";
+    
+
+# All other proposed tracks.
+    print STDERR "Writing tracks and request_header...";
+
+    push @manifest_files, "$name.in.track_pointer";
+    my $track_fh = new FileHandle ">$name.in.track_pointer";
+    print $track_fh <<"HEADER";
+!!TRACK_ID TRACKLET_ID
+HEADER
+
+    push @manifest_files, "$name.in.request";
+    my $request_fh = new FileHandle ">$name.in.request";
+    print $request_fh <<"HEADER";
+!!ID_OID NID TRACKLET_IDS OP_CODE N_OBS N_SOLUTIONS N_NIGHTS ARC_TYPE NO_RADAR PARAM(4)
+HEADER
+    my %seen;
+    my $raw_fh = new FileHandle 'raw_tracks';
+    while ($line = <$raw_fh>) {
+        chomp $line;
+
+        # If worry is set, then keep track of whether we've seen the track already.
+        # Otherwise we'll assume that somebody else uniquified the tracks.
+        if (!$seen_tracks_table{$line} and (!$worry or !$seen{$line})) {
+            $seen{$line} = 1 if $worry;
+            @ids = split '=', $line;
+            $numt = scalar @ids;
+            
+            # Request.
+            $numd = 0;
+            $go = 1;
+#        $numd += $ttable{$_} foreach @ids;  # count detections in tracklets
+            foreach (@ids) {
+                $det_id = $ttable{$_};
+                unless ($det_id) {
+                    warn "Can't locate det_id for track $line\n";
+                    $go = 0;
+                    last;
+                }
+                $numd += $ttable{$_};
+            }
+
+            if ($go) {
+                # Print track_pointer lines.
+                foreach $tid (@ids) {
+                    print $track_fh "$line $tid\n";
+                }
+                # Print request line.
+                print $request_fh "$line $numt " . join(' ', @ids) . " REQUEST_ORBIT $numd 0 0 0 0 0. 0. 0. 0.\n";
+            }
+        }
+    }
+    print STDERR "done.\n";
+
+}
+
+if ($phase == 3) {
+
+
+# Tracks and request header.
+    print STDERR "Counting detections in tracklets...";
+    my %ttable;
+    my $thang;
+    my $tt_fh = new FileHandle "$name.in.tracklet_pointer";
+    while ($thang = <$tt_fh>) {
+        ($tid, $det_id) = split ' ', $thang;
+        if (!exists($ttable{$tid})) {
+            $ttable{$tid} = 1;          # first time seen tracklet
+        }
+        else {
+            $ttable{$tid}++;            # inc num detections/tracklet
+        }
+    }
+    close $tt_fh;
+    print STDERR "done.\n";
+
+    my (@ids);
+    my (@orbit);
+    my $numd;
+    my $numt;
+    my $go;
+    
+    print STDERR "Writing tracklets...";
+    my ($id, $oid);
+
+    push @manifest_files, "$name.out.ident_header";
+    my $identified_tracklets_fh = new FileHandle ">$name.out.ident_header";
+    print $identified_tracklets_fh <<"HEADER";
+!!ID_OID NID TRACKLET_IDS OP_CODE N_OBS N_SOLUTIONS N_NIGHTS ARC_TYPE NO_RADAR PARAM(4)
+HEADER
+    push @manifest_files, "$name.out.orbit";
+    my $identified_orbits_fh = new FileHandle ">$name.out.orbit";
+    print $identified_orbits_fh <<"HEADER";
+!!OID FORMAT q e i Omega argperi t_p H t_0 INDEX N_PAR MOID COMPCODE
+HEADER
+    my $do_ref = $dbh->selectcol_arrayref("select distinct h.derivedobject_id from history h where h.classification <> 'X'");
+    foreach $id (@{$do_ref}) {
+        # Assemble linkage ID from all tracklet IDs.
+        @ids = @{$dbh->selectcol_arrayref('select tracklet_id from derivedobject_attrib where derivedobject_id=? order by tracklet_id', undef, $id)};
+        $oid = join('=', @ids);
+        
+        # Count detections.
+        $numt = scalar @ids;
+        $numd = 0;
+        $go = 1;
+        foreach (@ids) {
+            $det_id = $ttable{$_};
+            unless ($det_id) {
+                warn "Can't locate det_id for track $line\n";
+                $go = 0;
+                last;
+            }
+            $numd += $ttable{$_};
+        }
+
+        # Print tracklet file
+        print $identified_tracklets_fh "$oid $numt " . join(' ', @ids) . " ORBIT $numd 0 0 0 0 0. 0. 0. 0.\n";
+
+
+        @orbit = @{$dbh->selectrow_arrayref('select o.q, o.e, o.i, o.node, o.arg_peri, o.time_peri, o.h_v, o.epoch from orbits o, derivedobjects do where o.orbit_id=do.orbit_id and derivedobject_id=?', undef, $id)};
+
+        # Print orbit file
+        print $identified_orbits_fh "$oid COM " . join(' ', @orbit) . " 1 6 -1 MOPS\n";
+        
+    }
+    close $identified_tracklets_fh;
+    close $identified_orbits_fh;
+    print STDERR "done.\n";
+
+
+    # Add addl .out.* files to manifest.
+    push @manifest_files, "$name.out.orbit", "$name.out.ident_header";
+}
+
+my $fh = new FileHandle ">>$name.manifest";
+push @manifest_files, "$name.manifest";
+print $fh map { $_ . "\n" } @manifest_files;
+close $fh;
+
+exit;

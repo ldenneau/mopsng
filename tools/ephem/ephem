@@ -1,0 +1,211 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Pod::Usage;
+use Getopt::Long;
+use FileHandle;
+use File::Temp qw(tempfile tmpnam);
+use Math::Trig;
+
+use Astro::SLA;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Orbit;
+use PS::MOPS::JPLEPH;
+use PS::MOPS::DX;
+
+
+use subs qw(
+    get_inp
+    do_ephem
+);
+
+my $inst;
+my $instance_name;
+my $epoch_mjd;          # date to calc ephemeris
+my $obscode;
+my $format = 'DES';
+my $header;             # emit header
+my $out;                # output file (optional)
+my $debug;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'epoch_mjd=f' => \$epoch_mjd,
+    'mjd=f' => \$epoch_mjd,
+    'obscode=s' => \$obscode,
+    'header' => \$header,
+    'out=s' => \$out,
+    debug => \$debug,
+    'format=s' => \$format,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-message => "EPOCH_MJD is required.\n") unless $epoch_mjd;
+pod2usage(-message => "OBSCODE is required.\n") unless $obscode;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+
+
+# Assemble our input and call JPL ephemeris module.
+my ($fh, $filename) = tempfile(UNLINK => 1);
+my $dummy = *SAVESTDOUT;    # prevent Perl warning
+my $line;
+my $orbdata;
+my $orbhash;
+my $orb;
+my $res;
+
+open SAVESTDOUT, '>&STDOUT';    # hackery to redirect DIVA STDOUT to /dev/null
+open STDOUT, ">/dev/null";
+
+if ($header) {
+    print <<"HEADER";
+OBJECT_NAME EPOCH_MJD RA_DEG DEC_DEG MAG
+HEADER
+}
+
+while (defined($line = <>)) {
+    if ($line =~ /^!!/) {
+        # Auto-detect DES, then skip DES header line.
+        $format = 'DES';
+        next;
+    }
+    elsif ($line =~ /^!/) {
+        next;           # comment
+    }
+    elsif ($line =~ /^MIF-O/) {
+        $format = 'MIF';    # auto-detect MIF as well
+    }
+
+    undef $orb;
+    if ($format eq 'COM' or $format eq 'DES') {
+        $orbdata = modx_fromORBIT($line);
+        @{$orb}{qw(q e i node argPeri timePeri hV epoch orbitId)} = 
+            @{$orbdata}{qw(q e i Omega argperi t_p H t_0 OID)};
+    }
+    elsif ($format eq 'MIF') {
+        @{$orb}{qw(dummy orbitId q e i node argPeri timePeri epoch hV)} = split /\s+/, $line;
+        delete ${$orb}{dummy};
+    }
+    elsif ($format eq 'MITI') {
+        @{$orb}{qw(q e i node argPeri timePeri hV epoch orbitId)} = split /\s+/, $line;
+    }
+    else {
+        $inst->getLogger()->logdie("Unknown output format specified: $format\n");
+    }
+    $orb = PS::MOPS::DC::Orbit->new($inst, %{$orb});
+    $res = jpleph_calcEphemeris(
+        orbit => $orb,
+        epoch_mjd => $epoch_mjd,
+        obscode => $obscode,
+    );
+
+    my $ddays = 1.0;
+    my $res2 = jpleph_calcEphemeris(
+        orbit => $orb,
+        epoch_mjd => $epoch_mjd + $ddays,
+        obscode => $obscode,
+    );
+    unless ($res->{errcod}) {
+        my ($spv_dd, $pa_deg);
+        my $dist_deg = rad2deg(slaDsep(deg2rad($res->{ra}), deg2rad($res->{dec}), deg2rad($res2->{ra}), deg2rad($res2->{dec})));
+        $spv_dd = $dist_deg / $ddays;
+        $pa_deg = rad2deg(slaBear(deg2rad($res->{ra}), deg2rad($res->{dec}), deg2rad($res2->{ra}), deg2rad($res2->{dec})));
+        print $fh join(" ", @{$res}{qw(objectName epoch ra dec mag)}, $spv_dd, $pa_deg), "\n";
+    }
+    elsif ($debug) {
+        print $fh join(" ", $res->{objectName}, $res->{errcod}), "\n";
+    }
+}
+close $fh;
+
+$fh = new FileHandle $filename;
+open STDOUT, '>&SAVESTDOUT';
+while (<$fh>) {
+    print $_;
+}
+close $fh;
+
+exit;
+
+
+sub get_inp {
+    my ($inpfile) = @_;
+    my @inp;
+    if ($inpfile) {
+        # Input file specified, so slurp it.
+        open my $inpfh, $inpfile or die "can't open input file $inpfile";
+        @inp = <$inpfh>;        # slurp it
+        close $inpfh;
+    }
+    else {
+        @inp = <>;              # slurp all STDIN
+    }
+
+    # Add epoch and station (observatory code) to input.  genEphem2 wants
+    #   q e i node argPeri timePeri hV epoch ephemEpoch obsCode objectName
+    # But input is
+    #   q e i node argPeri timePeri hV epoch objectName
+
+    # Invoke genEphem2 
+    my @fixinp;     # modified input containing eph epoch and station
+    my @goo;
+    foreach my $line (@inp) {
+        chomp $line;
+        @goo = split /\s+/, $line;
+        splice @goo, 8, 0, ($epoch_mjd, $obscode);
+        push @fixinp, join(" ", @goo) . "\n";
+    }
+
+    return @fixinp;
+}
+
+
+=head1 NAME
+
+ephem - Wrapper for genEphem2 (JPL SSD1 ephemeris generation)
+
+=head1 SYNOPSIS
+
+ephem [options] --mjd DATE_MJD [infile]
+
+  --mjd DATE_MJD : calculate ephemeris for specified date
+  --obscode OBSCODE : use OBSCODE as station/observatory code, default 568 (Mauna Kea)
+  --header : emit header
+  --out OUTFILE : write output to OUTFILE instead of STDOUT
+  infile : option input file; use STDIN if not specified
+
+Examples:
+
+  ephem --mjd 53377 < obs_file > ephemfile
+  ephem infile > ephemfile
+  ephem --out ephemfile < infile
+  ephem --out ephemfile infile
+
+=head1 DESCRIPTION
+
+This program wraps the execution of the ephem.x executable so that the
+caller does not have to worry about home directory and STDOUT issues.
+The problem is that the JPL libraries (mostly DIVA) contain code that
+spews noise to STDOUT.
+
+The wrapped version manages temporary files and routes input and
+output in flexible and standard fashion to STOUT.
+
+The input file is a list of orbital parameters.
+
+Output is a single line containing the ephemeris:
+
+    Object name/ID
+    Epoch (MJD)
+    RA (deg)
+    DEC (deg)
+    Magnitude
+
+=head1 BUGS
+
+The JPL executable is hard-coded as "genEphem2".  The name of this
+program may change.
+
+=cut

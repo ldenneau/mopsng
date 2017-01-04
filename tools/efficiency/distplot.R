@@ -1,0 +1,5 @@
+foundns21 <- read.table('sstfv/ns2.5861.founddist', header=F)
+foundnc4s1 <- read.table('noconv_4sigma.5861.founddist', header=F)
+plot(foundnc4s1$V2, foundnc4s1$V3, col='purple', pch=20, cex=.5, main='Distance to matching detection', xlab='w mag', ylab='Distance, arcseconds')
+points(foundns21$V2, foundns21$V3, pch=20, col='black', cex=.5)
+legend(15.2,4.4,c('IPP-MOPS', 'NOCONV+4SIGMA'),col=c('black','purple'),pch=c(19,19))

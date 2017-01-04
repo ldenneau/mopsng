@@ -1,0 +1,19 @@
+#!/bin/bash
+
+NN=$1
+
+if [ "$NN" == "" ]; then
+   echo "<Usage>: resubmit_stamps <night number>"
+   echo "  e.g.: resubmit_stamps 56829"
+   exit 1
+fi
+
+submit_stamps --direct --log --field_status=T --type=diff --nn=$NN --quads --derived --czarpairs
+submit_stamps --direct --log --field_status=T --fuzzy --type=diff --nn=$NN
+submit_stamps --direct --log --field_status=T --type=diff --nn=$NN --unknownfuzzy
+submit_stamps --direct --log --field_status=T --type=diff --nn=$NN --knownfuzzy
+
+submit_stamps --direct --log --field_status=U --type=diff --nn=$NN --quads --derived --czarpairs
+submit_stamps --direct --log --field_status=U --fuzzy --type=diff --nn=$NN
+submit_stamps --direct --log --field_status=U --type=diff --nn=$NN --unknownfuzzy
+submit_stamps --direct --log --field_status=U --type=diff --nn=$NN --knownfuzzy

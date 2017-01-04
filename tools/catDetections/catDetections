@@ -1,0 +1,102 @@
+#!/usr/bin/env perl
+# $Id: catDetections 2327 2008-02-07 01:52:42Z denneau $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::MITI;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::History::Derivation;
+use PS::MOPS::DC::DerivedObject;
+use PS::MOPS::DC::Tracklet;
+
+my $inst;
+my $instance_name;
+my $event_ids;
+my $det_ids;
+my $help;
+GetOptions(
+    'instance_name=s' => \$instance_name,
+    event_ids => \$event_ids,
+    det_ids => \$det_ids,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+pod2usage(2) unless @ARGV;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+
+my $det_i;
+my $det;
+my $id;
+
+
+while ($id = shift) {
+    if ($id =~ /^${DERIVEDOBJECT_NAME_PREFIX}/) {
+        my $do = modcdo_retrieve($inst, objectName => $id);
+        foreach my $det ($do->fetchDetections) {
+            print miti_format_det($det);
+        }
+    }
+    if ($id =~ /^E\d+/ or $event_ids) {  
+        # aritifical efficiency prefix, or pure numeric
+        $id =~ s/^E//;  # strip leading artifical E prefix
+        my $h = modchd_retrieve($inst, eventId => $id);
+        if ($h) {
+            my $trk;
+            my $trk_id;
+            foreach $trk_id (@{$h->trackletIds}) {
+                $trk = modct_retrieve($inst, trackletId => $trk_id);
+                foreach my $det (@{$trk->detections}) {
+                    $det->detId($det->objectName or $MOPS_NONSYNTHETIC_OBJECT_NAME);
+                    print miti_format_det($det);
+                }
+            }
+        }
+    }
+    elsif ($det_ids) {
+        $det = modcd_retrieve($inst, detId => $id);
+        print miti_format_det($det);
+    }
+    else {
+        # Default is to treat args as SSM names.
+        $det_i = modcd_retrieve($inst, objectName => $id);
+        while (defined($det = $det_i->next)) {
+            print miti_format_det($det);
+        }
+    }
+};
+
+
+=head1 NAME
+ 
+catDetections - Output PSMOPS detections by name, ID, date, field
+ 
+=head1 SYNOPSIS
+ 
+catDetections [options] [--help] ID1 ID2 ...
+
+  ID1, ID2 : SSM or derived object name, or detection ID, or event ID
+  --det_ids : treat IDs as detection IDs
+  --event_ids : treat IDs as event IDs
+  --help : show manpage
+
+=head1 DESCRIPTION
+
+Prints out detections in MITI format.  One or more IDs are required.
+If ID begins with the letter L, it is treated as a derivedobject ID
+and all detections belonging to the derived object are retrieved.
+If --det_ids is specified, then the IDS are treated as individual
+detection IDs.  If --event_ids is specified, then the IDs are treated
+as event IDs.  Otherwise the ID is assumed to be a SSM object name,
+and the SSM object's detections are retrieved.
+
+=head1 NOTES
+
+=cut
+

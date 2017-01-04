@@ -1,0 +1,182 @@
+#!/usr/bin/perl
+# $Id$
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+
+use Astro::Time;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+
+
+# Forward sub declarations.
+use subs qw(
+);
+
+
+my $inst;
+my $instance_name;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help or !@ARGV;
+
+my $local_offset_hours = 0;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+if ($inst) {
+    $local_offset_hours = $inst->getConfig()->{site}->{gmt_offset_hours};
+}
+
+my $is_mjd;
+my $is_ocnum;
+my $is_localdate;
+my $is_utcdate;
+my $header_str = <<"HEADER";
+OCNUM START_MJD END_MJD MJD LOCAL UTC
+HEADER
+
+my $date;
+my $inp_timestr;
+
+foreach my $date (@ARGV) {
+    my $ocnum = '';
+    my $start_mjd = ''; # oc start mjd
+    my $end_mjd = '';   # oc end mjd
+    my $mjd = '';
+    my $localtimestr = '';
+    my $utctimestr = '';
+
+    if ($date =~ /Z/) {
+        $is_utcdate = 1;
+    }
+    elsif ($date =~ /T/) {
+        $is_localdate = 1;
+    }
+    elsif ($date =~ /^(\d\d\d\d-\d\d-\d\d)$/) {
+        $is_localdate = 1;
+        $date = "$1T";
+    }
+    elsif ($date >= 40000) {
+        $is_mjd = 1;
+    }
+    elsif ($date < 500) {
+        $is_ocnum = 1;
+    }
+    else {
+        warn(qq{Can't figure out "$date".});
+        next;
+    }
+
+    if ($is_mjd) {
+        $mjd = $date;
+        $ocnum = mopslib_mjd2ocnum($mjd);
+        $start_mjd = mopslib_ocnum2mjd($ocnum);
+        $end_mjd = mopslib_ocnum2mjd($ocnum + 1) - 1;
+        $localtimestr = mopslib_mjd2localtimestr($mjd, $local_offset_hours);
+        $utctimestr = mopslib_mjd2localtimestr($mjd, 0);
+        $utctimestr =~ s/T/Z/;
+    }
+    elsif ($is_ocnum) {
+        $ocnum = $date;
+        $mjd = mopslib_ocnum2mjd($ocnum);
+        $start_mjd = $mjd;
+        $end_mjd = mopslib_ocnum2mjd($ocnum + 1) - 1;
+        $localtimestr = mopslib_mjd2localtimestr($mjd, $local_offset_hours);
+        $utctimestr = mopslib_mjd2localtimestr($mjd, 0);
+        $utctimestr =~ s/T/Z/;
+    }
+    elsif ($is_localdate or $is_utcdate) {
+        $inp_timestr = $date;
+        my ($date_str, $day_str) = split /T|Z/, $inp_timestr;
+
+        my $day;
+        my $month;
+        my $year;
+
+        my $ut = 0;     # day fraction
+        if ($day_str) {
+            unless ($day_str =~ /^(\d\d):(\d\d):(.*)$/) {
+                warn("Strange time specification: $day_str");
+                next;
+            }
+            $ut = ($1 * 3600 + $2 * 60 + $3) / 86400;
+        }
+
+        unless ($date_str =~ /^(\d\d\d\d)-(\d\d)-(\d\d)$/) {
+            warn("Strange date specification: $date_str");
+            next;
+        }
+        else {
+            $year = $1;
+            $month = $2;
+            $day = $3;
+        }
+
+        $mjd = cal2mjd($day, $month, $year, $ut);
+        if ($is_localdate) {
+            $mjd -= $local_offset_hours / 24;
+        }
+
+        $ocnum = mopslib_mjd2ocnum($mjd);
+        $start_mjd = mopslib_ocnum2mjd($ocnum);
+        $end_mjd = mopslib_ocnum2mjd($ocnum + 1) - 1;
+        $localtimestr = mopslib_mjd2localtimestr($mjd, $local_offset_hours);
+        $utctimestr = mopslib_mjd2localtimestr($mjd, 0);
+        $utctimestr =~ s/T/Z/;
+    }
+
+    if ($header_str) {
+        print $header_str;
+        $header_str = undef;
+    }
+
+    print join(' ', 
+        $ocnum, 
+        $start_mjd,
+        $end_mjd,
+        $mjd,
+        $localtimestr,
+        $utctimestr,
+    ), "\n";
+}
+
+exit 0;
+
+=pod
+
+=head1 NAME
+
+dateinfo - print out information about a date
+
+=head1 SYNOPSIS
+
+dateinfo [date]
+
+  --help : show man page
+
+dateinfo MJD
+dateinfo OCNUM
+dateinfo UTC_DATE_STR
+dateinfo LOCAL_DATE_STR
+
+=head1 DESCRIPTION
+
+Given a date, print out various representations of the date: MJD,
+OCNUM, local and UTC date strings.  Try to determine the source
+date by its value.
+
+Time strings should have format
+
+2009-12-18T02:45:00
+2009-12-18Z02:45:00
+
+where 'T' indicates a local time and 'Z' indicates UTC.
+
+=cut

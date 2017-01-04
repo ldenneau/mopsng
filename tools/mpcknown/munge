@@ -1,0 +1,800 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+munge - integrate MPC catalogs into MOPS database
+
+=head1 SYNOPSIS
+
+munge [options] OBSFILES
+
+  OBSFILES : MPC-formatted observation files
+  --comet : comets only
+  --mpcorb : get orbits from MPCORB, otherwise mpn.txt, mpu.txt, mpo.txt
+  --verbose : noisy progress output
+  --debug : dump data, don't insert anything
+  --help : show this manpage
+
+Options:
+
+  --sql : emit SQL statements, don't modify DB directly
+
+=head1 DESCRIPTION
+
+=cut
+
+
+use strict;
+use warnings;
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use Math::Trig qw/acos/;
+use Astro::Time;
+use Astro::SLA;
+
+# Just a stub for quick debugging.
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::MPC qw(:all);
+use PS::MOPS::DC::Instance;
+#use PS::MOPS::DC::Detection;
+#use PS::MOPS::DC::Tracklet;
+
+
+# Start program here.
+my $instance_name;
+my $sql;
+my $comet;
+my $mpcorb;
+my $verbose;
+my $debug;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'sql=s' => \$sql,
+    comet => \$comet,           # comets only
+    verbose => \$verbose,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+
+
+# First read all our orbits files.
+my %orbits;
+
+my $line;
+my $seen;
+my @fields;
+my $orb;
+my $file;
+my $sqlfh;
+my $MOPS_HOME = $ENV{MOPS_HOME};
+
+print STDERR "Reading ids.\n";
+my %idmap;              # map a desig to master desig
+my %revidmap;           # list of alternate names for a master desig
+create_id_maps(\%idmap, \%revidmap);
+
+
+my $fh;
+my $n;
+if (!$comet) {
+    my @orbfiles;
+    if ($mpcorb) {
+        @orbfiles = ('MPCORB.DAT');
+    }
+    else {
+        @orbfiles = ('mpn.txt', 'mpu.txt', 'mpo.txt', 'mp1.txt');
+    }
+
+    for $file (@orbfiles) {
+        $fh = new FileHandle $file or die "can't open $file";
+        $n = 0;
+        while (defined($line = <$fh>)) {
+            if ($mpcorb) {
+                # MPCORB files have a bunch of header stuff, skip.
+                if ($line =~ /^----/ or $line =~ /^Object/) {
+                    $seen = 1;      # start of data
+                    next;
+                }
+                elsif ($line =~ /^\s*$/) {
+                    next;   # blank, skip
+                }
+                next unless $seen;
+            }
+
+            chomp $line;
+            $orb = mpcorb_to_obj($line); 
+            if (!$orb) {
+                warn "problem with line: $line\n";
+                next;
+            }
+            if (!$orb->{H}) {
+                warn "H missing for object $orb->{desig}\n";
+                next;
+            }
+            if (!$orb->{G}) {
+                $orb->{G} = 0.15;   # ugh
+            }
+
+            $orbits{$orb->{desig}} = $orb;
+            $n++;
+        }
+        $fh->close();
+        print STDERR "Found $n orbits in $file.\n" if $verbose;
+    }
+}
+
+
+# JPL comet orbits.
+$file = 'ELEMENTS.COMET';
+$fh = new FileHandle $file or die "can't open $file";
+$n = 0;
+while (defined($line = <$fh>)) {
+    if ($line =~ /^----/ or $line =~ /^Object/) {
+        $seen = 1;      # start of data
+        next;
+    }
+    elsif ($line =~ /^\s*$/) {
+        next;   # blank, skip
+    }
+    next unless $seen;
+
+    chomp $line;
+    $orb = jplcometorb_to_obj($line); 
+    if (!$orb) {
+        warn "problem with line: $line\n";
+        next;
+    }
+    if (exists($orbits{$orb->{desig}})) {
+        warn("Ignoring repeat comet $orb->{desig}.\n");
+    }
+    if (!$orb->{H}) {
+        warn "H missing for object $orb->{desig}; using H=10\n";
+        $orb->{H} = 10;
+    }
+    if (!$orb->{G}) {
+        $orb->{G} = 0.04;   # ugh
+    }
+    $orbits{$orb->{desig}} = $orb;
+}
+
+
+# MPC comet orbits.
+$file = 'CometEls.txt';
+$fh = new FileHandle $file or die "can't open $file";
+$n = 0;
+while (defined($line = <$fh>)) {
+    chomp $line;
+    $orb = cometorb_to_obj($line); 
+    if (!$orb) {
+        print STDERR "problem with line: $line\n";
+        next;
+    }
+    if (!$orb->{H}) {
+        print STDERR "H missing for object $orb->{desig}; using H=10\n";
+        $orb->{H} = 10;
+    }
+    if (!$orb->{G}) {
+        $orb->{G} = 0.04;   # ugh
+    }
+
+    # If the orbit is already present, it was found in the JPL file.  So just substitute the mag.
+    if (exists($orbits{$orb->{desig}})) {
+        print STDERR "Replacing H, G for $orb->{desig}.\n";
+        $orbits{$orb->{desig}}->{H} = $orb->{H};
+        $orbits{$orb->{desig}}->{G} = $orb->{G};
+    }
+    else {
+        $orbits{$orb->{desig}} = $orb;
+    }
+    $n++;
+}
+$fh->close();
+print STDERR "Found $n orbits in $file.\n" if $verbose;
+
+
+if ($sql) {
+    $sqlfh = new FileHandle ">$sql" or die "Can't create file $sql\n";
+}
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbname = $inst->dbname;
+my $logger = $inst->getLogger();
+my $dbh = $inst->dbh;
+
+my $obsfh = new FileHandle ">obs.des" or die "can't create obs.des";
+print $obsfh <<"DES";
+!!OID TIME OBS_TYPE RA DEC APPMAG FILTER OBSERVATORY RMS_RA RMS_DEC RMS_MAG S2N Secret_name
+DES
+my $orbfh = new FileHandle ">orb.des" or die "can't create orb.des";
+print $orbfh <<"DES";
+!!OID FORMAT q e i Omega argperi t_p H t_0 INDEX N_PAR MOID COMPCODE
+DES
+
+# SQL stub to lookup a detection by detection-tracklet search (slow).
+my $lookup_trk_sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+/* args are epoch1_mjd, epoch2_mjd, dec, dec, ra */
+select tracklet_id 
+from detections d join tracklet_attrib ta using(det_id) join tracklets t using(tracklet_id) join fields f on t.field_id=f.field_id
+where (f.epoch_mjd between ? and ?)
+and abs(
+    degrees(
+        /* spherical distance from tracklet to target field center */
+        acos(least(1.0, /* handle slight roundoff error causing arg > 1.0 */
+            sin(radians(d.dec_deg)) * sin(radians(?))
+            + cos(radians(d.dec_deg)) * cos(radians(?)) * cos(radians(d.ra_deg - ?))
+        ))
+    )
+) < 0.000555 /* 2 arcsec */
+SQL
+
+
+# SQL stub to lookup a detection by in the submitted obs table (faster).
+my $lookup_sub_sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+/* args are MJD1, MJD2, P1.dec, P2.dec, P1.dec, P2.dec, P1.ra, P2.ra */
+select tracklet_id, det_id, dbname, fpa_id, filter_id
+from export.mpc_sub m
+where (m.epoch_mjd between ? and ?)
+/* and m.dbname='$dbname' */
+and abs(
+    degrees(
+        /* spherical distance from tracklet to target field center */
+        acos(least(1.0, /* handle slight roundoff error causing arg > 1.0 */
+            sin(radians(m.dec_deg)) * sin(radians(?))
+            + cos(radians(m.dec_deg)) * cos(radians(?)) * cos(radians(m.ra_deg - ?))
+        ))
+    )
+) < 0.000555 /* 2 arcsec */
+SQL
+
+# SQL stub to lookup FPA_ID only.
+my $lookup_fpa_sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+/* args are MJD1, MJD2 */
+select fpa_id
+from export.mpc_sub m
+where (m.epoch_mjd between ? and ?)
+SQL
+
+
+
+# First read all the MPC-formatted detections and arrange into 
+# designations (tracklets).
+my $tracklets;
+my %seen_tracklet;
+my %seen_orbit;
+my %de2mpcdet;
+my $k;  # temp key
+
+while (my $in_file = shift) {
+    die "can't read $in_file" unless -r $in_file;
+    print STDERR "Reading $in_file" if $verbose;
+    my $in_fh = new FileHandle $in_file;
+
+    my $n = 0;
+    while (my ($desig, $det, $line) = read_det($in_fh)) {
+        next unless $desig;
+        last if $in_fh->eof();
+
+        # Look up det in DB.
+        my $found_desig;
+        if (!exists($orbits{$desig})) {
+            # Try to look up orbit in ID map, might be dbl or identification.
+            my $new_desig = $idmap{$desig};
+            if (!$new_desig) {
+                warn "Missing orbit for $desig.\n";
+                next;
+            }
+            else {
+                print STDERR "Found ID: $desig => $new_desig.\n";
+                $desig = $new_desig;
+            }
+        }
+        else {
+            # Try to get just the FPA ID.
+        }
+        my $orb = $orbits{$desig};
+        if (!$orb) {
+            warn "No orbit for $desig.\n";
+            next;
+        }
+
+        if (!exists($seen_orbit{$desig})) {
+            emit_orb_des($orbfh, $desig, $orb);
+            emit_names_sql($sqlfh, $desig, $revidmap{$desig});
+            emit_orb_sql($sqlfh, $desig, $orb) if $sqlfh;
+            $seen_orbit{$desig} = 1;
+        }
+
+        if (my $trk = lookup_det($det)) {
+            # Determine some addl information about the object.
+            print STDERR "$desig => $trk->{dbname}/T$trk->{tracklet_id}/D$trk->{det_id}\n";
+            $det->{trk} = $trk;
+            emit_trk_des($obsfh, $desig, $det, $trk, $orb);
+        }
+        else {
+            my ($fpa) = lookup_fpa($det);
+            if (!$fpa) {
+                warn "No FPA for $desig/$det->{epoch_mjd}: $line";
+                next;
+            }
+            # Reported observation with no MOPS tracklet.
+            emit_trk_des($obsfh, $desig, $det, $trk, $orb);
+        }
+
+
+        $k = sprintf("$desig-%11.5f", $det->{epoch_mjd});
+        $de2mpcdet{$k} = $det;      # lookup det given desig and epoch
+
+        if ($n % 10000 == 0) {
+            print STDERR "...$n" if $verbose;
+        }
+        $n++;
+    }
+    print STDERR "done.\n" if $verbose;
+}
+
+
+$lookup_trk_sth->finish;
+$lookup_sub_sth->finish;
+$lookup_fpa_sth->finish;
+
+$orbfh->close;
+$obsfh->close;
+
+
+# Now oorb stuff.
+#print STDERR "Computing ephemerides...\n";
+#system("oorb --task=ephemeris --G=0.15 --code=F51 --conf=$MOPS_HOME/config/oorb.conf --obs-in=obs.des --orb-in=orb.des > oorb.raw") == 0
+#    or die $?;
+#print STDERR "Computing true anomalies...\n";
+#system("./oorb2trueanom orb.des oorb.raw > oorb.out") == 0
+#    or die $?;
+
+print STDERR "oorbing it...\n";
+system("sh oorb.sh") == 0
+    or die $?;
+
+# Now we have to read stuff back in, get true anomaly, then schmush into SQL for DB insert.
+if ($sqlfh) {
+    print STDERR "Writing SQL...\n";
+    my @oorb_files = <*.oorb.out>;
+    for my $oorb_file (@oorb_files) {
+        my $oorbfh = new FileHandle $oorb_file or die "can't open $oorb_file";
+        $line = <$oorbfh>;
+        die "can't read header" unless defined($line);
+        $line =~ s/^!+//;
+        $line =~ s/^#+//;
+        my @heads = split /\s+/, $line;
+        while (defined($line = <$oorbfh>)) {
+            chomp($line);
+            my @vals = split /\s+/, $line;
+            my %d;
+            @d{@heads} = @vals;
+            $k = sprintf("$d{Designation}-%11.5f", $d{'MJD_UTC/UT1'});
+            my $det = $de2mpcdet{$k} or die "lookup of $k failed";
+            @{$det}{qw(r_AU delta_AU alpha_deg sol_elong_deg true_anom_deg)} = @d{qw(r Delta Phase SolarElon TrueAnom)};
+
+            # Write it!
+            emit_det_sql($sqlfh, $d{Designation}, $det, $det->{trk});
+        }
+        $oorbfh->close;
+    }
+}
+exit;
+
+
+#################################
+
+
+sub emit_names_sql {
+    my ($fh, $desig, $alt) = @_;
+
+    print $fh <<"SQL";
+/* Desig: $desig */
+insert into mpc_desigs (mpc_desig, alt_desig) values ("$desig", "$desig");
+SQL
+
+    return unless $alt;
+    for my $alt_name (@{$alt}) {
+        if ($alt_name && $alt_name ne $desig) {
+            $alt_name =~ s/'/\\'/;  # Convert quotes to escaped SQL quote
+            print $fh <<"SQL";
+insert into mpc_desigs (mpc_desig, alt_desig) values ("$desig", "$alt_name");
+SQL
+        }   
+    }
+}
+
+
+sub emit_orb_sql {
+    my ($fh, $desig, $orb) = @_;
+    my $ln = defined($orb->{longname}) ? qq{"$orb->{longname}"} : "NULL";
+    print $fh <<"SQL";
+insert into mpc_orb (mpc_desig, longname, q, e, i, node, arg_peri, time_peri, epoch, h_v) values ("$desig", $ln, $orb->{q_AU}, $orb->{e}, $orb->{i_deg}, $orb->{node_deg}, $orb->{argPeri_deg}, $orb->{timePeri_mjd_UTC}, $orb->{epoch_mjd_UTC}, $orb->{H}) on duplicate key update mpc_desig="$desig", longname=$ln, q=$orb->{q_AU}, e=$orb->{e}, i=$orb->{i_deg}, node=$orb->{node_deg}, arg_peri=$orb->{argPeri_deg}, time_peri=$orb->{timePeri_mjd_UTC}, epoch=$orb->{epoch_mjd_UTC}, h_v=$orb->{H};
+SQL
+
+}
+
+
+sub emit_det_sql {
+    my ($fh, $desig, $mpc_det, $trk) = @_;
+    my ($dbname_str, $det_id_str, $trk_id_str, $fpa_id_str) = qw(NULL NULL NULL NULL);
+    if ($trk) {
+        $dbname_str = "'$trk->{dbname}'";
+        $det_id_str = $trk->{det_id};
+        $trk_id_str = $trk->{tracklet_id};
+        $fpa_id_str = "'$trk->{fpa_id}'";
+    }
+
+
+    warn "desig not defined" unless defined($desig);
+    warn "fpa_id_str not defined" unless defined($fpa_id_str);
+    warn "dbname_str not defined" unless defined($dbname_str);
+    warn "det_id_str not defined" unless defined($det_id_str);
+    warn "trk_id_str not defined" unless defined($trk_id_str);
+    warn "mpc_det->{ra} not defined" unless defined($mpc_det->{ra});
+    warn "mpc_det->{dec} not defined" unless defined($mpc_det->{dec});
+    warn "mpc_det->{filter_id} not defined" unless defined($mpc_det->{filter_id});
+    warn "mpc_det->{mag} not defined" unless defined($mpc_det->{mag});
+    warn "mpc_det->{obscode} not defined" unless defined($mpc_det->{obscode});
+    warn "mpc_det->{r_AU} not defined" unless defined($mpc_det->{r_AU});
+    warn "mpc_det->{delta_AU} not defined" unless defined($mpc_det->{delta_AU});
+    warn "mpc_det->{alpha_deg} not defined" unless defined($mpc_det->{alpha_deg});
+    warn "mpc_det->{sol_elong_deg} not defined" unless defined($mpc_det->{sol_elong_deg});
+    warn "mpc_det->{true_anom_deg} not defined" unless defined($mpc_det->{true_anom_deg});
+    warn "mpc_det->{discovery} not defined" unless defined($mpc_det->{discovery});
+
+    $det_id_str = "NULL /* $desig */" unless defined($det_id_str);
+    $trk_id_str = "NULL /* $desig */" unless defined($trk_id_str);
+
+    print $fh <<"SQL";
+/* $desig $mpc_det->{epoch_mjd} */
+insert into mpc_obs (mpc_desig, fpa_id, epoch_mjd, ra_deg, dec_deg, filter_id, mag, obscode, r_au, delta_au, alpha_deg, sol_elong_deg, true_anom_deg, dbname, det_id, tracklet_id, discovery) values ('$desig', $fpa_id_str, $mpc_det->{epoch_mjd}, $mpc_det->{ra}, $mpc_det->{dec}, '$mpc_det->{filter_id}', $mpc_det->{mag}, '$mpc_det->{obscode}', $mpc_det->{r_AU}, $mpc_det->{delta_AU}, $mpc_det->{alpha_deg}, $mpc_det->{sol_elong_deg}, $mpc_det->{true_anom_deg}, $dbname_str, $det_id_str, $trk_id_str, $mpc_det->{discovery});
+SQL
+}
+
+
+sub emit_orb_des {
+    my ($fh, $desig, $orb) = @_;
+    my $e = $orb->{e};
+    if ($e == 1) { 
+        $e += .00000000001;         # OORB does not like e = 1 exactly
+    }
+    print $fh <<"DES";
+$desig COM $orb->{q_AU} $e $orb->{i_deg} $orb->{node_deg} $orb->{argPeri_deg} $orb->{timePeri_mjd_UTC} $orb->{H} $orb->{epoch_mjd_UTC} 1 6 -1 MOPS
+DES
+}
+
+
+sub emit_trk_des {
+    my ($fh, $desig, $mpc_det, $trk, $orb) = @_;
+    my $filt = $trk->{filter_id} || 'V';        # guess if no filter
+    print $fh <<"DES";
+$desig $mpc_det->{epoch_mjd} O 0 0 0 $filt $mpc_det->{obscode} 0 0 0 0 NA
+DES
+}
+
+
+sub emit {
+    my ($desig, $trk_id) = @_;
+    print "$desig => $trk_id\n";
+}
+
+
+sub read_det {
+    my ($fh) = @_;
+    my $line = <$fh>;
+    if ($line) {
+        chomp $line;
+#        return undef if !$line or $line =~ /^\s*$/ or $line =~ /^[A-Z]/;
+        return undef if !$line or $line =~ /^\s*$/;
+
+
+        my $foo = PS::MOPS::MPC::mpc_split($line);
+        my $desig = grok_desig($line) or die "couldn't get a number/designation from $line";
+        my $det = {
+            desig => $desig,
+            epoch_mjd => date2mjd($foo->{DATE}),
+            ra => str2deg($foo->{RA}, 'H'),
+            dec => str2deg($foo->{DEC}, 'D'),
+            mag => $foo->{MAG},
+            filter_id => $foo->{BAND},
+            obscode => $foo->{OBSERVATORY},
+            line => $line,
+            discovery => (substr($line, 12, 1) eq '*' ? 1 : 0),
+        };
+        return ($desig, $det, $line);
+    }
+    return (undef, undef, undef);
+}
+
+
+sub lookup_det {
+    my ($det) = @_;
+    $lookup_sub_sth->execute(
+        $det->{epoch_mjd} - 5 / 1000, 
+        $det->{epoch_mjd} + 5 / 1000, 
+        $det->{dec}, $det->{dec}, $det->{ra}
+    ) or die $lookup_sub_sth->errstr;
+    my ($near) = $lookup_sub_sth->fetchrow_hashref();
+    return $near;
+}
+
+
+sub lookup_fpa {
+    my ($det) = @_;
+    $lookup_fpa_sth->execute(
+        $det->{epoch_mjd} - 5 / 100_000, 
+        $det->{epoch_mjd} + 5 / 100_000, 
+    ) or die $lookup_fpa_sth->errstr;
+    my ($near) = $lookup_fpa_sth->fetchrow_hashref();
+    return $near;
+}
+
+
+sub date2mjd {
+    # Given an MPC date string, return an FPA id for the nearest PS1 
+    # exposure within +/- 1 sec.  Date format is
+    # 2011 01 23.23452
+    my ($date) = @_;
+    $date =~ s/^\s+|\s+$//g;    # strip
+    my ($y, $m, $d) = split /\s+/, $date;
+    my $df = ($d - int($d));
+    $d = int($d);
+    my $mjd = cal2mjd($d, $m, $y, $df);
+    return $mjd;
+}
+
+
+sub grok_desig {
+    # Given an MPC obs string, get a comet or asteroid name.
+    my ($line) = @_;
+    my $type = substr($line, 4, 1);
+    my $desig;
+    if ($type =~ /P|C|D/) {
+        # Comet.
+        $desig = substr($line, 0, 4);
+        $desig =~ s/ +//g;
+        if ($desig) {
+            $desig .= $type;
+        }
+        else {
+            $desig = substr($line, 5, 7);
+            $desig =~ s/ +//g;
+            return undef unless $desig;
+            $desig = $type . $desig;
+        }
+    }
+    else {
+        $desig = substr($line, 0, 5);
+        $desig =~ s/ +//g;
+        if (!$desig) {
+            $desig = substr($line, 5, 7);
+            $desig =~ s/ +//g;
+        }
+    }
+    return $desig;
+}
+
+
+sub cometorb_to_obj {
+    my ($line) = @_;
+    my ($number, $type, $provisional, $tp_year, $tp_month, $tp_day, $q_AU, $e, $argPeri_deg, $node_deg, $incl_deg, $epoch_year, $epoch_month, $epoch_day, $H, $G, $longname) = _cometsplit($line);
+    my $desig = grok_desig($line);
+    $G /= 100 if ($G);      # convert pct to fraction
+
+    # Perihelion time.
+    my $tp_mjd_TT = cal2mjd(int($tp_day), $tp_month, $tp_year, $tp_day - int($tp_day));
+    my $tp_mjd_UTC = $tp_mjd_TT - slaDtt($tp_mjd_TT) / 86400;
+
+    # Epoch (if provided).
+    my $epoch_mjd_TT;
+    my $epoch_mjd_UTC;
+    if ($epoch_year) {
+        $epoch_mjd_TT = cal2mjd(int($epoch_day), $epoch_month, $epoch_year, $epoch_day - int($epoch_day));
+        $epoch_mjd_UTC = $epoch_mjd_TT - slaDtt($epoch_mjd_TT) / 86400;
+    }
+    else {
+        $epoch_mjd_TT = $tp_mjd_TT;
+        $epoch_mjd_UTC = $tp_mjd_UTC;
+    }
+
+    return {
+        desig => $desig,
+        q_AU => $q_AU,
+        e => $e,
+        i_deg => $incl_deg,
+        node_deg => $node_deg,
+        argPeri_deg => $argPeri_deg,
+        timePeri_mjd_UTC => $tp_mjd_UTC,
+        H => $H,
+        G => $G,
+        epoch_mjd_UTC => $epoch_mjd_UTC,
+        longname => $longname
+    }
+}
+
+
+sub jplcometorb_to_obj {
+    my ($orig_line) = @_;
+    my $line = $orig_line;
+    $line =~ s/^\s*//;      # strip leading whitespace
+    my ($number_name) = substr($line, 0, 40, '');
+    $number_name =~ s/\s+$//;       # strip trailing whitespace from name field
+    $line =~ s/^\s+//;
+    my ($epoch_mjd_TT, $q_AU, $e, $incl_deg, $argPeri_deg, $node_deg, $tp_mjd) = split /\s+/, $line;
+
+    # tp_jd is of the format YYYYMMDD.DDDD; need to convert.
+    my ($yyyy, $mm, $dd, $df) = $tp_mjd =~ /^(\d\d\d\d)(\d\d)(\d\d)(\.\d+)$/;
+    if ($yyyy < 1000) {
+        warn "skipping ancient comet, perihelion year is $yyyy: $line";
+        return;
+    }
+
+    die "bad TP: $tp_mjd" unless defined($df);
+    $tp_mjd = cal2mjd($dd, $mm, $yyyy, $df);
+
+    # Suss out the comet number or desig and type.
+    my ($number, $name);
+    my $desig;
+    if ($number_name =~ m|^(\d+)([CDP])/|) {
+        $desig = sprintf "%04d%s", $1, $2;   # match MPC format, e.g. 0240P
+    }
+    elsif ($number_name =~ m|([CDP])/(\d\d)(\d\d) ([A-Z])(\d)|) {
+        # short designation, covert to MPC 1999 F3 => J99F030
+        my $cen = chr(ord('K')+($2-20));
+        $desig = "$1$cen" . (sprintf "%02d", $3) . "${4}0${5}0";
+    }
+    elsif ($number_name =~ m|([CDP])/(\d\d)(\d\d) ([A-Z])([A-Z])(\d*)|) {
+        # long designation, need to pack the suffix.
+        my $cen = chr(ord('K')+($2-20));
+        my $suffix;
+
+        if (!$6) {
+            $suffix = $4 . '00' . $5;
+        }
+        elsif ($6 > 99) {
+            $suffix = $4 . (chr(ord('A')+int($6/10)-10)) . ($6 % 10) . $5;
+        }
+        else {
+            $suffix = $4 . $6 . $5;
+        }
+        $desig = "$1$cen" . (sprintf "%02d", $3) . $suffix;
+    }
+    unless ($desig) {
+        warn("Can't make a desig for $line.\n");
+        return undef;       # weird comet
+    }
+    print STDERR "JPL comet $number_name => $desig\n";
+
+    my $H = 10;
+    my $G = 0.04;
+
+    # Perihelion time.
+    my $tp_mjd_TT = $tp_mjd;
+    my $tp_mjd_UTC = $tp_mjd_TT - slaDtt($tp_mjd_TT) / 86400;
+
+    # Epoch (if provided).
+    my $epoch_mjd_UTC = $epoch_mjd_TT - slaDtt($epoch_mjd_TT) / 86400;
+
+    return {
+        desig => $desig,
+        q_AU => $q_AU,
+        e => $e,
+        i_deg => $incl_deg,
+        node_deg => $node_deg,
+        argPeri_deg => $argPeri_deg,
+        timePeri_mjd_UTC => $tp_mjd_UTC,
+        timePeri_mjd_TT => $tp_mjd_TT,
+        H => $H,
+        G => $G,
+        epoch_mjd_UTC => $epoch_mjd_UTC,
+        epoch_mjd_TT => $epoch_mjd_TT,
+        longname => _get_comet_longname(substr($orig_line, 1, 44)), # Comet long name
+    }
+}
+
+
+sub _cometsplit {
+    # Split an MPC orbit line by columns instead of whitespace, since there may be missing values.
+    my $line = $_[0];
+    my @items = (
+        substr($line, 0, 4),        # periodic comet number
+        substr($line, 4, 1),        # orbit type (C, P, D)
+        substr($line, 5, 7),        # provisional designation
+        substr($line, 14, 4),       # year perihelion 
+        substr($line, 19, 2),       # month perilhelion (1-12)
+        substr($line, 22, 7),       # day perihelion (TT)
+        substr($line, 30, 9),       # q, AU
+        substr($line, 41, 8),       # e
+        substr($line, 51, 8),       # argPeri, deg
+        substr($line, 61, 8),       # node, deg
+        substr($line, 71, 8),       # incl, deg
+        substr($line, 81, 4),       # epoch year
+        substr($line, 85, 2),       # epoch month (1-12)
+        substr($line, 87, 2),       # epoch day (1-31)
+        substr($line, 91, 4),       # H
+        substr($line, 96, 4),       # G
+        _get_comet_longname(substr($line, 102, 56)), # Comet long name
+    );
+    s/^\s+|\s+$//g foreach @items;
+    return @items;
+}
+
+
+sub _get_comet_longname {
+    my ($str) = @_;
+    my $longname;
+    if ($str =~ m| \((.*)\)|) {
+        $longname = $1;
+    }
+    elsif ($str =~ m|/(\w.*\w)|) {
+        $longname = $1;
+    }
+    return $longname;
+}
+
+
+sub create_id_maps {
+    # Return a table that maps new identifications to some MPC authoritative ID.  There
+    # are two flavors: ids.txt and numids.txt.  ids.txt looks like
+    #
+    # J60S00WK02R73TK07X30Z
+    # J72R00B
+    # J79M02EK11K31U
+    #
+    # while numids.txt looks like
+    #
+    # 00009        J74Q02U
+    # 00010        J00G00A
+    # 00014        J06Q00CJ13E00AJ52T00M
+    # 00017        J13C00AJ16Y00FJ54S01O
+    #
+    # so for ids.txt we will use the first orbit is the authoritatve one; at
+    # least that's what seems to be consistent in the MPC data.
+    my ($idmap, $revidmap) = @_;
+
+    my $fh = new FileHandle 'numids.txt' or die "can't open numids.txt";
+    my ($id, $reststr, @restids);
+    while (my $line = <$fh>) {
+        chomp $line;
+        ($id, $reststr) = $line =~ /^(\w+)\s+(\w+)$/;
+        next unless defined($id) and defined($reststr);
+        @restids = split_ids($reststr);
+        $idmap->{$_} = $id foreach @restids;
+    }
+    $fh->close;
+
+    $fh = new FileHandle 'ids.txt' or die "can't open ids.txt";
+    my ($idstr);
+    my @ids;
+    while (my $line = <$fh>) {
+        chomp $line;
+        @ids = split_ids($line);
+        if (@ids > 1) {
+            $id = shift @ids;
+            $idmap->{$_} = $id foreach @ids;
+            push @{$revidmap->{$id}}, $_ foreach @ids;
+        }
+    }
+    $fh->close;
+}
+
+
+sub split_ids {
+    # Given a concatenated string of MPC orbit desigs, split them into a list.
+    my ($idstr) = @_;
+    my @ids;
+    my $len = length($idstr);
+    if ($len <= 0 or $len % 7 != 0) {
+        die "weird idstr: $idstr";
+    }
+    while ($idstr) {
+        push @ids, substr($idstr, 0, 7, '');
+    }
+    return @ids;
+}
+

@@ -1,0 +1,161 @@
+#!/usr/bin/env perl
+
+# Prep Spacewatch transient catalogs for insertSpacewatchFields.  This
+# means creating the .miti files and the ref file.
+
+use strict;
+use Pod::Usage;
+use Getopt::Long;
+use Date::Manip;
+use Astro::Time;
+
+
+=head1 NAME
+
+prep.pl - Program to convert Spacewatch transient catalogs to format
+digestible by insertSpacewatchFields.
+
+=head1 SYNOPSIS
+
+prep.pl --input_fields=INPUT_FIELDS
+
+  --input_fields INPUT_FIELDS : file containing Spacewatch-format field metadata
+  help : show man page
+
+=cut
+
+# Globals
+my $DATA_DIR = 'data/transient_catalogs';
+die "can't find directory $DATA_DIR" unless -d $DATA_DIR;
+
+my $MOSAIC_EXE = '../mosaic/extract_mosaic';
+die "can't find executable $MOSAIC_EXE" unless -x $MOSAIC_EXE;
+
+my $OUTPUT_FIELDS = 'fields.txt';
+my $INPUT_FIELDS;
+my $FIELDS_ONLY;        # process metadata only; don't extract mosaic
+my $help;
+
+GetOptions(
+    'data_dir=s' => \$DATA_DIR,
+    'mosaic_exe=s' => \$MOSAIC_EXE,
+    'input_fields=s' => \$INPUT_FIELDS,
+    'output_fields=s' => \$OUTPUT_FIELDS,
+    fields_only => \$FIELDS_ONLY,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(2) unless $INPUT_FIELDS;
+
+
+# Look for transient catalogs.
+unless ($FIELDS_ONLY) {
+    my @catalogs = <$DATA_DIR/*.dat>;
+    my $cmd;
+    my $cat;
+    my $miti;
+    foreach $cat (@catalogs) {
+        $miti = $cat;
+        $miti =~ s/transient\.dat/miti/;
+        $cmd = qq{$MOSAIC_EXE $cat 99999 > $miti};
+    #    print STDERR $cmd, "\n";
+    #    system($cmd) == 0 or die "command '$cmd' failed";
+        system($cmd);
+        print STDERR "Processed $cat.\n";
+    }
+}
+
+
+# Scan the fields metadata and generate a fields.txt file.
+my $line;
+my $date_str;
+my ($month, $day, $year);
+
+open OUTPUT_FIELDS, ">$OUTPUT_FIELDS" or die "can't open $OUTPUT_FIELDS for writing";
+open INPUT_FIELDS, $INPUT_FIELDS or die "can't open $INPUT_FIELDS";
+while(defined($line = <INPUT_FIELDS>)) {
+    if ($line =~ /UT DATE:\s+(\w+\s+\d+,\s+\d+)/) {
+        # Start of date line; set our date vars.
+        $date_str = ParseDate($1);
+        ($year, $month, $day) = ($date_str =~ /(\d\d\d\d)(\d\d)(\d\d)/);
+    }
+    elsif ($line =~ m{^\t
+            (\d\d\.\d\d)        # field IDs
+            \s+
+            \d+,\d+,\d+   # three different obs
+            \s+
+        }x) {
+
+        # Generate the filename that will contain the epoch of the field
+        # acquisition.
+        my ($f1) = ($1);
+        my ($t1, $t2, $t3);
+        my ($ra, $dec, $exp_s);
+        my $file1 = "$year.$month.$day.$f1.1";
+        my $file2 = "$year.$month.$day.$f1.2";
+        my $file3 = "$year.$month.$day.$f1.3";
+
+        if (-f "$DATA_DIR/$file1.miti" and -f "$DATA_DIR/$file2.miti" and -f "$DATA_DIR/$file3.miti") {
+            # Get other info.
+            ($ra, $dec, $exp_s, $t1, $t2, $t3) = ($line =~ m{
+                ^\s+
+                \d\d\.\d\d \s+
+                \d+,\d+,\d+ \s+
+                (\d+:\d+:\d+) \s+       # RA
+                ([-+]\d+:\d+:\d+) \s+   # DEC
+                (\d+) \s+               # exposure, sec
+                (\S+) \s+ \S+ \s+       # time, followed by FWHM
+                (\S+) \s+ \S+ \s+       # time, followed by FWHM
+                (\S+) \s+ \S+ \s+       # time, followed by FWHM
+            }x);
+
+            # Now do some conversions.
+            my $ra_deg;
+            my $dec_deg;
+            my ($t1_mjd, $t2_mjd, $t3_mjd);
+            my ($hour, $min, $sec);
+
+            $ra_deg = str2deg($ra, 'H');
+            $dec_deg = str2deg($dec, 'D');
+
+            ($hour, $min, $sec) = ($t1 =~ /(\d+):(\d+):(\d+)/);
+            $t1_mjd = cal2mjd($day, $month, $year, hms2time($hour, $min, $sec));
+
+            ($hour, $min, $sec) = ($t2 =~ /(\d+):(\d+):(\d+)/);
+            $t2_mjd = cal2mjd($day, $month, $year, hms2time($hour, $min, $sec));
+
+            ($hour, $min, $sec) = ($t3 =~ /(\d+):(\d+):(\d+)/);
+            $t3_mjd = cal2mjd($day, $month, $year, hms2time($hour, $min, $sec));
+
+            # Print filename (ID), RA, DEC, epoch, exposure
+            print OUTPUT_FIELDS join("\t", $file1, 
+                sprintf("%.8f", $ra_deg), 
+                sprintf("%.8f", $dec_deg), 
+                sprintf("%.8f", $t1_mjd), $exp_s), "\n";
+            print OUTPUT_FIELDS join("\t", $file2, 
+                sprintf("%.8f", $ra_deg), 
+                sprintf("%.8f", $dec_deg), 
+                sprintf("%.8f", $t2_mjd), $exp_s), "\n";
+            print OUTPUT_FIELDS join("\t", $file3, 
+                sprintf("%.8f", $ra_deg), 
+                sprintf("%.8f", $dec_deg), 
+                sprintf("%.8f", $t3_mjd), $exp_s), "\n";
+        }
+    }
+}
+close INPUT_FIELDS;
+close OUTPUT_FIELDS;
+
+print STDERR "Wrote field metadata to $OUTPUT_FIELDS.\n";
+
+
+# Tell user what to do.
+print STDERR <<"EOF";
+Now you need to insertSpacewatchFields --fields=fields.txt --max_dets=M
+EOF
+
+=head1 DESCRIPTION
+
+Looks for .dat transient catalogs in data/transient_catalogs; requires
+extract_mosaic.
+
+=cut

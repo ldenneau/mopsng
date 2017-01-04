@@ -1,0 +1,163 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+condor_wait - Emulate condor_submit
+
+=head1 SYNOPSIS
+
+condor_submit JOBFILE
+
+  JOBFILE : condor-formatted job file
+
+=head1 DESCRIPTION
+
+Emulates a condor job on the local system by executing the specified
+program in the job file for each subjob.
+
+=head1 TODO
+
+Rewrite this in Python using subprocess() that we can run multiple
+subjobs concurrently.
+
+=cut
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Basename;
+use File::Path;
+use File::Copy;
+use File::Temp;
+use Cwd;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::Constants qw(:all);
+
+
+use subs qw(
+    run_job
+);
+
+
+my $instance_name;
+my $inst;
+my $help;
+
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+my $job_file = shift or pos2usage(-msg => 'JOBFILE not specified.');
+
+# Emulate a condor invocation on the local system.
+
+# First read the job file into key-val pairs.
+my %job;
+my $job_fh = new FileHandle $job_file or die "can't open $job_file";
+my $line;
+my ($k, $v);
+while (defined($line = <$job_fh>)) {
+    chomp $line;
+    if ($line =~ /^queue\s+(\d+)/) {
+        $k = 'queue';
+        $v = $1;
+    }
+    else {
+        ($k, $v) = split /\s*=\s*/, $line, 2;
+    }
+    $job{$k} = $v;
+}
+
+# Special handling of environment; this is another key-value set.
+my %env;
+$job{environment} =~ s/"//g;    # strip leading/trailing quotes
+my @env_vals = split /\s+/, $job{environment};
+foreach my $ev (@env_vals) {
+    ($k, $v) = split /=/, $ev, 2;
+    $env{$k} = $v;
+}
+$job{ENV} = \%env;
+
+# Create our log file.
+print "Job submitted to cluster 42\n";      # write job string with fake ID for progs that look for it
+
+# Now we are ready to execute a loop for the number of subjobs specified
+# by the job.  For each iteration, prep the environment and perform
+# substitutions on Condor variables in the job setup, then execute
+# the program.
+
+my $num_jobs = $job{queue};
+foreach my $job_idx (0..$num_jobs-1) {
+    run_job($job_idx, \%job);
+}
+
+# Clean up.
+
+exit;
+
+
+sub run_job {
+    my ($job_idx, $jobref) = @_;
+    my $env_str;
+    my $cmd;
+    my $args = $jobref->{arguments};
+    my $stdin = $jobref->{input};
+    my $stdout = $jobref->{output};
+    my $stderr = $jobref->{error};
+    my $cwd = getcwd;           # save current dir
+    my $initialdir = $jobref->{initialdir} || $cwd;
+
+    # Create a temporary directory where everything will happen.
+    my $tmpdir = File::Temp::tempdir(DIR => "$ENV{MOPS_VAR}/run");
+    eval { mkpath($tmpdir) };
+    mops_logger->logdie("NOCONDOR($job_idx): $@") if $@;
+
+    # Munge the per-subjob items.
+    $args =~ s/\$\(Process\)/$job_idx/g;
+    $stdin =~ s/\$\(Process\)/$job_idx/g;
+    $stdout =~ s/\$\(Process\)/$job_idx/g;
+    $stderr =~ s/\$\(Process\)/$job_idx/g;
+
+    # Transfer input files.
+    chdir $initialdir or $mops_logger->logdie("can't chdir to $initialdir");
+    my @inpfiles = split /,/, $jobref->{transfer_input_files};
+    my $destfile;
+    for my $file (@inpfiles) {
+        $file =~ s/\$\(Process\)/$job_idx/g;
+        # If the file has a path component, extract just the file part.
+        $destfile = basename($file);
+        copy($file, "$tmpdir/$destfile") or $mops_logger->logdie("can't copy $file to $tmpdir/$destfile: $!");
+    }
+
+    # Run it!
+    chdir $tmpdir or $mops_logger->logdie("can't chdir to $tmpdir");
+#    $env_str = join(' ', map { "$_=$jobref->{ENV}->{$_}" } keys %{$jobref->{ENV}});
+    $env_str = '';
+    $cmd = "$env_str $jobref->{executable} $args <$stdin >$stdout 2>$stderr";
+    print STDERR "Executing $cmd.\n";
+    system($cmd) == 0 or $mops_logger->logdie("NOCONDOR($job_idx): $?");
+
+    # Copy all the files back to our original dir.
+    my @newfiles = grep { -f } <*>;     # all files in current dir
+    for my $file (@newfiles) {
+        if (!-f "$cwd/$file") {
+            copy($file, "$cwd/$file") or $mops_logger->logdie("can't copy $file to $cwd/$file: $!");
+        }
+    }
+
+    # Clean up.
+    chdir $cwd or $mops_logger->logdie("can't restore working directory $cwd");
+    eval { rmtree($tmpdir) };
+    mops_logger->logdie("NOCONDOR($job_idx): $@") if $@;
+}
+

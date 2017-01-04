@@ -1,0 +1,406 @@
+#!/usr/bin/env python
+
+from __future__ import division
+
+import os
+import sys
+import subprocess
+import math
+import time
+import re
+import numpy
+
+import MOPS.Instance
+import MOPS.Constants
+import MOPS.Lib
+import ssd
+import slalib
+
+
+DAYS_PER_SECOND = 1.0 / 86400
+SQRT2_DIV_2 = math.sqrt(2) / 2
+debug = 0
+
+
+class Position(object):
+    """
+    Utility class encapsulating an ephemeris for an object, so that we
+    can descriptive names instead of pos[0], pos[1], etc.
+    """
+    def __init__(self, ra_deg, dec_deg, mag, epoch_mjd, ra_sigma_arcsec, dec_sigma_arcsec, unc_smaa_arcsec, unc_smia_arcsec, unc_pa_deg, id=None):
+        self.ra_deg = ra_deg                            # RA of prediction
+        self.dec_deg = dec_deg                          # Dec of prediction
+        self.mag = mag                                  # V-mag
+        self.epoch_mjd = epoch_mjd                      # epoch
+        self.ra_sigma_arcsec = ra_sigma_arcsec          # RA error
+        self.dec_sigma_arcsec = dec_sigma_arcsec        # Dec error
+        self.unc_smaa_arcsec = unc_smaa_arcsec          # uncertainty semi-major axis
+        self.unc_smia_arcsec = unc_smia_arcsec          # uncertainty semi-minor axis
+        self.unc_pa_deg = unc_pa_deg                    # uncertainty semi-major position angle
+        self.id = id                                    # obj id or name
+
+
+class Boresight(object):
+    """
+    Utility class encapsulating boresight position.
+    """
+    def __init__(self, id, field_id, epoch_mjd, ra_deg, dec_deg, filter_id):
+        self.id = id                                    # RA of prediction
+        self.field_id = field_id
+        self.epoch_mjd = epoch_mjd                      # epoch
+        self.ra_deg = ra_deg                            # RA of prediction
+        self.dec_deg = dec_deg                          # Dec of prediction
+        self.filter = filter_id                         # obj id or name
+
+
+def debugmsg(msg):
+    if debug:
+        sys.stderr.write(msg + "\n")
+
+
+def msg(msg):
+    sys.stderr.write(msg + "\n")
+
+
+def _predictPosition(obj, mjds, obscode):
+    """
+    Thin wrapper around ssd.ephemerides.
+    ssd.ephemerides() returns [RA, Dec, mag, mjd, RAErr, DecErr, SemiMajAxis, SemiMinAxis, PA]
+    """
+
+    # Extract the orbital params.
+    orbitalParams = numpy.array([obj.orbit.q,
+                                 obj.orbit.e,
+                                 obj.orbit.i,
+                                 obj.orbit.node,
+                                 obj.orbit.argPeri,
+                                 obj.orbit.timePeri])
+    epoch = obj.orbit.epoch
+    absMag = obj.orbit.h_v
+
+    # See if we have a square root covariance matrix so that we can compute
+    # uncertainties.
+    if obj.orbit.src:
+        src = numpy.array(obj.orbit.src)
+    else:
+        src = None
+    # <- if
+
+    # positions = [[RA, Dec, mag, mjd, uncertainties], ]
+    positions = [
+        Position(id=obj.objectName, *eph)
+        for eph in 
+            ssd.ephemerides(
+                orbitalParams,
+                epoch,
+                numpy.array(mjds),
+                obscode,
+                absMag,
+                covariance=src
+            )
+    ]
+    return positions
+
+
+def fetch_boresights(mops_instance, options):
+    dbh = mops_instance.get_dbh()
+    cursor = dbh.cursor()
+    sql = ''' select f.fpa_id, f.field_id, f.epoch_mjd, f.ra_deg, f.dec_deg, f.filter_id from fields f '''
+    n = cursor.execute(sql)
+    if not n:
+        return []
+    return [Boresight(*row) for row in cursor.fetchall()]
+
+
+def fetch_desig(desig):
+    # Grep the desig out of the MPCORB.DES file
+    file = os.path.join(os.environ['MOPS_HOME'], 'data', 'mpcorb', 'MPCORB.DES')
+    if not os.path.exists(file):
+        raise RuntimeError("Can't find MPCORB.DES")
+
+    proc = subprocess.Popen(['grep', '-m 1', '-w' , '^' + desig, file], stdout=subprocess.PIPE)
+    (out, err) = proc.communicate()
+    return out
+
+
+def numbered2desig(name):
+    # Convert numbered asteroid to packed designation.
+    foo = '0123456789ABCDEFGHIJKLMNOPQRST'
+    num = int(name)
+    return foo[int(num / 10000)] + ("%04d" % (num % 10000))
+
+
+def unnumbered2desig(yr, half, second, cycle):
+    # Take a name of the form 2004, M, N, 4 and convert it to
+    # K04M04N.
+    if cycle is None:
+        cycle = 0   # handle cases like 1995XA
+    foo = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+    a = chr(ord('I') + int(int(yr) / 1000)) 
+    b = ("%02d" % (int(yr) % 100)) + half
+    c = (foo[int(int(cycle) / 10)] + str(int(cycle) % 10)) + second
+    return a + b + c
+
+
+def comet2desig(yr, half, frag, num):
+    # Take a name of the form 2004, M, 4 and convert it to
+    # K04M4N.
+    if frag is None:
+        frag = '0'
+    foo = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+    a = chr(ord('I') + int(int(yr) / 1000)) 
+    b = ("%02d" % (int(yr) % 100)) + half
+    c = (foo[int(int(cycle) / 10)] + str(int(cycle) % 10)) + frag.lower()
+    return a + b + c
+
+
+def get_mpec_elems(lines):
+    # Given a string containing an MPEC's HTML contents, scrape orbital elements from it.
+    # For an example MPEC, see view-source:http://www.minorplanetcenter.org/mpec/K10/K10T79.html.
+
+    # Want to return a list of orbit information:
+    # [
+    #   name,
+    #   [ q, e, i, 
+    # ]
+
+    found_orbit = False
+    found_line = -1
+    for i in range(len(lines)):
+        if re.match(r'Orbital elements:', lines[i]):
+            found_line = i
+            break
+        # if
+    # for
+
+    # We require a very specific sequence following. Probably this will
+    # break for some comets or hyperbolic orbits.
+    i = found_line + 1
+    id = lines[i][0:30]
+    id = re.sub(r'\s+', '', id)
+    i += 1
+
+    # Epoch
+    epoch_match = re.match(r'Epoch.*JDT\s+([\d\.]+)', lines[i])
+    if not epoch_match:
+        raise RuntimeError("couldn't get epoch")
+    epoch_jd = float(epoch_match.group(1))
+    i += 1
+
+    # Mean anomaly
+    m_match = re.match(r'M\s+([\d\.-]+)', lines[i])
+    if not m_match:
+        raise RuntimeError("couldn't get mean anomaly")
+    M = float(m_match.group(1))
+    i += 1
+
+    # Mean motion, argPeri
+    n_match = re.match(r'n\s+([\d\.-]+)\s+Peri\.\s+([\d\.-]+)', lines[i])
+    if not n_match:
+        raise RuntimeError("couldn't get node and arg peri")
+    n = float(n_match.group(1))
+    arg_peri = float(n_match.group(2))
+    i += 1
+
+    # a, node
+    a_match = re.match(r'a\s+([\d\.]+)\s+Node\s+([\d\.-]+)', lines[i])
+    if not a_match:
+        raise RuntimeError("couldn't get a and node")
+    a = float(a_match.group(1))
+    node = float(a_match.group(2))
+    i += 1
+
+    # e, incl
+    e_match = re.match(r'e\s+([\d\.]+)\s+Incl\.\s+([\d\.-]+)', lines[i])
+    if not e_match:
+        raise RuntimeError("couldn't get e and incl")
+    e = float(e_match.group(1))
+    incl = float(e_match.group(2))
+    i += 1
+
+    # P, H
+    p_match = re.match(r'P\s+([\d\.]+)\s+H\s+([\d\.-]+)', lines[i])
+    if not p_match:
+        raise RuntimeError("couldn't get P and H")
+    p = float(p_match.group(1))
+    h_V = float(p_match.group(2))
+    i += 1
+
+    # Convert M and n to time_peri
+    if e >= 1:
+        raise RuntimeError("got e >= 1: " + str(e) + "\n")
+    q = a * (1 - e)
+
+    # Emit stuff.
+    template = """
+"%s" "Sol" {
+   Class "asteroid"
+   Mesh "asteroid.cms"
+   Texture "asteroid.*"
+
+   Radius 2.000
+
+   EllipticalOrbit {
+      Epoch         %.1f
+      MeanAnomaly       %.5f
+
+      SemiMajorAxis       %.5f
+      Period              %.5f
+
+      Eccentricity        %.4f
+      Inclination         %.4f
+      AscendingNode     %.5f
+      ArgOfPericenter   %.5f
+   }
+
+   Albedo 0.15
+}
+
+"""
+    print template % (
+        id, epoch_jd, M, a, p, e, incl, node, arg_peri
+    )
+
+
+def fetch_orbit_stuff(filenames):
+    """ 
+    Given a something, return orbit elements from DES-formatted line.  Columns are
+    OID FORMAT q e i Omega argperi t_p H t_0 INDEX N_PAR MOID COMPCODE 
+    If the name looks like an asteroid or coment name, grab that from
+    MPCORB.DES, otherwise assume the something is a file name.
+    """
+
+    orbit_stuff = []
+
+    for filename in filenames:
+        desig_match = re.match(r'^([A-Z]\d\d\w+)', filename)
+        numbered_match = re.match(r'^\(?(\d+)\)?$', filename)
+        unnumbered_match = re.match(r'^(\d\d\d\d)([A-Z])([A-Z])(\d*)', filename)
+        comet_match = re.match(r'^(\d\d\d\d)([A-Z])(\d+)(\w?)', filename)
+        desig = None
+
+        # If we're given an MPEC URL, grab it and scrap the orbital elements form it.
+        if re.search(r'\.html$', filename):
+            import urllib
+            if not re.match(r'http://', filename):
+                prefix_match = re.match(r'([IJK]\d\d)', filename)
+                if prefix_match:
+                    filename = "http://www.minorplanetcenter.org/mpec/" + prefix_match.group(1) + '/' + filename
+                    sys.stderr.write("Using URL " + filename + ".\n")
+                else:
+                    raise RuntimeError("Can't handle partial MPEC URL " + filename)
+            # endif
+
+            f = urllib.urlopen(filename)
+            contents = f.readlines()
+
+            try:
+                stuff = get_mpec_elems(contents)
+            except Exception, e:
+                sys.stderr.write("Couldn't get orbit from " + filename + ": " + str(e) + "\n")
+                exit(1)
+            # try
+        else:
+            line = None
+            if desig_match:
+                line = fetch_desig(desig_match.group(0))
+            elif numbered_match:
+                # looks like numbered asteroid
+                desig = numbered2desig(numbered_match.group(0))
+                line = fetch_desig(desig)
+            elif unnumbered_match:
+                desig = unnumbered2desig(*unnumbered_match.groups())
+                line = fetch_desig(desig)
+            elif comet_match:
+                desig = comet2desig(*comet_match.group(0))
+                line = fetch_desig(desig)
+            # endif
+
+            if not line:        # didn't get anything from MPCORB, try local file
+                if filename == '-':
+                    fh = sys.stdin
+                else:
+                    if not os.path.exists(filename):
+                        if not desig:
+                            sys.stderr.write("No object " + filename + " or file " + filename + " found.\n")
+                        else:
+                            sys.stderr.write("No object " + desig + " or file " + filename + " found.\n")
+                        exit(1) # give up
+                    fh = file(filename)
+                # else
+
+                for line in fh.readlines():
+                    if not re.match(r'!!', line):
+                        stuff = line.split()
+                        name = stuff[0]
+                        elems = numpy.array(stuff[2:8])
+                        h_V = stuff[8]
+                        t0 = stuff[9]
+                        orbit_stuff.append((name, elems, t0, h_V))
+                    # if
+                # for
+            else:
+                stuff = line.split()
+                name = stuff[0]
+                elems = numpy.array(stuff[2:8])
+                h_V = stuff[8]
+                t0 = stuff[9]
+                orbit_stuff.append((name, elems, t0, h_V))
+            # else
+        # else 
+
+    # for filename
+
+    return orbit_stuff
+
+
+if __name__ == '__main__':
+    import optparse
+    import sys
+    
+    
+    # Constants
+    USAGE = """\
+Usage: findobj [options] THING
+
+  THING : full or partial MPEC URL; MPC designation
+ """
+    
+    # Get user input (tracks file) and make sure that it exists.
+    parser = optparse.OptionParser(USAGE)
+    parser.add_option('--instance',
+                      dest='instance_name',
+                      type='str',
+                      help="MOPS instance name")
+
+    parser.add_option("--debug",
+                      action="store_true",
+                      dest="debug",
+                      default=False)
+    
+    parser.add_option("--quiet",
+                      action="store_true",
+                      dest="quiet",
+                      default=False)
+
+    options, args = parser.parse_args()
+    debug = options.debug
+
+    # Make sure that we have what we need.
+    if not options.instance_name:
+        options.instance_name = os.environ.get('MOPS_DBINSTANCE', None)
+    if not options.instance_name:
+        parser.error('--instance must be specified.')
+        
+    if len(args) < 1:
+        parser.error('No orbit file specified.')
+
+
+    # setup
+    obscode = 'F51'     # or get from config
+    fov_deg = 3.0       # FOV diameter in degrees
+    done_header = False # only print header once
+
+    # Fetch orbital elements.
+    fetch_orbit_stuff(args)
+# <-- if __name__

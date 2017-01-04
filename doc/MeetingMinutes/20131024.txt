@@ -1,0 +1,37 @@
+Attendees: Bolin, Chastel (Chair/Scribe), Denneau, Veres
+
+Telescope Status:
+No report
+
+IPP trail fitting
+- Got IPP data yesterday evening
+- Missing entries and data
+- SC: Review all ground-truth data
+- SC: Compare with IPP data
+- SC: Organize meeting with the IPP
+
+Data Processing
+No report
+
+NEO Status
+- One interesting fast mover (3deg/day).
+- 3 100-scorers: total of 44 objects on the confirmation page atm.
+
+NEO Czaring
+- BB: Lots of pairs.
+- No detection in the stamps problem
+PV: Large DoF might be the sign of a wrong detection
+
+Comets
+- unknown comets page: fixed. All stamps are queried now.
+- BB: How to publicly submit comet but keep it "secret"?
+   -> The best is to ask RJW.
+- BB: Missing stamps in known MBC
+   -> SC: Will investigate
+
+ATLAS
+- no report
+
+AOB:
+- BB: Need support for ingesting SMF diffs (MOPS for CFHT images)
+

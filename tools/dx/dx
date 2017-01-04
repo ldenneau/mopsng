@@ -1,0 +1,118 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::MPC qw(:all);
+use PS::MOPS::MITI;
+use PS::MOPS::DX;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Orbit;
+
+use subs qw(
+);
+
+
+my $header;
+my $from_fmt = '';
+my $to_fmt = '';
+my $help;
+GetOptions(
+    header => \$header,
+    'to=s' => \$to_fmt,
+    'from=s' => \$from_fmt,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+die "--from or --to must be specified.\n" unless ($from_fmt || $to_fmt);
+
+
+my $did_header;
+my $dummy_inst = undef;
+my $line;
+my $href;
+my $obj;                                        # generic object
+while (defined($line = <>)) {
+    chomp $line;
+    next if $line =~ /^\s*$|^#|^!/;             # skip blank lines, comment lines
+
+    # Handle from-age.
+    if ($from_fmt) {
+        if ($from_fmt eq $MIF_D) {
+            # Convert a MIF-D detection to something, usually DX-D.
+            print $PS::MOPS::DX::header_DETECTION, "\n" if ($header && !$did_header);
+            $obj = modcd_deserialize($dummy_inst, $line);
+
+            if ($to_fmt eq $MOBS_D) { 
+                # Tholen MOPS/KNOBS
+                print modx_toMOBS_D($obj), "\n";
+            }
+#            elsif ($to_fmt eq $MITI) {
+#            }
+#            elsif ($to_fmt eq $MPC) {
+#            }
+            else {
+                # DX detection
+                print modx_toDETECTION($obj), "\n";
+            }
+        }
+        elsif ($from_fmt eq $MIF_O or $from_fmt eq $MIF_OC) {
+        }
+    }
+    else {
+    }
+
+    $did_header = 1;
+}
+
+=head1 NAME
+
+dx - Convert to and from DX-formatted files
+
+=head1 SYNOPSIS
+
+dx [options] INFILE
+dx [options] < INFILE
+
+  --from=FORMAT : convert from specified format to DX, (see below)
+  --to=FORMAT : convert from DX to specified format (see below)
+
+=head1 DESCRIPTION
+
+Converts input file or STDIN to specified format.  Tries to do the right/obvious
+thing where possible.
+
+=head1 FORMATS
+
+=item MPC
+
+Minor Planet Center (MPC) format, for detections only
+
+=item MITI 
+
+Original MOPS MITI format, usually
+
+ID EPOCH_MJD RA_DEG DEC_DEG MAG OBSCODE OBJECT_NAME
+
+=item MIF-D
+
+MOPS internal (MIF) detection format
+
+=item MIF-O, MIF-OC
+
+MOPS internal orbit and orbit+covariance formats
+
+=item DX-D
+
+DX detection format
+
+=item DX-O
+
+DX orbit format
+
+=cut

@@ -1,0 +1,921 @@
+#! /usr/bin/env perl
+
+=head1 NAME
+
+surv2ds - Put files from various MOPS synthetic surveys into a simulation's data store
+
+=head1 SYNOPSIS
+
+surv2ds --survey_name=NAME [options]
+
+  --instance=INSTANE_NAME : specify simulation to use
+  --survey_name=NAME : specify template survey name
+  --survey_mode=MODE : specify survey mode (optional)
+  --insert_file=FILE : get fields from specified insert file
+
+  --all : insert all fields from survey named NAME
+  --mode=PATTERN : only insert fields with SURVEY_MODE matching PATTERN
+
+  --nn=NN : insert fields for specified night number
+  --start_nn=START_NN : starting night number
+  --end_nn=END_NN : ending night number (inclusive)
+
+  --ocnum=OCNUM : insert all fields for specified OC
+  --start_ocnum=START_OCNUM : starting OC
+  --end_ocnum=END_OCNUM : ending OC, inclusive
+  --continue : start where the current simulation left off
+
+  --create_false : if set, create false detections
+  --mopper : if set, run mopper after inserting a night
+  --email=ADDR : invoke mopper with --email=ADDR to send email after each night
+  --direct : insert directly into current sim FIELDS table
+
+  --list : list nightly data for survey using above conf
+  --summary : summary list output by night instead of by field
+
+surv2ds --survey=DRM1 --ocnum 83        # insert all fields from OCNUM 83
+
+surv2ds --survey=TAO --all --mode=SS
+
+
+=head1 DESCRIPTION
+
+surv2ds retrieves field metadata from a MOPS library of field
+templates and creates files in the MOPS incoming datastore or inserts
+fields directory into a simulation.
+
+surv2ds takes the options specified on the command line, examines
+various MOPS synthetic survey data, and then inserts files using into
+a simulation's incoming data store.  In this fashion, surv2ds can
+be used to simulation actual ingest of simulated fields from various
+sources.
+
+For field specifications that depend on a local configuration parameter,
+such as a night number specification, the configuration file for the
+current or specified simulation is read and used to fill values in the
+FITS file, e.g. OBSCODE.
+
+surv2ds does some scrubbing of the input data, in particular by default
+it will remove duplicate occurrences of a field, override filter values
+with 'r', and omit fields exceeding a particular exposure time so that
+"deep-drilling" MD fields are not used, as MOPS does not gracefully
+cope with these yet.
+
+When using --continue, surv2ds will rewrite the starting night number
+with whatever the MOPS instance says was the last completed processing.
+If the status of the last completed field is $FIELD_STATUS_LINKDONE,
+surv2ds will start with the next night number; otherwise surv2ds will
+attempt to start with the unfinished night.
+
+=cut
+
+
+
+
+# $Id$
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Slurp;
+use FileHandle;
+
+use File::Path;
+use File::Copy;
+use File::Temp;
+
+use Astro::SLA;
+
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::Constants qw(:all);
+
+use PS::MOPS::DC::TemplateInstance;
+use PS::MOPS::DC::TemplateField;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+
+use PS::MOPS::FITS::IPP;
+
+use subs qw(
+    open_fields
+    filter_tti_pairs
+    process
+    list
+    false_detection_rate
+    false_detection_mag
+    do_field_false_detections
+    twiddle_start_nn
+    make_fpa_id_from_epoch
+
+    insert_direct
+    insert_datastore
+);
+
+my @default_de = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+my $default_ds_type = 'DETECTION';         # DS file type
+
+# Job exit codes:
+#  0 - successfully processed some data
+#  1 - no data to process
+#  2 - other MOPS failure 
+#  3 - exit via stop request
+#  99 - internal error in job
+my $EXIT_SUCCESS = 0;
+my $EXIT_STOP = 2;
+
+
+my $instance_name;
+my $inst;
+my $info;
+my $survey_name = 'TAO';
+my $survey_mode;
+my $insert_file;
+my $create_false;
+my $mopper;
+my $email;
+my $all;
+my ($nn, $start_nn, $end_nn);
+my ($ocnum, $start_ocnum, $end_ocnum);
+my $continue;
+my $extra_sql;
+my $direct;
+my $list;
+my $summary;
+my $help;
+
+my $obscode;
+my $pairs;
+my $max_exposure_time = 65;     # max exposure time allowed for TTI field
+my $limiting_mag = 22.7;        # PS-1 5-sigma limiting mag
+my $filter_replace = 'r';       # replace input filters in simulation
+my $filter_ignore = 'z,y';      # ignore fields with these filters
+my $noinsert;
+
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help,
+    info => \$info,
+    all => \$all,
+    'survey_name=s' => \$survey_name,
+    'survey_mode=s' => \$survey_mode,
+    'insert_file=s' => \$insert_file,
+    create_false => \$create_false,
+    mopper => \$mopper,
+
+    'nn=i' => \$nn,
+    'start_nn=i' => \$start_nn,
+    'end_nn=i' => \$end_nn,
+    'ocnum=i' => \$ocnum,
+    'start_ocnum=i' => \$start_ocnum,
+    'end_ocnum=i' => \$end_ocnum,
+    'extra_sql=s' => \$extra_sql,
+    'continue' => \$continue,
+    direct => \$direct,
+
+    'max_exposure_time=f' => \$max_exposure_time,
+    pairs => \$pairs,
+    noinsert => \$noinsert,
+    'obscode=s' => \$obscode,
+    'limiting_mag=f' => \$limiting_mag,
+    'filter_replace=s' => \$filter_replace,
+    'filter_ignore=s' => \$filter_ignore,
+    list => \$list,
+    summary => \$summary,
+    'email=s' => \$email,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+my $gmt_offset_hours = $mops_config->{site}->{gmt_offset_hours};
+
+# Set up who (or whether) to notify.
+$email ||= $mops_config->{main}->{notify};
+$email = '' if $email =~ /^none$/i;
+
+my $template_inst = PS::MOPS::DC::TemplateInstance->new(
+    GMT_OFFSET_HOURS => $gmt_offset_hours
+);
+
+if ($info) {
+    my @vals;
+
+    print STDERR "Fetching survey data...";
+    $info = $template_inst->info();
+    my $num_surveys = scalar keys %{$info};
+
+    if ($num_surveys) {
+        printf STDERR "found %d template %s.\n\n", 
+            $num_surveys,
+            $num_surveys == 1 ? 'survey' : 'surveys';
+
+        foreach my $id (sort { $info->{$a}->{SURVEY_NAME} cmp $info->{$b}->{SURVEY_NAME} } keys %{$info}) {
+            @vals = @{$info->{$id}}{qw(
+                SURVEY_NAME 
+                SURVEY_DESC 
+                MIN_OCNUM 
+                MAX_OCNUM 
+                MIN_NN 
+                MAX_NN 
+                MIN_DATE 
+                MAX_DATE
+            )};
+            print sprintf <<"EOF", @vals;
+Survey Name: %s
+Description: %s
+OC Range: %d-%d
+NN Range: %d-%d
+Date Range: %s until %s
+
+EOF
+        }
+    }
+    else {
+        print STDERR "no surveys found.\n";
+    }
+    exit;
+}
+
+# Now check some args.
+pod2usage(-msg => 'No survey name specified.') unless ($survey_name or $insert_file);
+pod2usage(-msg => "No date specifier or --all was specified.") unless
+    $all 
+    or $insert_file
+    or ($nn or ($start_nn and $end_nn)) 
+    or ($ocnum or ($start_ocnum and $end_ocnum));
+
+
+# Create table of filters to ingore.
+my %filter_ignore_table;
+if ($filter_ignore) {
+    my @filts = split ',', $filter_ignore;
+    $filter_ignore_table{$_} = 1 foreach @filts;    # set keys in table
+}
+
+
+
+# False detection stuff.
+my $_log10 = log(10);       # used to calculate log10
+
+# Configuration.
+my $field_size_deg2 = $mops_config->{site}->{field_size_deg2}
+    or die("couldn't get field_size_deg2");
+my $field_shape = $mops_config->{site}->{field_shape} || 'circle';
+
+my $astrometric_error_arcseconds = $mops_config->{site}->{astrometric_error_arcseconds}
+    or die("couldn't get astrometric_error_arcseconds");
+
+# Get a S/N to use for false detections. Generally we want to use the configured low_confidence_s2n,
+# but we can override it with false_s2n.  INGEST will split all S/N higher than limiting_s2n into DB.
+my $hc_s2n = $mops_config->{site}->{limiting_s2n} or die "couldn't get limiting_s2n";
+my $lc_s2n = $mops_config->{site}->{low_confidence_s2n} or die "couldn't get low_confidence_s2n";
+my $false_detection_s2n = 
+    $mops_config->{site}->{false_s2n} 
+    || $lc_s2n
+    || $hc_s2n
+    or die "couldn't get false_detection_s2n";
+
+my $fwhm_arcseconds = $mops_config->{site}->{fwhm_arcseconds}
+    or die("couldn't get fwhm_arcseconds");
+my $false_detection_rate_per_deg2 = false_detection_rate(
+    $false_detection_s2n, $fwhm_arcseconds
+);
+my $num_false = int($field_size_deg2 * $false_detection_rate_per_deg2);
+
+
+# If --continue was specified, twiddle our start night.
+if ($continue) {
+    $start_nn = twiddle_start_nn($inst, $start_nn);
+}
+
+
+if ($list) {
+    # Look up survey ID.  Punt if we can't find it.
+    my $fields_grouped_by_night;
+    if ($insert_file) {
+        $fields_grouped_by_night = load_fields_from_file($insert_file);
+    }
+    else {
+        my $survey_id = $template_inst->lookupSurveyId($survey_name);
+        die "Can't find a survey named '$survey_name'." unless $survey_id;
+        $fields_grouped_by_night = load_fields($survey_id);
+    }
+    list($_, $fields_grouped_by_night->{$_}) foreach sort { $a <=> $b } keys %{$fields_grouped_by_night};
+}
+elsif ($insert_file) {
+    # Look up survey ID.  Punt if we can't find it.
+    my $fields_grouped_by_night = load_fields_from_file($insert_file);
+    process($_, $fields_grouped_by_night->{$_}) foreach sort { $a <=> $b } keys %{$fields_grouped_by_night};
+}
+else {
+    # Look up survey ID.  Punt if we can't find it.
+    my $survey_id = $template_inst->lookupSurveyId($survey_name);
+    die "Can't find a survey named '$survey_name'." unless $survey_id;
+    my $fields_grouped_by_night = load_fields($survey_id);
+    process($_, $fields_grouped_by_night->{$_}) foreach sort { $a <=> $b } keys %{$fields_grouped_by_night};
+}
+exit;
+
+
+sub load_fields {
+    # Create a table of all fields in the survey, aggregated by night number.  The returned
+    # value should be a hashref where each value is an arrayref of fields.
+    my ($survey_id) = @_;
+    my $tfield_i = PS::MOPS::DC::TemplateField->retrieve(
+        $template_inst,
+        survey_id => $survey_id,
+        survey_mode => $survey_mode,
+        all => $all,
+        nn => $nn,
+        start_nn => $start_nn,
+        end_nn => $end_nn,
+        ocnum => $ocnum,
+        start_ocnum => $start_ocnum,
+        end_ocnum => $end_ocnum,
+        extra_sql => $extra_sql
+    );
+    my %fields_by_night;
+    my $tfield;
+
+    while ($tfield = $tfield_i->next()) {
+        next if $filter_ignore_table{$tfield->filter};  # ignore retrieved field's filter
+        push @{$fields_by_night{$tfield->nn}}, $tfield;
+    }   # while
+    return \%fields_by_night;
+}
+
+
+sub load_fields_from_file {
+    # Create a table of all fields in the survey, aggregated by night number.  The returned
+    # value should be a hashref where each value is an arrayref of fields.
+    my ($file) = @_;
+    my @lines = read_file($file);
+    my @all_fields;
+    my @stuff;
+
+    die "file is not MIF-FS" unless $lines[0] =~ /^#MIF-FS/;
+    foreach my $line (@lines) {
+        next if $line =~ /^#/;
+        @stuff = split /\s+/, $line;
+        push @all_fields, PS::MOPS::DC::Field->new(
+            $inst,
+            fpaId => $stuff[0],
+            epoch => $stuff[1],
+            ra => $stuff[2],
+            dec => $stuff[3],
+            surveyMode => $stuff[4],
+            timeStart => $stuff[5],
+            timeStop => $stuff[6],
+            filter => $stuff[7],
+            limitingMag => $stuff[8],
+            raSigma => $stuff[9],
+            decSigma => $stuff[10],
+#            obscode => $stuff[11],
+            obscode => $mops_config->{site}->{obscode},
+            de => \@default_de,
+        );
+    }
+
+    my %fields_by_night;
+    my $field;
+    foreach $field (@all_fields) {
+        next if $filter_ignore_table{$field->filter};  # ignore retrieved field's filter
+        push @{$fields_by_night{$field->nn}}, $field;
+    }   # foreach
+    return \%fields_by_night;
+}
+
+
+sub _sep_rad {
+    my ($f1, $f2) = @_;
+    return slaDsep(
+        $f1->{ra_deg} / $DEG_PER_RAD, $f1->{dec_deg} / $DEG_PER_RAD,
+        $f2->{ra_deg} / $DEG_PER_RAD, $f2->{dec_deg} / $DEG_PER_RAD,
+    );
+}
+
+
+sub filter_tti_pairs {
+    my @inp_fields = @_;
+    my @paired_fields;
+    my ($f, $f1, $match, $idx);     # field objects
+    my ($exp_mjd, $exp1_mjd);       # exposure times
+
+    my $MAX_EXPOSURE_TIME_MJD = $max_exposure_time / 86400;         # max exposure time in MJD
+    my $ONE_HOUR_MJD = 3600 / 86400;                # one hour in MJD
+    my $MAX_SEP_RAD = 0.1 / $DEG_PER_RAD;           # .1 degree max spatial separation of TTI pair
+
+    while (@inp_fields) {
+        $f = shift @inp_fields;     # get first in list
+
+        $exp_mjd = $f->{time_stop} - $f->{time_start};
+        next if $exp_mjd == 0 or $exp_mjd > $MAX_EXPOSURE_TIME_MJD;    # toss bogus exp time or MD fields
+
+        $idx = 0;
+        $match = undef;
+        foreach $f1 (@inp_fields) {
+            $exp1_mjd = $f1->{time_stop} - $f1->{time_start};
+            if (
+                $f1->{filter_id} eq $f->{filter_id}     # filters must match
+                and $exp1_mjd != 0 
+                and abs($f->{epoch_mjd} - $f1->{epoch_mjd}) > $ONE_HOUR_MJD
+                and (_sep_rad($f, $f1) < $MAX_SEP_RAD)
+            ) {
+                # If we've made it this far, the field is acceptable.  Pair $f and $f1 together, and remove
+                # $f1 from the current list.
+                $match = $f1;
+                last;   # outta here
+            };
+            $idx++;
+        }
+        if ($match) {
+            splice @inp_fields, $idx, 1;        # extract item, compressing list
+            push @paired_fields, $f, $match;
+        }
+    }
+
+    return @paired_fields;
+}
+
+
+sub list {
+    # Write the data for the fields to STDOUT.
+    my ($nn, $fields_list) = @_;
+
+
+    # Convert src to a filename.
+    # Bin our data into nights.  Then for each night, locate TTI pairs.
+    my %seen_fields;            # record of what epoch/RA/DECs we've inserted
+
+    while (@{$fields_list}) {
+        # Now filter so that we have only TTI pairs.
+        my @nightly_fields;
+        my $f;
+        my $nn;
+        $f = shift @{$fields_list};         # first item
+        $nn = mopslib_mjd2nn($f->{epoch}, $gmt_offset_hours);
+        push @nightly_fields, $f;
+        while (@{$fields_list} and mopslib_mjd2nn($fields_list->[0]->{epoch}, $gmt_offset_hours) == $nn) {
+            push @nightly_fields, shift @{$fields_list};        # transfer $fields_list->[0] => $nightly_fields
+        }
+
+        if ($summary) {
+            print join(' ', $nightly_fields[0]->ocnum, $nn, scalar @nightly_fields), "\n";
+        }
+        else {
+            foreach $f (@nightly_fields) {
+                print join(' ', 
+                    $nightly_fields[0]->ocnum, 
+                    $nn, 
+                    $f->ra, $f->dec, $f->epoch
+                ), "\n";
+            }
+        }
+    } 
+}
+
+
+sub insert_direct {
+    my ($inst, $tfield, $idx) = @_;
+
+    # Create a field object from the template field object, and INSERT!
+    my $field = PS::MOPS::DC::Field->new($inst,
+        epoch => $tfield->epoch,
+        ra => $tfield->ra,
+        dec => $tfield->dec,
+        surveyMode => $tfield->surveyMode,
+        timeStart => $tfield->timeStart,
+        timeStop => $tfield->timeStop,
+        status => $FIELD_STATUS_NEW,
+        filter => $tfield->filter,
+        limitingMag => $tfield->limitingMag,
+        raSigma => $tfield->raSigma,
+        decSigma => $tfield->decSigma,
+        obscode => $tfield->obscode,
+        de => $tfield->de,
+        fpaId => make_fpa_id_from_epoch($tfield->epoch, $idx),
+    ) or die "can't create field from template field";
+    $field->insert();
+}
+
+
+sub insert_datastore {
+    my ($inst, $field, $idx) = @_;
+
+    my $filename = sprintf "%05d", $idx;        # filename
+    my $p = new PS::MOPS::FITS::IPP;            # FITS table object
+    my $epoch = $field->{epoch};
+    my $fpa_id = make_fpa_id_from_epoch($epoch, $idx);
+
+    my $force = 1;      # force file overwrite
+
+    # Really need to globalize this procedure here.
+    $p->createfile($filename, $force,
+        'EXP_NAME' => $fpa_id,
+        'EXP_ID' => -1,
+        'CHIP_ID' => -1,
+        'CAM_ID' => -1,
+        'FAKE_ID' => -1,
+        'WARP_ID' => -1,
+        'DIFF_ID' => -1,
+
+        'MJD-OBS' => $epoch,
+        'RA' => PS::MOPS::Lib::DDtoHMS($field->{ra}),
+        'DEC' => PS::MOPS::Lib::DDtoDMS($field->{dec}),
+        'TEL_ALT' => 0.0,
+        'TEL_AZ' => 0.0,
+        'EXPTIME' => ($field->{timeStop} - $field->{timeStart}) * $SECONDS_PER_DAY,
+        'ROTANGLE' => 0.0,
+        'FILTER' => $field->{filter},
+        'AIRMASS' => 1.0,
+        'OBSCODE' => $mops_config->{site}->{obscode},
+        'SEEING' => 1.0,
+        'MAGZP' => $field->{limitingMag},
+        'MAGZPERR' => 0.01,
+        'ASTRORMS' => 1.0,
+
+        'DE1' => $field->de->[0],
+        'DE2' => $field->de->[1],
+        'DE3' => $field->de->[2],
+        'DE4' => $field->de->[3],
+        'DE5' => $field->de->[4],
+        'DE6' => $field->de->[5],
+        'DE7' => $field->de->[6],
+        'DE8' => $field->de->[7],
+        'DE9' => $field->de->[8],
+        'DE10' => $field->de->[9],
+    );
+    $p->closefile();
+
+    if ($create_false) {
+#                do_field_false_detections(
+#                    $p, $field->{ra}, $field->{dec}, $field->{epoch}, $field->{filter},
+#                    $field->{limitingMag}, $field->{obscode}, $num_false, $field_size_deg2
+#                );
+
+        # Execute a program to install false dets into our FITS file.
+        my @args = (
+            'createFalse',
+            '--ra_deg', $field->{ra},
+            '--dec_deg', $field->{dec},
+            '--epoch_mjd', $epoch,
+            '--filter', $field->{filter},
+            '--limiting_mag', $field->{limitingMag},
+            '--num_dets', $num_false,
+            '--field_size_deg2', $field_size_deg2,
+            '--field_shape', $field_shape,
+            '--astro_error_baseline_arcsec', $astrometric_error_arcseconds,
+            '--hc_s2n', $hc_s2n,
+            '--false_s2n', $false_detection_s2n,
+            $filename,
+        );
+        $mops_logger->info(join ' ', @args);
+        system(@args) == 0 or $mops_logger->logdie("$@: " . join(' ', @args));
+    }
+}
+
+
+sub process
+{
+	my ($nn, $fields_list) = @_;
+    printf STDERR "Manufacturing %d fields for night %d.\n", scalar(@{$fields_list}), $nn;
+
+    # Initialize datastore.
+    my $product_dir;
+    my $fileset_dir;
+    my $fileset;
+    if (!$direct) {
+        $product_dir = "$ENV{MOPS_HOME}/ds/dsroot/" . $inst->dbname();
+
+        # Create if necessary.
+        if (!-d $product_dir) {
+            eval { mkpath $product_dir };
+            $mops_logger->logdie($@) if $@;
+        }
+    }
+
+    # Convert src to a filename.
+    # Bin our data into nights.  Then for each night, locate TTI pairs.
+    my %seen_fields;            # record of what epoch/RA/DECs we've inserted
+
+    while (@{$fields_list}) {
+        # Now filter so that we have only TTI pairs.
+        my @nightly_fields;
+        my $f;
+        my $nn;
+        $f = shift @{$fields_list};         # first item
+        $nn = mopslib_mjd2nn($f->{epoch}, $gmt_offset_hours);
+        push @nightly_fields, $f;
+        while (@{$fields_list} and mopslib_mjd2nn($fields_list->[0]->{epoch}, $gmt_offset_hours) == $nn) {
+            push @nightly_fields, shift @{$fields_list};        # transfer $fields_list->[0] => $nightly_fields
+        }
+
+        # If pairs is specified, filter out only apparent TTI pairs.
+        if ($pairs) {
+            @nightly_fields = filter_tti_pairs(@nightly_fields);
+            printf STDERR "Found %d fields in TTI pairs for night $nn.\n", scalar @nightly_fields;
+        }
+
+        next if $noinsert;
+
+        if (!$direct) {
+            $fileset = "fpas.$nn";
+            $fileset_dir = "$product_dir/$fileset";
+
+            # Remove old dir.
+            eval { rmtree $fileset_dir };
+            $mops_logger->logdie($@) if $@;
+
+            # Create new fileset dir.
+            eval { mkpath $fileset_dir };
+            $mops_logger->logdie($@) if $@;
+
+            chdir $fileset_dir or $mops_logger->logdie("can't chdir to $fileset_dir");
+        }
+
+        # Insert into DB.
+        my $num_done = 0;
+        my $idx = 0;
+        foreach my $field (@nightly_fields) {
+            $idx++;
+            if ($direct) {
+                insert_direct($inst, $field, $idx);
+            }
+            else {
+                insert_datastore($inst, $field, $idx);
+            }   
+
+            $num_done++;
+            printf STDERR "\r%d/%d", $num_done, scalar @nightly_fields;
+
+            # Now register the fileset with the datastore.
+        }
+        print STDERR "...done.\n";
+
+        if (!$direct) {
+            my @cmd = (
+                'register_fileset',
+                '--add',
+                '--product=' . $inst->dbname(),
+                '--type=ipp-mops',
+                '--fileset=' . $fileset,
+            );
+            system(@cmd) == 0 or $mops_logger->logdie($@ . ': ' . join(' ', @cmd));
+        }
+
+
+        # If --mopper was set, run mopper.
+        if ($mopper) {
+            my $email_str = '';
+            if ($email) {
+                $email_str = "--email=$email";
+            }
+
+            my $rv = system("mopper $email_str");
+            my $exit_code = $rv ? ($? >> 8) : 0;
+            if ($exit_code == $EXIT_STOP) {
+                warn "child mopper was stopped";
+                exit($EXIT_STOP);
+            }
+            elsif ($exit_code) {
+                die "mopper failed: $?";
+            }
+        }
+    }   # bin
+}
+
+
+
+sub false_detection_mag {
+=pod
+
+As per our lunch discussion yesterday, I've worked out how to generate fake 
+fluxes for the false detections...
+
+According to eq. 153 from Kaiser's PSDC-200-010-00 the number distn of false 
+detections goes like
+
+f(x) ~ x * exp( -x*x/2 )
+
+where x=S/N.
+
+Let F(y) be the normalized fraction of objects in the range [x_min,y] or:
+
+       \int_{x_min}^{y}    x * exp( -x*x/2 ) dx
+F(y) = -------------------------------------
+       \int_{x_min}^{\inf} x * exp( -x*x/2 ) dx
+
+     = 1 - exp[ ( - ( y^2 - x_min^2 ) / 2 ] 
+
+so, if we generate a random number p in the range [0,1] then the corresponding 
+x=S/N is given by
+
+x = S/N = sqrt( x_min^2 - 2 ln( 1 - p ) )
+
+We want x_min=5.0 at V=24.0 so to convert from x to V use:
+
+V = 24.0 - 2.5 log( x/5 )
+
+
+SUMMARY:
+
+For each randomly generated false detection on the image:
+
+1) generate p randomly in range [0,1)
+2) get corresponding value of S/N (= sqrt( 25 - 2 ln( 1 - p ) ))
+  (let F(y) = p; solve for y)
+3) convert to V = 24.0 - 2.5 log( x/5 )
+
+
+I'm sure one of you will let me know if there is a problem...
+
+=cut
+
+	my ($hc_s2n, $hc_limiting_mag, $lc_s2n) = @_;
+    my $p;
+    my $SN;
+    my $V;
+
+    $p = rand(1);       # uniform random number in [0, 1)
+#    $SN = sqrt($x_min * $x_min - 2 * log(1 - $p));   # 25 = 5 sigma ^2 (?)
+#    $SN = sqrt(25 - 2 * log(1 - $p));   # 25 = 5 sigma ^2 (?)
+    $SN = sqrt($lc_s2n * $lc_s2n - 2 * log(1 - $p));   # 25 = 5 sigma ^2 (?)
+    $V = $hc_limiting_mag - 2.5 * log($SN / $hc_s2n) / $_log10;
+    return ($V, $SN);
+}
+
+
+sub false_detection_rate {
+=pod
+
+    PANSTARRS#S2N-FALSE-DETECTIONS  FWHM=0.7
+
+    * Returns number of false detections per deg^2 of S/N=x in PS images
+    * according to eq. 153 from Kaiser's PSDC-200-010-00.
+
+    * FWHM is the PSF guassian FWHM in arcseconds.
+
+    * To use FWHM instead of SIGMA use SIG2FWHM=5.2255
+    SIGMAG=[FWHM]/2.35
+
+    * AS2PERDEG2=1.296e7 = ARC-SECOND^2 PER DEGREE^2
+    AS2PERDEG2=1.296e7
+
+    * Hokey-Correction Factor (HCF) to get 250 detections/deg^2 @ S/N=5
+    * NOTE: is HCF due to using sigma instead of real FWHM as input parameter?
+    HCF=2.9
+
+    * 2^(5/2)*pi^(3/2)=31.49921989
+    C=[HCF]*[AS2PERDEG2]/31.499/[SIGMAG]/[SIGMAG]
+
+    NPERDEG2 = [C]*S2N*exp(-S2N*S2N/2.0)
+
+    RETURN
+
+=cut
+
+    my ($s2n, $fwhm) = @_;
+    my $SIGMAG = $fwhm / 2.35;
+#    $HCF = 2.9;                     # hokey correction factor
+#    $EXTRA_HCF = 1.5 / 2.5         # Larry's extra HCF; this eqn gens 2.5M/field, want 1.5M/field
+#    $ARCSEC2_PER_DEG2 = 1.296e7;
+#    $SOMETHING = 31.49921989;
+#    $c = $HCF * $EXTRA_HCF * $ARCSEC2_PER_DEG2 / $SOMETHING / ($SIGMAG * $SIGMAG);
+    my $c = 2.9 * .6 * 1.296e7 / 31.49921989 / ($SIGMAG * $SIGMAG);
+    return int($c * $s2n * exp(-$s2n * $s2n / 2));
+}
+
+
+sub do_field_false_detections {
+    my ($fits_obj, $field_ra_deg, $field_dec_deg, $epoch, $filter,
+		$limiting_mag, $num, $field_size_deg2) = @_;
+    my $num_false = 0;          # count inserted fields
+    my $num_lc_false = 0;
+    my $num_hc_false = 0;
+    my $det_num = 0;    # night-unique false det ID
+
+	# For the fieldId provided, generate $num uniformly-distributed
+	# false detections in the field.
+	eval {
+		my ($tpra_rad, $tpdecl_rad);  # tangent plane RA/DEC in RAD
+		my ($fra_rad, $fdecl_rad);  # false RA, DEC in RAD
+		my ($fra_deg, $fdecl_deg);  # false RA, DEC in DEG
+		my $tp_size_rad;            # size of tangent plane area in rad
+		my $mag;
+		my $ra_sigma_deg;
+		my $dec_sigma_deg;
+		my $mag_sigma;
+		my $S2N;
+        my $flux;
+        my $flux_sigma;
+        my $orient_deg = 0;
+        my $orient_sigma_deg = 0;
+        my $length_deg = 0;
+        my $length_sigma_deg = 0;
+        my $in_field;
+
+
+        my $fov_size_deg;
+        if ($field_shape eq 'circle') {
+            $fov_size_deg = 2 * sqrt($field_size_deg2 / $PI);  # width of field
+        }
+        else {
+            $fov_size_deg = sqrt($field_size_deg2);            # width of field
+        }
+        $tp_size_rad = $fov_size_deg / $DEG_PER_RAD;
+
+		for my $n (0..$num) {
+			$tpra_rad = (rand() - 0.5) * $tp_size_rad;         # tangent plane coords in rad
+			$tpdecl_rad = (rand() - 0.5) * $tp_size_rad;     # tangent plane coords
+
+			slaDtp2s(
+				$tpra_rad, $tpdecl_rad, 
+				$field_ra_deg / $DEG_PER_RAD, $field_dec_deg / $DEG_PER_RAD,
+				$fra_rad, $fdecl_rad
+			);
+			$fra_deg = $fra_rad * $DEG_PER_RAD;
+			$fdecl_deg = $fdecl_rad * $DEG_PER_RAD;
+
+            # Now make sure the detection is actually in the field. If so, insert.
+            $in_field = 0;
+            if ($field_shape eq 'circle') {
+                if (mopslib_inField($field_ra_deg, $field_dec_deg, $fov_size_deg, $fra_deg, $fdecl_deg)) {
+                    $in_field = 1;
+                }
+            }
+            else {
+                if (mopslib_inSquareField($field_ra_deg, $field_dec_deg, $fov_size_deg, $fra_deg, $fdecl_deg)) {
+                    $in_field = 1;
+                }
+            }
+
+
+            if ($in_field) {
+                ($mag, $S2N) = false_detection_mag($hc_s2n, $limiting_mag, $false_detection_s2n);
+                ($flux, $flux_sigma) = mopslib_hsn2flux($mag, $S2N, $filter);
+                next if $flux == 0 or $flux_sigma == 0 or $S2N < $false_detection_s2n;
+
+                # Compute uncertainty in position.  This is the baseline PS uncertainty +
+                # uncertainty due to photometry.
+                $ra_sigma_deg = ($astrometric_error_arcseconds + mopslib_astroError($mag, $S2N)) / 3600;
+                $dec_sigma_deg = $ra_sigma_deg;
+
+                $fits_obj->writerecord(
+                    $fra_deg, $ra_sigma_deg, 
+                    $fdecl_deg, $dec_sigma_deg, 
+                    $flux, $flux_sigma, 
+                    $orient_deg, $orient_sigma_deg,
+                    $length_deg, $length_sigma_deg,
+                );
+                $num_false++;
+                if ($S2N > $hc_s2n) {
+                    $num_hc_false++;
+                }
+                elsif ($S2N > $lc_s2n) {
+                    $num_lc_false++;
+                }
+            }
+
+		}   # for
+	};
+
+    $mops_logger->info("Generated $num_false false detections ($num_hc_false HC/$num_lc_false LC).");
+    warn $@ if $@;
+    return $num_false;      # return num dets added
+}
+
+
+sub twiddle_start_nn {
+    my ($mops_inst, $orig_start_nn) = @_;
+    my $new_start_nn = $orig_start_nn;
+
+    # If there is previous work done in the simulation, set the starting night
+    # appropriately (night of unfinished work if oldest status is not
+    # $FIELD_STATUS_LINKDONE, following night otherwise.
+    my $field = $mops_inst->getOldestUnfinishedField();
+    if ($field) {
+        $new_start_nn = $field->nn;                     # still unfinished work
+    }
+    else {
+        # No unfinished fields were found, so get the last night number of the 
+        # simulation and set our starting night the next night.
+        $field = $mops_inst->getLastProcessedField();
+        if ($field) {
+            $new_start_nn = $field->nn + 1;
+        }
+    }
+
+    return $new_start_nn;
+}
+
+
+sub make_fpa_id_from_epoch {
+    my ($epoch, $idx) = @_;
+    my $nn = mopslib_mjd2nn($epoch, $gmt_offset_hours);
+
+    # Construct an FPA_ID using camera style, e.g. oNNNNm0001.
+    return sprintf "o%4dm%04d", ($nn % 10000), $idx;
+}

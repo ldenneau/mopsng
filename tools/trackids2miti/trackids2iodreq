@@ -1,0 +1,160 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(mopslib_parseOrbfitOptsFile);
+use PS::MOPS::DX;
+use PS::MOPS::DC::Tracklet;
+
+use subs qw(
+    _out_track
+);
+
+
+my $inst;
+my $instance_name;
+my $tracklets_file;
+my $trackids_file;
+my $out_fileroot;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'tracklets_file=s' => \$tracklets_file,
+    'trackids_file=s' => \$trackids_file,
+    'out_fileroot=s' => \$out_fileroot,
+    help => \$help,
+) or pod2usage(2);
+
+pod2usage(-message => "Tracklets file $tracklets_file does not exist.") unless $tracklets_file;
+pod2usage(-message => "Track IDs file $trackids_file does not exist.") unless $trackids_file;
+pod2usage(-message => "out_fileroot is not specified") unless $out_fileroot;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+
+
+my $line;
+my $id;
+my $rest;
+my %tracklets;
+
+# First, read in the tracklets file and create a table where the keys
+# are tracklet IDs and the values are lists of DES detection lines.
+my $tracklets_fh = new FileHandle $tracklets_file;
+while (defined($line = <$tracklets_fh>)) {
+    next if (!$line or $line =~ /^!!/ or $line =~ /^#/);    # skip if empty or comment
+    chomp $line;
+    ($id, $rest) = split /\s+/, $line, 2;
+    push @{$tracklets{$id}}, $rest;     # append line with ID stripped
+}
+close $tracklets_fh;
+
+
+# Output filenames.
+my $tracklet_filename = "$out_fileroot.in.tracklet";
+my $request_filename = "$out_fileroot.in.request";
+my $manifest_filename = "$out_fileroot.in.manifest";
+
+
+# Track IDs => requests.
+my $trackids_fh = new FileHandle $trackids_file or die "can't open track IDs file $trackids_file";
+my $request_fh = new FileHandle ">$request_filename" or die "can't create request file $request_filename";
+print $request_fh $PS::MOPS::DX::header_IODREQUEST, "\n";
+
+my $track_id;
+my @tracklet_ids;
+while (defined($line = <$trackids_fh>)) {
+    next if (!$line or $line =~ /^!!/ or $line =~ /^#/);    # skip if empty or comment
+    chomp $line;
+    @tracklet_ids = split '=', $line;
+    _out_track($line, @tracklet_ids);
+}
+
+# Clean up.
+close $request_fh;
+close $trackids_fh;
+
+
+# Create file handles for tracklets and request.
+system("/bin/ln -fs $tracklets_file $tracklet_filename") == 0 or die "can't create symlink to $tracklets_file";
+
+
+# Print manifest.
+my $manifest_fh = new FileHandle ">$manifest_filename" or die "can't create request file $manifest_filename";
+print $manifest_fh <<"EOF";
+$out_fileroot.in.tracklet
+$out_fileroot.in.request
+$out_fileroot.in.manifest
+EOF
+close $manifest_fh;
+
+
+# Create OrbFit options file for IOD.  XXX reeeallly need to clean this up.
+my $section;
+if ($out_fileroot =~ /K$/) {
+    $section = 'PRELIM_K';
+}
+elsif ($out_fileroot =~ /L$/) {
+    $section = 'PRELIM_L';
+}
+else {
+    $section = 'PRELIM';
+}
+
+my $master_opts_filename = "orbfit.opt";
+die "can't locate a master options file (orbfit.opt)" unless -f $master_opts_filename;
+my $opt_fh = new FileHandle ">$out_fileroot.opt" or die "can't create options file $out_fileroot.opt";
+print $opt_fh mopslib_parseOrbfitOptsFile($master_opts_filename, $section);
+close $opt_fh;
+
+exit;
+
+
+sub _out_track {
+    my ($track_id, @tracklet_ids) = @_;
+
+    # Count number of observations (detections).
+    my $nobs = 0;
+    $nobs += scalar @{$tracklets{$_}} foreach @tracklet_ids;    # add length of detection list for each tracklet
+
+    if ($nobs > 0) {
+        print $request_fh modx_toIODREQUEST(
+            ID_OID => $track_id,
+            TRACKLET_IDS => \@tracklet_ids,
+            N_OBS => $nobs,
+            N_NIGHTS => 0,
+        ), "\n";
+    }
+}
+
+
+=head1 NAME
+
+trackids2iodreq - Create DES-formatted IOD requests from LinkTracklets trackIDs output
+
+=head1 SYNOPSIS
+
+trackids2iodreq --tracklets_file=FILE1 --trackids_file=FILE2
+
+  --help : show manpage
+
+=head1 DESCRIPTION
+
+Converts LinkTracklets track IDs and a DES tracklets input file a Data
+Exchange Standard (DES) IOD request.  Four files are created in the current
+directory:
+
+  * a symlink to the tracklets file, with the name ROOT.in.tracklet
+  * a .in.request file
+  * a .manifest file, listing the files in the package
+  * a .opt file, controlling various inscrutable paramters
+
+These four files are suitable as input to Milani's IOD code.
+
+=cut

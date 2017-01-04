@@ -1,0 +1,187 @@
+#!/usr/bin/env perl
+
+=pod
+
+=head1 NAME
+
+posttracklet - MOPS pipeline stage to do post-tracklet accounting
+
+=head1 SYNOPSIS
+
+posttracklet --nn NIGHT_NUMBER [--help]
+
+  --nn NIGHT_NUMBER : night to process
+  --test : test mode; don't modify DB, don't execute makefiles
+  --help : show man page
+  --run : id of the run that posttracklet is a part of. This parameter is used by the 
+          mopper script and should not be specified when manually running posttracklet.
+
+=head1 DESCRIPTION
+
+POSTTRACKLET is a placeholder pipeline stage that allows a MOPS installation
+to perform timely tracklet-based processing before other lengthy processing
+is started for a night.  For PS1, this means NEO digest scores and postage
+stamp requests.
+
+=head1 EXIT VALUE
+
+POSTTRACKLET exits with the following values:
+
+  0 - successful completion
+  other - internal failure
+
+=cut
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+use File::Slurp;
+use FileHandle;
+use Params::Validate;
+
+use Astro::SLA;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Tracklet;
+
+
+our $nosubmit = 0;
+
+
+# Main.
+package main;
+
+# Globals.
+my $debug;
+my $t0 = time;                          # for timing
+
+my $inst;
+my $instance_name;
+my $nn;
+my $run_id;
+my $help;
+my $cmd;
+GetOptions(
+    debug => \$debug,
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    'run=i' => \$run_id,    
+    nosubmit => \$nosubmit,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => '--nn is required') unless $nn;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+$mops_logger->info("Starting POSTTRACKLET.");
+my $end_status = $mops_config->{posttracklet}->{end_status} || $FIELD_STATUS_POSTTRACKLET;
+
+my $direct = $mops_config->{main}->{stamps_direct}==1?"--direct":"";
+
+# Update process status.
+$0 = sprintf "POSTTRACKLET %s", $inst->dbname;
+
+
+# Create our working directory, and go there.
+my $dir = $inst->makeNNDir(NN => $nn, SUBSYS => 'posttracklet', FORCE_EMPTY => 1);
+chdir $dir or die "can't chdir to $dir";
+
+
+# Create a table of all fields that we need to process for this night.
+# We will organize them into tuples (stacks), then distribute jobs for
+# each stack.  Fields that are leftover (not in a stack) will be cleaned
+# up at the end.
+my $field_i;
+my $field;
+my @fields;
+my $queue;
+$field_i = modcf_retrieve($inst,
+    nn => $nn,
+    status => $FIELD_STATUS_TRACKLET,
+);
+while ($field = $field_i->next()) {
+    push @fields, $field;
+}
+
+
+# Now finish up.  First write tracklets for our TTI tuples and deep stacks.
+$inst->pushAutocommit(0);
+my $dbh = $inst->dbh();
+
+
+run_cmd("scoreTrackletProbabilities --nn=$nn");
+
+# Compute digests and submit stamp requests for NEO czaring.
+if ($mops_config->{main}->{enable_digest}) {
+    run_cmd("nightly_digests --field_status=T --nn=$nn --all");
+}
+
+if ($mops_config->{main}->{enable_stamps}) {
+    run_cmd("submit_stamps $direct --log --field_status=T --type=diff --nn=$nn --quads --derived --czarpairs --slow");
+
+    # Disable fuzzy stamps until all data processed for night.  Needs to be run by hand for now.
+    run_cmd("submit_stamps $direct --log --field_status=T --fuzzy --type=diff --nn=$nn");
+    # run_cmd("submit_stamps --log --field_status=T --fuzzy --type=chip --nn=$nn");
+}
+
+# If tracklet known attribution is enabled, perform known attribution now.
+if ($mops_config->{tracklet}->{attribute_known}) {
+    run_cmd("KNOWN_LOCAL --field_status=T --nn $nn");
+#    run_cmd("submit_stamps --log --field_status=T --type=chip --known_pairs --nn=$nn");
+}
+
+if ($mops_config->{main}->{enable_stamps}) {
+    # Generate known and unknown fuzzy stamps only when KNOWN has been run
+    run_cmd("submit_stamps $direct --log --field_status=T --type=diff --nn=$nn --unknownfuzzy");
+    run_cmd("submit_stamps $direct --log --field_status=T --type=diff --nn=$nn --knownfuzzy");
+}
+
+# Send MPC coverage data 
+if ($mops_config->{main}->{enable_coverage}) {
+    my $model = $inst->dbname; 
+    run_cmd("mpc_coverage --nn=$nn --instance $model --cc 'psmops\@gmail.com cssfield\@lpl.arizona.edu'");
+}
+
+# Run Alerts.
+if ($mops_config->{main}->{enable_alert}) {
+    my $model = $inst->dbname; 
+    run_cmd("alertupdate.py --nn=$nn --instance $model");
+    run_cmd("alertcheck.py");
+    run_cmd("alertsubmit.py --noTweet");
+}
+
+# Update field statuses.
+eval {
+    for $field (@fields) {
+        $field->status($end_status, $run_id);
+    }
+    $dbh->commit();
+};
+if ($@) {
+    $dbh->rollback();
+    $mops_logger->logdie($@);
+}
+
+$mops_logger->info(
+    mopslib_formatTimingMsg(
+        subsystem => 'POSTTRACKLET',
+        time_sec => (time - $t0),
+        nn => $nn,
+    )
+);
+exit;
+
+
+sub run_cmd {
+    my ($cmd) = @_;
+    $mops_logger->info("Running command [$cmd]");
+    system($cmd) == 0 or $mops_logger->logdie("POSTTRACKLET: $cmd failed: $?");
+}

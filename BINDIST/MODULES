@@ -1,0 +1,7 @@
+Params::Validate
+File::Slurp
+Config::Scoped
+Class::Accessor
+Astro::SLA (requires C SLALIB)
+Proc::Daemon
+MySQLdb (Python)

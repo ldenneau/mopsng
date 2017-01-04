@@ -1,0 +1,35 @@
+Attendees: 
+Bolin, Chastel, Denneau, Veres
+
+* Telescope Status
+No report
+
+* IPP Issues  - IPP Trail fitting
+No report
+  - Photometry
+No report
+  - Convolution
+No report
+
+* Data Processing
+  - mops07: 
+  - Replacement plan:
+  - dump of db for tests with Atlas
+
+* NEO Status
+  - 30 candidates
+  - bad weather
+* NEO Czaring
+Nothing to report
+
+* Comets
+  - 2 new comets; 1 to be confirmed.
+
+* ATLAS
+  - First light on 4 dec 2013
+  - tphot used for photometry
+  - Surveying for asteroids expected very soon (2 weeks?) from Mauna Loa
+
+* AOB
+No report
+

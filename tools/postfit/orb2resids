@@ -1,0 +1,128 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use Data::Dumper;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::Orbit;
+use PS::MOPS::JPLEPH;
+
+
+use subs qw(
+);
+
+
+# Options.
+my $inst;
+my $instance_name;
+my $help = 0;
+
+# Start program here.
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);
+my $orbits_file = shift or die pod2usage(-message => "input not specified.");
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mc = $inst->getConfig();
+my $ml = $inst->getLogger();
+
+my $line;
+my $track_id;
+my @stuff;
+my @tids;
+my $fmt;
+my $classification;
+my $synth_id;
+my $orbit;
+my $orbit_code;
+my $dummy;
+my $rest;
+my %tracks;
+
+my $orbits_fh = new FileHandle($orbits_file) or $ml->logdie("can't open $orbits_file");
+
+while ($line = <$orbits_fh>) {
+    next if $line =~ /^(#|!)/;      # MOPS or DES comment, skip
+    if ($line =~ /^MIF-TRACK/) {
+        ($dummy, $dummy, $classification, $synth_id, $orbit_code, $fmt, $track_id, $rest) = split /\s+/, $line, 8;
+        next unless $orbit_code = $MOPS_EFF_ORBIT_OK;
+
+        @tids = split /=/, $track_id;   # tracklet IDs from track ID
+        $orbit = modco_deserialize($inst, "$fmt $track_id $rest");
+    }
+    elsif ($line =~ /^MIF-O/) {
+        ($fmt, $track_id, @stuff) = split /\s+/, $line;
+        @tids = split /=/, $track_id;   # tracklet IDs from track ID
+        $orbit = modco_deserialize($inst, $line);
+    }
+    else {
+        $ml->logdie("strange line: $line");
+    }
+
+    $tracks{$track_id} = {
+        ORBIT => $orbit,
+        TIDS => [@tids],
+    };
+}
+$orbits_fh->close();
+
+# Got our stuff. Now loop through track IDs.
+my $trk;
+my ($k, $v);
+my ($det_id, $resid);
+my $NO_AST_REJECT = 0;
+while (($k, $v) = each %tracks) {
+    my @dets;
+    my %det2trk;
+    my %detid2det;
+    foreach my $tid (@{$v->{TIDS}}) {
+        $trk = modct_retrieve($inst, trackletId => $tid);
+        push @dets, @{$trk->detections};
+
+        # Want to map which dets belong to which tracklets.
+        $det2trk{$_->detId} = $tid foreach @{$trk->detections};
+        $detid2det{$_->detId} = $_ foreach @{$trk->detections};
+    }
+
+    my $resids = jpleph_calcDetectionResiduals(
+        orbit => $v->{ORBIT},
+        detections_ref => \@dets,
+    );
+
+    while (($det_id, $resid) = each %{$resids}) {
+        #   TRACK_ID TRACKLET_ID DET_ID RA_RES_DEG DEC_RES_DEG RA_ERR_DEG DEC_ERR_DEG AST_REJECT
+        print join(' ', 
+            $k, $det2trk{$det_id}, $det_id, $resid->{dra}, $resid->{ddec}, $detid2det{$det_id}->raSigma, $detid2det{$det_id}->decSigma, $NO_AST_REJECT, 
+        ), "\n";
+    }
+}
+
+exit;
+
+
+=head1 NAME
+
+orb2resids - Program to generate per-detection residuals from orbit output
+
+=head1 SYNOPSIS
+
+orb2resids FOO.orbits > FOO.residuals
+
+=head1 DESCRIPTION
+
+Takes a MIF-O or MIF-OC orbits file and generates a residuals file by
+computing the per-detection residuals for each detection.  Note that
+the IDs are concatenated tracklet IDs, so we fetch detections using
+that information.
+
+=cut
+

@@ -1,0 +1,34 @@
+Attendees:
+Bolin (BB), Chastel (SC/chair), Denneau (LD/scribe), Engelhardt (TE), Jedicke (RJ), Veres (PV), Wainscoat (RW)
+
+* PS1 Status / Data Czaring (SC) 
+- very good weather, actually causes problem close to GP, hard to do astrometry because so many sources 
+- SC asked EM, EM says star catalog near GP is not robust enough in w-band to do astrometry
+- IPP: MH still looking at convolution issues, in most cases "fine", some cases don't work  -
+CW also looking at convolution as well. PSFs modeled as linear combination of Gaussians, but finding single Gaussian works well; some data was reprocessed and published to datastore, see Chris's report as well 
+- LD: has convolution really been listed as a KP1 priority? Why not wrap up trail fitting first, then work on convolution?
+
+* NEO Czaring (BB)
+- BB: g-band seems to have problems with sources appearing/disappearing 
+- unclear whether these are crosstalk/reflection artifacts 
+- LD suggest somebody (Serge) post something to NEOCP blog indicating they are processing artifacts
+
+* NEO Status (PV and then RJW)
+- still chugging, couple PHAs & comets since last mtg 
+- MSS starts tonight
+
+* Comets (HH by e-mail)
+- Blanpain
+- RW: 2 candidates are not comets probably
+
+* Production databases replication (SC)
+- replication of production MOPS DBs on neohq1 
+- efficiency data (for Toni) available since Feb 2011 
+- want eff0 and L values stored per night in DB
+
+* Bugs reporting and evolutions for MOPS (SC+LD)
+- Use Bugzilla for enhancement  / evolution / bug report
+
+* AO(S)B
+- BB: Please notify BB if you are away during czar commitments
+

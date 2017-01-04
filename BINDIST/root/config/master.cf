@@ -1,0 +1,76 @@
+# $Id: master.cf,v 1.26 2007/01/19 01:04:11 denneau Exp $
+# MOPS master config file.  Nearly MOPS runtime operation is controlled using
+# this file.  Configuration variables can be fetched from Perl using the
+# PS::MOPS::Config module.
+
+# Solar system model, used for synthetic data generation.
+ssm {
+    exposure_time_s = 30.0                  # exposure time, seconds
+    field_size_deg2 = 7.5
+
+    add_astrometric_error = 1               # 1 => add astrometric error, 0 => no
+    add_false_detections = 0                # 1 => include false detections, 0 => no
+    add_shape_mag = 0                       # 1 => compute shape magnitudes for objects
+}
+
+findtracklets {
+    maxv_degperday = 2.0                    # findtracklets max degree/day
+    minobs = 2                              # 2 detections/tracklet
+    extended = 1                            # use elongated tracklets
+    maxt = 0.050                            # The maximum time range for a tracklet (in fractional days).
+}
+
+dtctl {
+    attribution_resid_threshold_arcsec = 0.30;      # attributed orbits must have resid < this
+    attribution_proximity_threshold_arcsec = 600;   # 10 arcsec
+}
+
+lodctl {
+    iod_threshold_arcsec = 3600             # IOD residual threshold, arcseconds
+    diffcor_threshold_arcsec = 0.40         # differential correction residual threshold, arcseconds
+    fallback_iod = 30                       # if set, use low-resid IOD if diffcor failed
+
+    max_link_days = 15                      # size of window for moving objects
+    min_nights = 3                          # minimum number of nights to attempt OD
+    slow_minv_degperday = 0.0               # minv for "slow movers"
+    slow_maxv_degperday = 0.5               # maxv for "slow movers"
+    slow_grouped_radius_deg = 4             # radius for grouping link batch jobs
+
+    fast_minv_degperday = 0.4               # minv for "fast movers"
+    fast_maxv_degperday = 7.0               # maxv for "fast movers"
+    fast_grouped_radius_deg = 8             # radius for grouping link batch jobs
+
+    allow_multiple_attributions = 1         # allow multiple tracklet attributions
+    iod_program = 'fake_iod'
+    diffcor_program = 'mopsdiffcor'         # default standard MOPS diffcor
+}
+
+linktracklets {
+    slow_link_opts = 'vtree_thresh 0.0004 pred_thresh 0.0008'
+    fast_link_opts = 'vtree_thresh 0.0030 pred_thresh 0.0050'
+}
+
+debug {
+    force_empty_attribution_list = 0        # for testing provisional attributions; should be 0
+    disable_attributions = 0                # enable attributions when fields processed
+    disable_precovery = 0                   # enable precovery jobs after linking night completed
+    disable_orbit_identification = 0        # enable orbit id after linking
+    disable_orbit_determination = 0         # enable orbit determination; otherwise just link
+}
+
+site {
+# Leave blank; force manual set
+    obscode = 568                           # Mauna Kea
+    gmt_offset_hours = -10                  # 10 hours behind GMT; used for night delination
+
+# A/P
+    limiting_mag = 24
+    fwhm_arcseconds = 0.7                   # PSF FWHM; calc false/deg2 from this (see insertFalseDetections)
+    astrometric_error_arcseconds = 0.01     # arcseconds RMS
+    s2n = 5.0                               # SSM signal-to-noise
+
+## deprecated
+##    false_detection_rate_per_deg2 = 200     # 200 false dets/deg2
+##    false_detection_mag = 23.5              # mag for false detections
+#    false_detection_s2n = 5.0              # false detection signal-to-noise (5 or 3 usually); default use ssm->{s2n}
+}

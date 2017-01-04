@@ -1,0 +1,6 @@
+Changes
+Makefile.PL
+MANIFEST
+README
+t/PS-MOPS-DC-History-Removal.t
+lib/PS/MOPS/DC/History/Removal.pm

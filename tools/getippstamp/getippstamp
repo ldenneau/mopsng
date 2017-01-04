@@ -1,0 +1,181 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+getippstamp - fetch PS1 or PS2 stamp from IPP stamp server
+
+=head1 SYNOPSIS
+
+getippstamp [options] EXPNAME RA_DEG DEC_DEG SIZE
+
+  EXPNAME : PS exposure name
+  RA_DEG : right ascension [degrees]
+  DEC_DEG : declination [degrees]
+  SIZE : size of stamp in pixels, e.g. 100 for 100x100
+
+  Options:
+    --type=chip|diff : stamp type, chip default
+    --help : show man page
+    --verbose : show lots of output
+    --debug : debugging output
+
+  Note: to use negative value don't forget to "end" the options with --
+  e.g.:
+  getippstamp --type=diff -- o6432g0365o 331.746418 -7.298918 1000 > o6432g0365o.fits
+              ^^^^^^^^^^^ ^^                        ^^^^^^^^^
+              diff opt    end of options            negative declination
+  
+=head1 DESCRIPTION
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use FileHandle;
+use LWP::UserAgent;
+use Pod::Usage;
+
+my $type = 'chip';
+my $timeout_sec = 600;
+my $out;
+my $debug;
+my $verbose;
+my $help;
+GetOptions(
+    'type=s' => \$type,
+    'timeout=f' => \$timeout_sec,
+    'out=s' => \$out,
+    help => \$help,
+    debug => \$debug,
+    verbose => \$verbose,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+
+sub fail {
+    die "$_[0]\n";
+}
+
+
+my $expname = shift or pod2usage(-msg => 'EXPNAME not specified');
+my $ra_deg = shift or pod2usage(-msg => 'RA_DEG not specified');
+my $dec_deg = shift or pod2usage(-msg => 'DEC_DEG not specified');
+my $size = shift;
+pod2usage(-msg => 'SIZE not specified') if !defined($size); # allow size == 0
+
+my $ua = LWP::UserAgent->new;
+$ua->cookie_jar({});    # new empty cookie jar
+$ua->agent('Mozilla/5.0');
+$ua->timeout(10);
+#$ua->credentials('pstamp.ipp.ifa.hawaii.edu:80', 'Restricted Section', 'ps1sc', 'skysurveys');
+
+# The base URL for the request looks something like
+# http://pstamp.ipp.ifa.hawaii.edu/request.php?project=gpc1&select_by=exposure_id&img_type=chip&id=o7060g0277o&center_type=sky&RA=179.641382912573&DEC=49.0309076348828&range_type=Pixels&W=1000&H=1000&cmd_mode=Make%20Stamps
+
+# Plan is: 
+# 0. submit a auth request to get the session cookie.
+# 1. submit request, read reply, looking for 'request id: \d+' and web_XXXXX
+# 2. poll server for status, looking for liens with request id
+# 3. when status shows 'State: stop', follow the link using web_XXXXX/index.txt
+# 4. get item with pstamp type
+# 5. if not present, fail with contents of results.mdc (NOT DONE YET)
+# 6. timeout available
+# 7. write FITS file
+
+
+# 0. Initial session request.
+my $USERPASS = 'ps1sc:skysurveys';
+my $session_url = "http://$USERPASS\@pstamp.ipp.ifa.hawaii.edu/request.php";
+my $resp = $ua->get($session_url);
+
+my $project = "";
+my $psExpChar = substr($expname, 5, 1);
+if ($psExpChar eq "g") {
+    $project = "gpc1";
+} elsif ($psExpChar eq "h") {
+    $project = "gpc2";
+} else {
+    fail "[$expname] doesn't look like a Pan-STARRS observation. Aborting";
+}
+
+# 1. Scan the reply for 'request id: \d+. If we don't see this, fail.
+my $submit_url = "http://$USERPASS\@pstamp.ipp.ifa.hawaii.edu/request.php?project=$project&select_by=exposure_id&img_type=$type&id=$expname&center_type=sky&RA=$ra_deg&DEC=$dec_deg&range_type=Pixels&W=$size&H=$size&cmd_mode=Make\%20Stamps&email=mops\@ifa.hawaii.edu";
+$resp = $ua->get($submit_url)->content;
+print $resp if $debug;
+my @reqs = $resp =~ /request id: (\d+)/mg;
+if (@reqs == 0) {
+    fail "No request found after stamp submitted.  Something is not happy.";
+}
+my $me = $reqs[0];
+# Dig out web ID.
+my @webs = $resp =~ /(web_\d+)/mg;
+if (@webs == 0) {
+    fail "No web ID found after stamp submitted.  Something is not happy.";
+}
+my $meweb = $webs[0];
+printf STDERR "Found %d request(s), waiting on %d/$meweb.\n", scalar @reqs, $me;
+
+
+# 2. Now we poll the server for status, checking on  our request.
+my $t0 = time;      # start time (for timeout)
+my $done;
+my $sleep = 5;
+my $state;
+while (time - $t0 < $timeout_sec) {
+    my $check_url = "http://$USERPASS\@pstamp.ipp.ifa.hawaii.edu/request.php?project=gpc1&select_by=exposure_id&img_type=$type&id=$expname&center_type=sky&RA=$ra_deg&DEC=$dec_deg&range_type=Pixels&W=$size&H=$size&cmd_mode=Get%20Status";
+#    if ($verbose) { print STDERR "Checking $check_url\n"; } else { print STDERR '.'; }
+    my $check = $ua->get($check_url)->content;
+
+    ($state) = $check =~ /request id: $me\&nbsp;\&nbsp; State: (\w+)/;
+    last if $state eq 'stop';
+    printf STDERR "$me/$meweb is in state '$state' (%.0fs).\n", time - $t0;
+
+    sleep($sleep);
+    $sleep *= 1.2;
+    $sleep = 60 if ($sleep > 60);
+}
+#print STDERR "\n";
+if ($state ne 'stop') {
+    fail "Timed out waiting for request $me.";
+}
+
+# Go to the web results page and see what's there.
+my $fetch_url = "http://datastore.ipp.ifa.hawaii.edu/mops-pstamp-results/$meweb/index.txt";
+if ($verbose) { print STDERR "Fetching $fetch_url\n"; }
+my @result = split /[\r\n]+/, $ua->get($fetch_url)->content;
+my ($pstamp) = grep /pstamp/, @result;
+
+if (!$pstamp) {
+    fail "No pstamp result in $meweb";
+}
+if ($pstamp !~ /$expname/) {
+    fail "Weird result from pstamp: $pstamp";
+}
+print STDERR "Found '$pstamp'\n" if $verbose;
+
+# Get FITS file and spit back.
+my ($file) = (split /\|/, $pstamp)[0];
+$fetch_url = "http://datastore.ipp.ifa.hawaii.edu/mops-pstamp-results/$meweb/$file";
+if ($verbose) { print STDERR "Fetching $fetch_url\n"; }
+
+my $fits_resp = $ua->get($fetch_url);
+if ($fits_resp->code != 200) {
+    fail "Got $fits_resp->code from server";
+}
+my $fits = $fits_resp->content;
+
+if ($out) {
+    # Write to file.
+    my $fh = new FileHandle ">$out" or fail "Can't create filehandle for $out";
+    print $fh $fits;
+    $fh->close;
+    print STDERR "Wrote FITS file to $out.\n";
+}
+else {  
+    # Dump to STDOUT.
+    print $fits;
+}
+exit;
+

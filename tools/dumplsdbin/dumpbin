@@ -1,0 +1,95 @@
+#! /usr/bin/env perl
+
+=head1 NAME
+
+dumpbin - Dump contents of NSD binary files in LSD archive
+
+=head1 SYNOPSIS
+
+dumpbin [options] FILENAME
+
+  --offset OFFSET : number of records to skip from beginning of file
+  --length LENGTH : number of records to write
+  FILENAME : file to read
+
+=head1 DESCRIPTION
+
+This program dumps the contents of a nonsynthetic low-significance
+detection (NSD) archive file to STDOUT.
+
+=cut
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use PS::MOPS::LSD;
+
+my $offset = 0;
+my $length = 0;
+my $help;
+GetOptions(
+    help => \$help,
+    'offset=i' => \$offset,
+    'length=i' => \$length,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+pod2usage(-msg => 'no file specified') unless @ARGV;
+
+
+foreach my $filename (@ARGV) {
+    my $file_size_bytes = -s $filename;
+    next if !$file_size_bytes;
+    my $fh = new FileHandle $filename or die "can't open $filename";
+    $fh->binmode();
+
+    my $buf;
+    my $num_read;
+
+    my $unpack_template;
+    my $record_size_bytes;
+    my $offset_bytes;
+    my $read_size_bytes;
+
+    my @stuff;
+
+    # Determine record size, unpack template and file I/O offset/len.
+    if ($filename =~ /nsd/i) {
+        $unpack_template = PS::MOPS::LSD::NSD_PACK_TEMPLATE;
+        $record_size_bytes = PS::MOPS::LSD::NSD_TEMPLATE_LENGTH;
+    }
+    elsif ($filename =~ /syd/i) {
+        $unpack_template = PS::MOPS::LSD::SYD_PACK_TEMPLATE;
+        $record_size_bytes = PS::MOPS::LSD::SYD_TEMPLATE_LENGTH;
+    }
+    else {
+        warn "Unknown file format: $filename\n";
+        next;
+    }
+
+    $offset_bytes = $record_size_bytes * $offset;
+    if (!$length) {
+        $length = ($file_size_bytes - $offset_bytes) / $record_size_bytes;  # length in records
+    }
+    $read_size_bytes = $length * $record_size_bytes;
+
+    # Read entire part of file we want into memory, respecting
+    # user-specified length and offset.
+    # 0 => SEEK_SET
+    $fh->seek($offset_bytes, 0) or die "can't seek $filename offset $offset_bytes";
+    $num_read = $fh->read($buf, $read_size_bytes);
+    if ($num_read != $read_size_bytes) {
+        warn "short read from $filename";
+        next;
+    }
+    $fh->close();
+
+    $num_read = 0;      # count records extracted
+    while ($num_read < $length) {
+        @stuff = unpack $unpack_template, substr $buf, $num_read * $record_size_bytes, $record_size_bytes;
+        print join(' ', @stuff), "\n";
+        $num_read++;
+    }
+}

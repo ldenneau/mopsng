@@ -1,0 +1,429 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use FileHandle;
+use Getopt::Long;
+use Astro::Time;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+
+use subs qw(
+    get_reused_tracklets
+    get_reused_detections
+    do_detection_detail
+    do_tracklet_detail
+    do_tracklet_summary
+    do_detection_summary
+);
+
+
+# Start program here.
+my $instance_name;
+my $opt_tracklets;
+my $opt_detections;
+my $opt_details;
+my $ocnum;
+my $one_result_per_line;
+my $verbose;
+my $help;
+GetOptions(
+    instance => \$instance_name,
+    t => \$opt_tracklets,
+    tracklets => \$opt_tracklets,
+    d => \$opt_detections,
+    detections => \$opt_detections,
+    details => \$opt_details,
+    1 => \$one_result_per_line,
+    'ocnum=i' => \$ocnum,
+    verbose => \$verbose,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => undef);
+my $mops_config = $inst->getConfig();
+my $gmt_offset_hours = defined($mc->{site}->{gmt_offset_hours}) ? $mc->{site}->{gmt_offset_hours} : die "can't get gmt_offset_hours";
+die "no ocnum specified.\n" unless $ocnum;
+
+
+my $dbh = $inst->dbh();
+
+if ($opt_detections) {
+    my $dets_aref = get_reused_detections($dbh);
+    if ($opt_details) {
+        do_detection_details($dbh, $dets_aref);
+    }
+    else {
+        do_detection_summary($dbh, $dets_aref);
+    }
+}
+elsif ($opt_tracklets) {
+    my $tracklets_aref = get_reused_tracklets($dbh);
+    if ($opt_details) {
+        do_tracklet_details($dbh, $tracklets_aref);
+    }
+    else {
+        do_tracklet_summary($dbh, $tracklets_aref);
+    }
+}
+
+exit;
+
+
+sub get_reused_detections {
+    my ($dbh) = @_;
+
+    if ($verbose) {
+        print STDERR "Retrieving resued detections for OC $ocnum...";
+    }
+
+    # Get a list of all tracklets that appear multiple times in different derived objects.
+    $dbh = $inst->dbh();
+    my $dets_aref = $dbh->selectcol_arrayref(<<"SQL", undef, $ocnum) or die $dbh->errstr;
+select
+    ta.det_id det_id
+from
+    tracklet_attrib ta, derivedobject_attrib doa, derivedobjects do, tracklets t, fields f
+where
+    f.ocnum=?
+    and ta.tracklet_id=doa.tracklet_id
+    and doa.derivedobject_id=do.derivedobject_id
+    and doa.tracklet_id=t.tracklet_id
+    and t.field_id=f.field_id
+    and do.status <> 'M'
+group by ta.det_id
+having count(*) > 1
+SQL
+
+    if ($verbose) {
+        printf STDERR "found %d detections.\n", scalar(@{$dets_aref});
+    }
+
+    return  $dets_aref;
+}
+
+
+sub get_reused_tracklets {
+    my ($dbh) = @_;
+
+    if ($verbose) {
+        print STDERR "Retrieving resued tracklets for OC $ocnum...";
+    }
+
+    # Get a list of all tracklets that appear multiple times in different derived objects.
+    $dbh = $inst->dbh();
+    my $tracklets_aref = $dbh->selectcol_arrayref(<<"SQL", undef, $ocnum) or die $dbh->errstr;
+select
+    doa.tracklet_id tracklet_id
+from
+    derivedobject_attrib doa, derivedobjects do, tracklets t, fields f
+where
+    f.ocnum=?
+    and doa.derivedobject_id=do.derivedobject_id
+    and doa.tracklet_id=t.tracklet_id
+    and t.field_id=f.field_id
+    and do.status <> 'M'
+group by doa.tracklet_id
+having count(*) > 1
+SQL
+
+    if ($verbose) {
+        printf STDERR "found %d tracklets.\n", scalar(@{$tracklets_aref});
+    }
+
+    return  $tracklets_aref;
+}
+
+
+sub do_tracklet_details {
+    my ($dbh, $tracklets_aref) = @_;
+    my $sth;
+    my $href;
+
+    # Print tracklet details.  For each tracklet, list the derived objects
+    # that use the tracklet.
+    $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select 
+    do.derivedobject_id do_id, 
+    do.object_name object_name,
+    do.classification classification
+from 
+    derivedobject_attrib doa, derivedobjects do
+where 
+    doa.derivedobject_id=do.derivedobject_id
+    and doa.tracklet_id=? 
+SQL
+
+    if ($one_result_per_line) {
+        foreach my $trk_id (@{$tracklets_aref}) {
+            $sth->execute($trk_id) or die $sth->errstr;
+            while ($href = $sth->fetchrow_hashref) {
+                print join(' ', $trk_id, $href->{object_name}, $href->{classification}), "\n";
+            }
+        }
+    }
+    else {
+        foreach my $trk_id (@{$tracklets_aref}) {
+            my @items = ($trk_id);
+            $sth->execute($trk_id) or die $sth->errstr;
+            while ($href = $sth->fetchrow_hashref) {
+                push @items, $href->{object_name};
+            }
+            print join(' ', @items), "\n";
+        }
+    }
+}
+
+
+sub do_tracklet_summary {
+    # Print a header and a single line containing:
+    # num_tracklets num_clean_obj num_mixed_obj num_cleanmixed
+    my ($dbh, $tracklets_aref) = @_;
+    my $sth;
+    my $href;
+
+    if ($verbose) {
+        print STDERR "Analyzing derived objects...\n";
+    }
+
+    my $header = <<"EOF";
+OCNUM NUM_TRACKLETS NUM_CLEAN_DOBJ NUM_MIXED_DOBJ NUM_NS_DOBJ NUM_CLEANMIXED NUM_NSMIXED
+EOF
+
+    my %clean_tbl;      # clean DOs
+    my %mixed_tbl;      # mixed DOs
+    my %ns_tbl;         # nonsynth DOs
+    my %cleanmixed_tbl; # clean+mixed tracklets
+    my %nsmixed_tbl;    # ns+mixed tracklets
+
+    my $num_tracklets = scalar @{$tracklets_aref};
+    my $num_clean_dobj = 0;
+    my $num_mixed_dobj = 0;
+    my $num_ns_dobj = 0;
+    my $num_cleanmixed = 0;
+    my $num_nsmixed = 0;
+
+    $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select 
+    do.derivedobject_id do_id, 
+    do.object_name object_name,
+    do.classification classification
+from 
+    derivedobject_attrib doa, derivedobjects do
+where 
+    doa.derivedobject_id=do.derivedobject_id
+    and doa.tracklet_id=? 
+SQL
+
+    my $classification;
+    foreach my $trk_id (@{$tracklets_aref}) {
+        my $found_clean;        # does this trk have a clean DO
+        my $found_mixed;        # does this trk have a mixed DO
+        my $found_ns;           # does this trk have a NS DO
+
+        $sth->execute($trk_id) or die $sth->errstr;
+        while ($href = $sth->fetchrow_hashref()) {
+            $classification = $href->{classification};
+
+            if ($classification eq $MOPS_EFF_CLEAN) {
+                $clean_tbl{$href->{do_id}} = 1;
+                $found_clean = 1;
+            }
+            elsif ($classification eq $MOPS_EFF_MIXED) {
+                $mixed_tbl{$href->{do_id}} = 1;
+                $found_mixed = 1;
+            }
+            elsif ($classification eq $MOPS_EFF_NONSYNTHETIC) {
+                $ns_tbl{$href->{do_id}} = 1;
+                $found_ns = 1;
+            }
+        }
+
+        if ($found_clean and $found_mixed) {
+            $num_cleanmixed++;
+        }
+        if ($found_ns and $found_mixed) {
+            $num_nsmixed++;
+        }
+    }
+
+    # Get totals.
+    $num_clean_dobj = scalar keys %clean_tbl;
+    $num_mixed_dobj = scalar keys %mixed_tbl;
+    $num_ns_dobj = scalar keys %ns_tbl;
+
+    # Print results.
+    print $header;
+    print join(' ', $ocnum, $num_tracklets, $num_clean_dobj, $num_mixed_dobj, $num_ns_dobj, $num_cleanmixed, $num_nsmixed), "\n";
+}
+
+
+sub do_detection_details {
+    my ($dbh, $dets_aref) = @_;
+    my $sth;
+    my $href;
+
+    # Print detection details.  For each detection, list the derived objects
+    # that use the detection.
+    $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select 
+    do.derivedobject_id do_id, 
+    do.object_name object_name,
+    do.classification classification
+from 
+    tracklet_attrib ta, derivedobject_attrib doa, derivedobjects do
+where 
+    ta.tracklet_id=doa.tracklet_id
+    and doa.derivedobject_id=do.derivedobject_id
+    and ta.det_id=? 
+SQL
+
+    if ($one_result_per_line) {
+        foreach my $det_id (@{$dets_aref}) {
+            $sth->execute($det_id) or die $sth->errstr;
+            while ($href = $sth->fetchrow_hashref) {
+                print join(' ', $det_id, $href->{object_name}, $href->{classification}), "\n";
+            }
+        }
+    }
+    else {
+        foreach my $det_id (@{$dets_aref}) {
+            my @items = ($det_id);
+            $sth->execute($det_id) or die $sth->errstr;
+            while ($href = $sth->fetchrow_hashref) {
+                push @items, $href->{object_name};
+            }
+            print join(' ', @items), "\n";
+        }
+    }
+}
+
+
+sub do_detection_summary {
+    # Print a header and a single line containing:
+    # num_tracklets num_clean_obj num_mixed_obj num_cleanmixed
+    my ($dbh, $dets_aref) = @_;
+    my $sth;
+    my $href;
+
+    if ($verbose) {
+        print STDERR "Analyzing derived objects...\n";
+    }
+
+    my $header = <<"EOF";
+OCNUM NUM_DETS NUM_CLEAN_DOBJ NUM_MIXED_DOBJ NUM_NS_DOBJ NUM_CLEANMIXED NUM_NSMIXED
+EOF
+
+    my %clean_tbl;      # clean derived objects
+    my %mixed_tbl;      # mixed derived objects
+    my %ns_tbl;         # nonsynth DOs
+    my %cleanmixed_tbl; # cleanmixed detections
+    my %nsmixed_tbl;    # ns+mixed tracklets
+
+    my $num_dets = scalar @{$dets_aref};
+    my $num_clean_dobj = 0;
+    my $num_mixed_dobj = 0;
+    my $num_ns_dobj = 0;
+    my $num_cleanmixed = 0;
+    my $num_nsmixed = 0;
+
+    $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select 
+    do.derivedobject_id do_id, 
+    do.object_name object_name,
+    do.classification classification
+from 
+    tracklet_attrib ta, derivedobject_attrib doa, derivedobjects do
+where 
+    ta.tracklet_id=doa.tracklet_id
+    and doa.derivedobject_id=do.derivedobject_id
+    and ta.det_id=? 
+SQL
+
+    my $classification;
+    foreach my $det_id (@{$dets_aref}) {
+        my $found_clean;        # does this trk have a clean DO
+        my $found_mixed;        # does this trk have a mixed DO
+        my $found_ns;           # does this trk have a NS DO
+
+        $sth->execute($det_id) or die $sth->errstr;
+        while ($href = $sth->fetchrow_hashref()) {
+            $classification = $href->{classification};
+
+            if ($classification eq $MOPS_EFF_CLEAN) {
+                $clean_tbl{$href->{do_id}} = 1;
+                $found_clean = 1;
+            }
+            elsif ($classification eq $MOPS_EFF_MIXED) {
+                $mixed_tbl{$href->{do_id}} = 1;
+                $found_mixed = 1;
+            }
+            elsif ($classification eq $MOPS_EFF_NONSYNTHETIC) {
+                $ns_tbl{$href->{do_id}} = 1;
+                $found_ns = 1;
+            }
+        }
+
+        if ($found_clean and $found_mixed) {
+            $num_cleanmixed++;
+        }
+        if ($found_ns and $found_mixed) {
+            $num_nsmixed++;
+        }
+    }
+
+    # Get totals.
+    $num_clean_dobj = scalar keys %clean_tbl;
+    $num_mixed_dobj = scalar keys %mixed_tbl;
+    $num_ns_dobj = scalar keys %ns_tbl;
+
+    # Print results.
+    print $header;
+    print join(' ', $ocnum, $num_dets, $num_clean_dobj, $num_mixed_dobj, $num_ns_dobj, $num_cleanmixed, $num_nsmixed), "\n";
+}
+
+
+=head1 NAME
+
+mops_audit - Audit duplicate tracklet and detection usage in a MOPS database
+ 
+=head1 SYNOPSIS
+
+mops_audit --ocnum=OCNUM [options] 
+
+  --ocnum=OCNUM : OC to analyze (required)
+  --instance=INSTANCE_NAME : name of simulation to analyze
+  --tracklets : analyze tracklet data
+  --detections : analyze detection data
+  --details : show details instead of summary
+  --1 : (numeral 1) show details one-per-line
+  --verbose : noise on STDERR
+  --help : show usage
+
+=head1 DESCRIPTION
+
+Analyze a MOPS database for duplicate tracklet or detection usage within
+derived objects.  Specifically this means to count and report tracklets
+or detections that appear in more than one derived objects.  This is a
+normal occurrence within MOPS that should be infrequent.
+
+=head1 EXAMPLES
+
+# print summary tracklet info for OC 114
+mops_audit --ocnum=114 --tracklets  
+
+# print tracklet details for OC 114
+mops_audit --ocnum=114 --tracklets  --details 
+
+# print summary detection info for OC 114
+mops_audit --ocnum=114 --tracklets  
+
+# print detection details, one-per-line, for OC 114
+mops_audit --ocnum=114 --tracklets  --details 
+
+=cut

@@ -1,0 +1,44 @@
+#!/usr/bin/env perl
+
+# Just a stub for quick debugging.
+use Data::Dumper;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::IPPDB;
+
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => undef);
+$dbh = $inst->dbh();
+
+print STDERR "Loading fields.\n";
+$rows = $dbh->selectcol_arrayref(<<"SQL") or die $dbh->errstr;
+select fpa_id from fields where de10 is NULL
+SQL
+
+# Loop through fields and get survey mode from IPP.
+print STDERR "Loading IPP data.\n";
+$ippdbh = PS::MOPS::IPPDB::dbh();
+$tessids = $ippdbh->selectcol_arrayref(<<"SQL", { Columns => [1, 2] }) or die $dbh->errstr;
+select exp_name, tess_id from rawExp where exp_name like 'o5%'
+SQL
+%name2tessid = @{$tessids};
+
+# Match em up and update.
+#$sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+#update fields set de10=? where fpa_id=?
+#SQL
+print "begin;\n";
+foreach my $row (@{$rows}) {
+    my $xpx;
+    $match = $name2tessid{$row};
+    if ($match and $match =~ /^MD.*V2$/) {
+        $xpx = -0.26;
+    }
+    else {
+        $xpx = 0.26;
+    }
+#    printf STDERR "Patching DE10 %.2f $row $match.\n", $xpx;
+#    $sth->execute($xpx, $row) or die $sth->errstr;
+     printf "update fields set de10=%.6f where fpa_id='$row';\n", $xpx;
+}
+print "commit;\n";

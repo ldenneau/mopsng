@@ -1,0 +1,55 @@
+#!/bin/bash
+ 
+# Verification test for CR 4.2.3.1 (attribution efficiency)
+# Mikael Granvik  07/24/2008
+
+USERNAME="granvik"
+STUB="cr_4231_verification"
+INSTANCE_NAME="psmops_${USERNAME}_cr_test_sim"
+
+echo "1..1"
+
+# Query attr efficiency:
+attreff=`echo \
+"
+select
+  truncate(clean/avail,5) attr_efficiency
+from (
+  select
+    sum(if(sub_classification in ('X', 'C'),1,0)) avail,
+    sum(if(sub_classification='C',1,0)) clean
+  from (
+    select
+      h.classification sub_classification
+    from
+      history h, history_attributions ha
+    where 
+      h.event_type = 'A'
+      and h.event_id = ha.event_id
+      and ha.ephemeris_uncertainty < 15 # arcsec!?
+  ) as sub 
+) effacc
+" | \
+mysql -umops -pmops -hschmopc01 $INSTANCE_NAME`
+
+if [[ $1 == "--result" ]]
+    then
+    echo $attreff
+fi
+
+# Remove header from result and convert to integer so that poor Bash
+# understands what we want:
+attreff=${attreff#attr_efficiency}
+attreff=`echo "$attreff * 100000" | bc`
+attreff=${attreff/.*/}
+
+#echo $attreff
+
+# Check whether the 99% criterion is met:
+if (( $attreff > "99000" )) ; then
+    echo "ok 1 - ${STUB}"
+else
+    echo "not ok 1 - ${STUB}"
+fi
+
+exit

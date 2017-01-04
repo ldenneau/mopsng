@@ -1,0 +1,160 @@
+#!/usr/bin/env perl
+# $Id: analyzeFindTracklets 1295 2006-09-01 00:30:27Z denneau $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+
+
+my @FAMILIES = qw (
+    S0
+    S1
+    St
+    SC
+    ST
+    SS
+    Sc
+);
+
+
+# Summary data.
+my %aa;     # all summary
+my %dd;     # detections 
+my %tt;     # tracklets
+
+my $mjd;
+my $header;
+my $raw;
+my $detsfile;
+my $sumfile;
+my $help;
+GetOptions(
+    'mjd=i' => \$mjd,
+    header => \$header,
+    raw => \$raw,
+    dets => \$detsfile,
+    sum => \$sumfile,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(2) unless $mjd;
+pod2usage(-verbose => 2) if $help;
+
+
+# Analyze all detections on this date.
+my $det_i = modcd_retrieve(mjd => $mjd, mysql_store_result => 1);            # get detection iterator
+my $det;
+my %detdata;
+while ($det = $det_i->next) {
+    if ($det->objectName && $det->objectName !~ /$MOPS_NONSYNTHETIC_OBJECT_NAME/o) {  # valid objectName
+        $detdata{$det->objectName}++;
+    }
+}
+
+# Now report all detections for which its detdata is >= 2.  This means
+# we should have found a tracklet for it.
+my $d;
+if ($raw) {
+    # Output raw data; that is, each item we analyzed.
+    foreach $d (sort keys %detdata) {
+        print "DET $d\n" if $detdata{$d} >= 2;
+    }
+    foreach $d (sort keys %detdata) {
+        print "ALL $d\n";
+    }
+}
+else {
+    # Output summary data; this is stuff grouped by family.
+    my $prefix;
+    foreach $d (sort keys %detdata) {
+        $prefix = substr($d, 0, 2);
+        $dd{$prefix}++ if $detdata{$d} >= 2;
+        $aa{$prefix}++;
+    }
+}
+
+
+# Analyze all tracklets.
+my $trk_i = modct_selectTracklets(mjd1 => $mjd, mysql_store_result => 1);            # get tracklets iterator
+my $trk;
+my $mixed = 0;
+while ($trk = $trk_i->next) {
+    my %cleanstuff;
+    my $name;
+    my $prefix;
+    foreach my $det (@{$trk->detections}) {
+        $name = $det->objectName || $MOPS_NONSYNTHETIC_OBJECT_NAME;
+        $cleanstuff{$name}++;
+    }
+
+    # See if this is a clean tracklet, and if so, print the object name
+    # or tabulate it.
+    if (scalar keys %cleanstuff == 1 &&         # only one obj for this tracklet
+        !exists($cleanstuff{$MOPS_NONSYNTHETIC_OBJECT_NAME})) {          # and it's not a nonsynthetic detection
+
+        if ($raw) {
+            if ($cleanstuff{$name} >= 2) {
+                print "TRK $name\n";
+            }
+        }
+        else {
+            $prefix = substr($name, 0, 2);
+            $tt{$prefix}++;
+        }
+    }
+    else {
+        # Mixed tracklet.
+        if ($raw) {
+            print "TRK MIXED\n";                        # bogus tracklet, different objs
+        }
+        else {
+            $tt{'MX'}++;        # inc mixed count
+        }
+    }
+}
+
+if (!$raw) {
+    if ($header) {
+        print "FAM\tANY\t>=2\tTRK\n";
+    };
+    foreach my $fam (@FAMILIES, 'MX') {
+        printf "$fam\t%d\t%d\t%d\n", ($aa{$fam} || 0), ($dd{$fam} || 0), ($tt{$fam} || 0);
+    }
+}
+
+
+
+
+=head1 NAME
+
+analyzeFindTracklets
+
+=head1 SYNOPSIS
+
+analyzeFindTracklets --mjd DATE [--help]
+
+  --mjd DATE : date to analyze, MJD
+  --header : display header
+  --raw : show raw (individual) object names, not summary
+  --dets DETSFILE : findTracklets input detections file
+  --sum SUMFILE : findTracklets output summary file
+  --help : show man page
+
+=head1 DESCRIPTION
+
+Analyze FindTracklet's performace for a given MJD.  Look at all detections
+for that date and determine how many tracklets are available, then examine
+all tracklets created on that date and determine how many were actually
+found by FindTracklets.  Tabulate by synthetic object prefix.
+
+Also report mixed tracklets.
+
+If --dets and --sum are specified, then these text files are used to analyze
+the tracklets, instead of the current PSMOPS database.
+
+=cut

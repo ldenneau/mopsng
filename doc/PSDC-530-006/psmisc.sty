@@ -1,0 +1,289 @@
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%       ****************************************
+%       *              ENDNOTES                *
+%       ****************************************
+%
+%       ****************************************
+%       *           ENDNOTE MACROS             *
+%       ****************************************
+%
+
+\@definecounter{endnote}
+\def\theendnote{\arabic{endnote}}
+
+% Default definition
+\def\@makeenmark{\hbox{$^{\@theenmark}$}}
+
+\newdimen\endnotesep
+
+\def\endnote{\@ifnextchar[{\@xendnote}{\stepcounter
+   {endnote}\xdef\@theenmark{\theendnote}\@endnotemark\@endnotetext}}
+
+\def\@xendnote[#1]{\begingroup \c@endnote=#1\relax
+   \xdef\@theenmark{\theendnote}\endgroup
+   \@endnotemark\@endnotetext}
+
+%  Here begins endnote code that's really different from the footnote
+% code of LaTeX.
+
+\let\@doanenote=0
+\let\@endanenote=0
+
+\newwrite\@enotes
+\newif\if@enotesopen \global\@enotesopenfalse
+
+\def\@openenotes{\immediate\openout\@enotes=\jobname.ent\relax
+      \global\@enotesopentrue}
+
+%  The stuff with \next and \meaning is a trick from the TeXbook, 382,
+% there intended for setting verbatim text, but here used to avoid
+% macro expansion when the footnote text is written.  \next will have
+% the entire text of the footnote as one long line, which might well
+% overflow limits on output line length; the business with \newlinechar
+% makes every space become a newline in the \@enotes file, so that all
+% of the lines wind up being quite short.
+
+\long\def\@endnotetext#1{%
+     \if@enotesopen \else \@openenotes \fi
+     \immediate\write\@enotes{\@doanenote{\@theenmark}}%
+     \begingroup
+        \def\next{#1}%
+        \newlinechar='40
+        \immediate\write\@enotes{\meaning\next}%
+     \endgroup
+     \immediate\write\@enotes{\@endanenote}}
+
+% \addtoendnotes works the way the other endnote macros probably should
+% have, requiring the use of \protect for fragile commands.
+
+\long\def\addtoendnotes#1{%
+     \if@enotesopen \else \@openenotes \fi
+     \begingroup
+        \newlinechar='40
+        \let\protect\string
+        \immediate\write\@enotes{#1}%
+     \endgroup}
+
+%  End of unique endnote code
+
+\def\endnotemark{\@ifnextchar[{\@xendnotemark
+    }{\stepcounter{endnote}\xdef\@theenmark{\theendnote}\@endnotemark}}
+
+\def\@xendnotemark[#1]{\begingroup \c@endnote #1\relax
+   \xdef\@theenmark{\theendnote}\endgroup \@endnotemark}
+
+\def\@endnotemark{\leavevmode\ifhmode
+  \edef\@x@sf{\the\spacefactor}\fi \@makeenmark
+   \ifhmode\spacefactor\@x@sf\fi\relax}
+
+\def\endnotetext{\@ifnextchar
+    [{\@xendnotenext}{\xdef\@theenmark{\theendnote}\@endnotetext}}
+
+\def\@xendnotenext[#1]{\begingroup \c@endnote=#1\relax
+   \xdef\@theenmark{\theendnote}\endgroup \@endnotetext}
+
+
+%  \theendnotes actually prints out the endnotes.
+
+%  The user may want separate endnotes for each chapter, or a big
+% block of them at the end of the whole document.  As it stands,
+% either will work; you just say \theendnotes wherever you want the
+% endnotes so far to be inserted.  However, you must add
+% \setcounter{endnote}{0} after that if you want subsequent endnotes
+% to start numbering at 1 again.
+
+%  \enoteformat is provided so user can specify some special formatting
+% for the endnotes.  It needs to set up the paragraph parameters, start
+% the paragraph, and print the label.  The \leavemode stuff is to make
+% and undo a dummy paragraph, to get around the games \section*
+% plays with paragraph indenting.
+
+\def\notesname{Notes}% <------ JK
+\def\enoteheading{\section*{\notesname
+  \@mkboth{\uppercase{\notesname}}{\uppercase{\notesname}}}%
+     \leavevmode\par\vskip-\baselineskip}
+
+\def\enoteformat{\rightskip\z@ \leftskip\z@ \parindent=1.8em
+     \leavevmode\llap{\hbox{$^{\@theenmark}$}}}
+
+\def\enotesize{\footnotesize}
+
+% The definition of \ETC. is needed only for versions of TeX prior
+% to 2.992.  Those versions limited \meaning expansions to 1000
+% characters; in 2.992 and beyond there is no limit.  At Brandeis the
+% BIGLATEX program changed the code in the token_show procedure of
+% TeX to eliminate this problem, but most ``big'' versions of TeX
+% will not solve this problem.
+
+\def\theendnotes{
+% only try to open the endnotes file (\jobname.ent) if endnotes have been made
+  \if@enotesopen 
+   \immediate\closeout\@enotes 
+   \global\@enotesopenfalse
+   \begingroup
+   \makeatletter
+% the following is to save catcode of ``>'' and restore it in \@endanenote
+   \edef\@tempa{`\string >}%
+   \ifnum\catcode\@tempa=11\let\@ResetGT\relax% accepts also that > were active
+     \else\edef\@ResetGT{\noexpand\catcode\@tempa=\the\catcode\@tempa}%
+     \fi%
+   \catcode`>=12% char > will be read as char so force it to \catcode 12 --bg\edef\GOfrench{`\string @}% temp def futher correctly defined
+   \def\@doanenote##1##2>{\def\@theenmark{##1}\par\begingroup
+     \@ResetGT%\catcode`>=13
+     \edef\@currentlabel{\csname p@endnote\endcsname\@theenmark} %DW
+     \enoteformat}
+   \def\@endanenote{\par\endgroup}%
+   \def\ETC.{\errmessage{Some long endnotes will be truncated; %
+                            use BIGLATEX to avoid this}%
+   \def\ETC.{\relax}}
+   \enoteheading
+   \enotesize
+   \input{\jobname.ent}%
+   \endgroup
+  \else \fi
+}
+
+\def\endnotesection{
+\begingroup
+\parindent 0pt
+\parskip 2ex
+\def\enotesize{\normalsize}
+\theendnotes
+\endgroup
+}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+%%% TBD Generation %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\newread\@infile
+\newwrite\@tbdfile
+
+\newif\if@tbdfileopen \global\@tbdfileopenfalse
+
+\@definecounter{tbdcount}
+
+\def\thetbd{\arabic{tbdcount}}
+\def\thetbdsec{\thesection}
+\let\ttnl\relax
+
+\def\tbd#1{
+ \textbf{\color{red}#1 (TBD)}
+ \stepcounter{tbdcount}
+ \if@tbdfileopen \else \@opentbdfile \fi
+ \immediate\write\@tbdfile{\thetbdsec\ & \thepage\ & \thetbd\ & #1 \ttnl }%
+}
+
+\def\@opentbdfile{
+ \immediate
+ \openout
+ \@tbdfile=\jobname.tbd 
+ \global\@tbdfileopentrue
+}
+
+% command to add TBDs at end of file processing:
+\def\dumptbd{
+  % only try to open the file (\jobname.tbd) if tbds have been made
+  \if@tbdfileopen 
+    \immediate\closeout\@tbdfile 
+    \global\@tbdfileopenfalse
+    \def\ttnl{\tabularnewline \hline}
+    { \Large \bf TBD Listing}
+    \begin{center}
+    \begin{longtable}{|p{1in}|p{0.8in}|p{0.8in}|p{3.45in}|}
+    \hline
+    {\bf Section No.} & {\bf Page No.} & {\bf TBD No.} & {\bf Description} \\
+    \hline
+    \input{\jobname.tbd}
+    \end{longtable}
+    \end{center}
+  \else \fi
+}
+
+\def\inserttbd{
+  \openin\@infile=\jobname.tbd
+  \ifeof\@infile
+  \else
+    \immediate\closeout\@infile
+    \def\ttnl{\tabularnewline \hline}
+    { \Large \bf TBD Listing}
+    \begin{center}
+    \begin{longtable}{|p{1in}|p{0.8in}|p{0.8in}|p{3.45in}|}
+    \hline
+    {\bf Section No.} & {\bf Page No.} & {\bf TBD No.} & {\bf Description} \\
+    \hline
+    \input{\jobname.tbd}
+    \end{longtable}
+    \end{center}
+    \let\ttnl\relax
+  \fi
+}
+
+%%% TBR Generation %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\newread\@infile
+\newwrite\@tbrfile
+
+\newif\if@tbrfileopen \global\@tbrfileopenfalse
+
+\@definecounter{tbrcount}
+
+\def\thetbr{\arabic{tbrcount}}
+\let\ttnl\relax
+
+\def\tbr#1{
+ \textbf{\color{blue}#1 (TBR)}
+ \stepcounter{tbrcount}
+ \if@tbrfileopen \else \@opentbrfile \fi
+ \immediate\write\@tbrfile{\thetbdsec\ & \thepage\ & \thetbr\ & #1 \ttnl }%
+}
+
+\def\@opentbrfile{
+ \immediate
+ \openout
+ \@tbrfile=\jobname.tbr 
+ \global\@tbrfileopentrue
+}
+
+% command to add TBRs at end of file processing:
+\def\dumptbr{
+  % only try to open the file (\jobname.tbr) if tbrs have been made
+  \if@tbrfileopen 
+    \immediate\closeout\@tbrfile 
+    \global\@tbrfileopenfalse
+    \def\ttnl{\tabularnewline \hline}
+    { \Large \bf TBR Listing}
+    \begin{center}
+    \begin{longtable}{|p{1in}|p{0.8in}|p{0.8in}|p{3.45in}|}
+    \hline
+    {\bf Section No.} & {\bf Page No.} & {\bf TBR No.} & {\bf Description} \\
+    \hline
+    \input{\jobname.tbr}
+    \end{longtable}
+    \end{center}
+  \else \fi
+}
+
+\def\inserttbr{
+  \openin\@infile=\jobname.tbr
+  \ifeof\@infile
+  \else
+    \immediate\closeout\@infile
+    \def\ttnl{\tabularnewline \hline}
+    { \Large \bf TBR Listing}
+    \begin{center}
+    \begin{longtable}{|p{1in}|p{0.8in}|p{0.8in}|p{3.45in}|}
+    \hline
+    {\bf Section No.} & {\bf Page No.} & {\bf TBR No.} & {\bf Description} \\
+    \hline
+    \input{\jobname.tbr}
+    \end{longtable}
+    \end{center}
+    \let\ttnl\relax
+  \fi
+}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

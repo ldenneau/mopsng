@@ -1,0 +1,787 @@
+#!/usr/bin/env perl
+# $Id: attributeOrbits 2091 2007-11-15 01:31:38Z fpierfed $
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use Data::Dumper;
+use Params::Validate;
+
+use Astro::SLA;
+use PS::MOPS::JPLORB;
+use PS::MOPS::JPLEPH;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::Orbit;
+use PS::MOPS::DC::DerivedObject;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::History::Attribution;
+use PS::MOPS::DC::History::Precovery;
+use PS::MOPS::DC::Efficiency;
+use PS::MOPS::DC::EONQueue;
+
+
+# MOPS Configuration.
+my $inst;
+
+# Invocation options.
+my $instance_name;
+my $date_mjd;
+my $nn;
+my $precovery;
+my $ignore_field_status;
+my $only_field_id;
+my $debug;
+my $verbose;
+my $superverbose;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'date_mjd=f' => \$date_mjd,
+    'nn=f' => \$nn,
+    precovery => \$precovery,
+    ignore_field_status => \$ignore_field_status,
+    'only_field_id=i' => \$only_field_id,
+    debug => \$debug,
+    verbose => \$verbose,
+    superverbose => \$superverbose,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(2) unless @ARGV && ($date_mjd || $nn);      # no args
+
+$verbose = 1;
+
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_logger = $inst->getLogger;
+
+# Configuration.
+my $mops_config = $inst->getConfig;
+my $field_size_deg2 = $mops_config->{site}->{field_size_deg2} or
+    $mops_logger->logdie("couldn't get field_size_deg2");
+my $field_shape = $mops_config->{site}->{field_shape} || 'circle';
+
+my $attribution_resid_threshold_arcsec = 
+    $mops_config->{dtctl}->{attribution_resid_threshold_arcsec} or
+    $mops_logger->logdie("couldn't get attribution_resid_threshold_arcsec");
+
+# If night number was specified, convert to starting MJD.
+if ($nn) {
+    $date_mjd = mopslib_nn2mjd($nn, $mops_config->{site}->{gmt_offset_hours});
+}
+
+
+#my $obscode = $mops_config->{site}->{obscode} or 
+#    $mops_logger->logdie("couldn't get obscode");
+
+##my $attribution_proximity_thresh_arcsec = 3 * 60;    # 3 arcminutes
+my $attribution_proximity_thresh_arcsec = 
+    $mops_config->{dtctl}->{attribution_proximity_threshold_arcsec} || 3 * 60;
+##    $mops_logger->logdie("couldn't get attribution_proximity_threshold_arcsec");
+
+my $disable_attributions = $mops_config->{debug}->{disable_attributions};
+my $force_empty_attribution_list = $mops_config->{debug}->{force_empty_attribution_list};
+my $use_iod = $mops_config->{dtctl}->{attribution_use_iod};
+
+# What is the minimum arc length to do IOD?
+my $max_arclength_for_iod = $mops_config->{dtctl}->{attribution_precovery_max_arclength_for_iod} || 0;
+
+# Field status management.
+my $START_FIELD_STATUS = $FIELD_STATUS_TRACKLETS_DONE;
+my $END_FIELD_STATUS = $FIELD_STATUS_ATTRIBUTIONS;
+
+# Extra area around FOV when checking objs in fields.
+my $FOV_EXTRA = 1.05;
+
+# Forward sub declarations.
+use subs qw{
+    do_field
+    find_candidate_tracklets
+    eval_attribution
+};
+
+
+
+
+# Start.  Input files contain FieldProximity output:(fieldId, objectName )
+# tuples for the given MJD.
+my $filename = shift;           # get filename from cmd line
+my @lines;
+if (-s $filename) {
+    my $fh = new FileHandle $filename or warn "can't open $filename";        # filehandle
+    @lines = grep !/^#/, <$fh>;     # toss comment lines
+    chomp @lines;
+    close $fh;
+}
+
+
+# Next get a list of all field IDs for this MJD.  It's not guaranteed
+# that the FieldProximity output will hit all fields, so we need to
+# keep track of the ones we DON'T hit so we can set all field statuses
+# to their correct values.
+my @all_fields;
+my $all_fields_i = modcf_retrieve($inst, date_mjd => $date_mjd);
+my $field;
+while ($field = $all_fields_i->next) {
+    # Add the field to our list to process if either: $only_field_id
+    # is not set (process all field), or our fieldId==$only_field_id.
+    if (!$only_field_id or ($field->fieldId == $only_field_id)) {
+        push @all_fields, $field;
+    }
+}
+##$mops_logger->info(sprintf "Got %d fields.", scalar @all_fields);
+
+
+# Group lines by field.  Our hash will contain keys that are fieldIds,
+# and each fieldId will have an ARRAYREF containing derived object names.
+my $line;           # complete line
+my %fieldtbl;       # hash table of fields
+my ($fieldId, $objectName, $fieldLno, $orbLno);
+foreach $line (@lines) {
+    ($fieldId, $objectName, $fieldLno, $orbLno) = split /\s+/, $line;
+    push @{$fieldtbl{$fieldId}}, $objectName;    # add this orbit to this field
+}
+$mops_logger->info(sprintf "Found %d fields to attribute in $filename.", scalar keys %fieldtbl);
+
+
+# Field processing.  Just do_field() for each field.
+my $num_field = 1;    # progress counter for printing status
+$mops_logger->debug(sprintf "%d fields to attribute.", scalar keys %fieldtbl);
+$inst->pushAutocommit(0);         # disable DB autocommit
+
+foreach $field (@all_fields) {
+    # If the field is not a parent field, skip it.
+    if (defined($field->parentId)) {
+        # For attributions, mark the field as having been processed.
+        unless ($precovery and !$ignore_field_status) { 
+            $field->status($END_FIELD_STATUS);            # field processed 
+            $mops_logger->info(sprintf "changed status of field %d to $END_FIELD_STATUS", $field->fieldId);
+        }
+    }
+    else  {
+        $fieldId = $field->fieldId;
+        do_field($fieldId, $fieldtbl{$fieldId});    # process detections for this field
+        exit if $debug;
+        $num_field++;
+        $inst->dbh->commit;
+    }
+}
+
+# Following should no longer be necessary since we're looping above
+# using @all_fields, not keys %fieldtbl.
+
+## Update field statuses unless we're doing precovery.  For attributions
+## we need to indicate the field has gone through the attribution step.
+## LD: XX probably move this to DTCTL eventually.
+#unless ($precovery) {
+#    $mops_logger->debug("Updating field statuses.");
+#    foreach $field (@all_fields) {
+#        $field->status($END_FIELD_STATUS);
+#    }
+#}
+$mops_logger->debug("$0 done.");
+
+$inst->dbh->commit;
+$inst->popAutocommit;
+exit;
+
+
+sub do_field {
+    my ($fieldId, $objects) = @_;
+    my $field;
+
+#    $mops_logger->info(sprintf "Processing field ID %d", $fieldId) if $superverbose;
+    $mops_logger->info("Processing field ID $fieldId");
+
+    # If attributions are disabled in the configuration or the object
+    # ARRAYREF was empty, just set the status for the field and return.
+    if ($disable_attributions) {
+        $field = modcf_retrieve($inst, fieldId => $fieldId);
+
+        # Don't update the field status if either --precovery was set (during precovery, duh)
+        # or --ignore_field_status was set (testing, operator override).
+        unless ($precovery and !$ignore_field_status) { 
+            $field->status($END_FIELD_STATUS);              # field processed 
+        }
+        return;
+    }
+
+    # Fixup $objects ARRAYREF.  If $force_empty_attribution_list is set, 
+    # always set the object list to empty.  This lets us test that provisional
+    # attributions are getting created. 
+    $objects = [] if (!defined($objects) or $force_empty_attribution_list);                 
+
+    # For each orbit provided, calculate precise ephemerides for derived objects.
+    eval {
+        my $trk;
+        $field = modcf_retrieve($inst, fieldId => $fieldId);
+        die "can't retrieve field $fieldId" unless $field;
+        my $s = $field->status;
+
+        # Table of attributions of synthetic objects we should find.  As we attribute
+        # them we remove them from this table.  Leftovers are inserted as unfound
+        # attributions.
+        my %pa_tbl;         # provisional attribution table
+
+        my $pa_aref = modce_retrieveProvisionalAttributions($inst, 
+            fieldId => $field->fieldId, 
+            precovery => $precovery,
+        );
+        foreach my $pa (@{$pa_aref}) {
+            $pa_tbl{$pa->ssmId} = $pa;
+        }
+
+        if ($superverbose) {
+            printf "Fetched %d provisional attributions for field %d.\n", scalar @{$pa_aref}, $field->fieldId;
+            print join(" ", map { modcs_ssmId2objectName($inst, $_) } keys %pa_tbl), "\n";
+        }
+
+#        if ($verbose && scalar keys %pa_tbl) {
+#            $mops_logger->info(sprintf "Found %d provisional attributions/precoveries for field %d", scalar keys %pa_tbl, $fieldId);
+#            $mops_logger->info(modcs_ssmId2objectName($inst, $_)) foreach keys %pa_tbl;
+#        }
+
+        my %keep_obj2pos;
+        my $pos;
+        my $dist;
+        my $limiting_mag;
+        my ($fc_ra_deg, $fc_dec_deg);   # field center RA, DEC
+        my $fov_size_deg;
+        my %obj_to_radius; # Given an derived object ID and a field id, return the corrseponding search radius.
+
+
+        $limiting_mag = $field->limitingMag;
+        $fc_ra_deg = $field->ra;
+        $fc_dec_deg = $field->dec;
+
+        if ($field_shape eq 'circle') {
+            $fov_size_deg = 2 * sqrt($field_size_deg2 / $PI) * $FOV_EXTRA;  # width of field (FOV) + extra margin
+        }
+        else {
+            $fov_size_deg = sqrt($field_size_deg2) * $FOV_EXTRA;            # size of side of FOV rect
+        }
+
+        # Calculate the exact predicted position of derived objects near this field.
+        my $results;
+        if (@{$objects}) {  # check empty array
+            $results = jpleph_calcEphemerides(
+                instance => $inst,
+                derivedObjectNames => $objects, 
+                epoch => $field->epoch,
+                obscode => $field->obscode,
+                withSRC => 1,
+            );
+            $mops_logger->info(sprintf "Fetched %d orbits for epoch %.1f.", scalar keys %{$results}, $field->epoch);
+            if ($superverbose) {
+                my $field_epoch = $field->epoch;
+                my $res_str = Dumper($results);
+                $mops_logger->info("jpleph($field_epoch): $res_str");
+            }
+        }
+        else {
+            $results = {};  # no objects, so empty results
+        }
+
+
+        # Now loop through the results and determine which ones are really in the field.
+        foreach my $key (keys %{$results}) {
+            $pos = ${$results}{$key};
+            if (!$pos || !$pos->{mag}) {
+                my $e = $pos->{epoch};
+                $mops_logger->info(sprintf "Got empty result for $key: $e");
+            }
+            $keep_obj2pos{$key} = $pos;        # save position for this object
+        }
+
+        # At this point keep_obj2pos contains a list of objects that should be
+        # present in the field.  Search for them, and if we find any matches,
+        # extract all the tracklets containing the detction, and compute orbits
+        # for them.  Choose the best tracklet that satisfies our residual
+        # requirements.
+        # foreach (@keep_obj2pos)
+        #   find_detections()
+        #   foreach (@found_detections)
+        #     extract_tracklet()
+        #     compute_orbit()
+        #  find_best_orbit(@new_orbits)
+        #  if ($best_orbit < resid)
+        #    attribute_orbit($obj, $orbit)
+
+        my @orig_field_trks;                                # original list of all tracklets terminating in this field
+        my @field_trks;                                     # all tracklets terminating in this field, still unattributed
+        my $found_trk_id2trkinfo_href;                      # candidate attributions
+        my $objname;
+        foreach my $objname (keys %keep_obj2pos) {
+            my $fail_reason;
+            my $attributed;
+            my $attr_trackletId;    # attributed trackletId
+            my $attr_orbitId;       # attributed orbitId
+            my $attr_orbitCode;     # attributed orbitCode
+            my $attr_ephemerisDistance;     # attributed distance from attr tracklet to expected pos
+            
+            
+            # Update the $pos variable with the values for $objname.
+            $pos = $keep_obj2pos{$objname};
+
+            # Make sure that we are inside the field.
+            # XXX LD should we increase FOV by ephem uncertainty to handle predictions
+            # outside field when tracklet is inside field?
+            if ($field_shape eq 'circle') {
+                if(!mopslib_inField($fc_ra_deg, $fc_dec_deg, $fov_size_deg, $pos->{ra}, $pos->{dec})) {
+                    $mops_logger->info("$objname is outside of circular field $fieldId");
+                    next;
+                }
+            }
+            else {
+                if(!mopslib_inSquareField($fc_ra_deg, $fc_dec_deg, $fov_size_deg, $pos->{ra}, $pos->{dec})) {
+                    $mops_logger->info("$objname is outside of square field $fieldId");
+                    next;
+                }
+            }
+
+            # Fetch derived object and orbit.
+            my $dobj = modcdo_retrieve($inst, objectName => $objname);  # fetch orbit object
+            my $dobj_orbit = $dobj->fetchOrbit();
+            my @dobj_tracklets = $dobj->fetchTracklets();
+
+            # Add the information to the derived object id, field id -> radius table.
+            my $radius = $pos->{smaa_sec} || -1.0;
+            if($radius <= 0) {
+                $radius = $attribution_proximity_thresh_arcsec;
+            }
+            $obj_to_radius{$dobj->derivedobjectId}{$fieldId} = $radius;
+            if($verbose) {
+                $mops_logger->info("Stored radius $radius for $objname/$fieldId");
+            }
+
+            # If the detections in our field have not been fetched yet, well,
+            # fetch em.
+            if (!@orig_field_trks) {
+##                my $det_i = modcd_retrieve($inst, fieldId => $field->fieldId, trackletOnly => 1);
+##                my $det;
+##                while (defined($det = $det_i->next)) {
+##                    push @field_dets, $det if ($det;
+##                }
+##                $mops_logger->debug(sprintf "Fetched %d detections for fieldId %s", 
+##                    scalar @field_dets, $field->fieldId);
+
+                # Fetch detections for tracklets that terminate with this field.
+                my $trk_i = modct_retrieve($inst, 
+                    fieldId => $fieldId,                            # terminating fieldId
+                    status => $TRACKLET_STATUS_UNATTRIBUTED,        # only unattributed tracklets
+                );
+                while ($trk = $trk_i->next) {
+                    push @orig_field_trks, $trk;
+                }
+            }
+
+            # Filter our @orig_field_tracks list so that any tracklets in the original list
+            # that were lucky enough to be attributed have been removed.
+            @field_trks = grep { $_->status eq $TRACKLET_STATUS_UNATTRIBUTED } @orig_field_trks;
+
+            # next unless @field_dets;        # no detections in this field; skip
+            $fail_reason = 'no detections in field';
+            if (@field_trks) {
+                # Tell the world that we are about to search for tracklets to be
+                # associated to our derivedobject.
+                if($verbose) {
+                    $mops_logger->info("Looking for tracklets for $objname");
+                }
+                $found_trk_id2trkinfo_href = find_candidate_tracklets(
+                    \@orig_field_trks,                                 # tracklets terminating this field
+                    $pos,                                              # object's predicted position
+                    $obj_to_radius{$dobj->{derivedobjectId}}{$fieldId} # search radius (arcsec)
+                );
+
+                # Report stuff.
+                my $numTracklets = scalar %{$found_trk_id2trkinfo_href};
+                if($verbose) {
+                    $mops_logger->info("Found $numTracklets matching tracklets for $objname");
+                }
+                
+                # Calculate residuals for each of the candidate tracklets.
+                $fail_reason = 'no candidate tracklets';
+                if (scalar %{$found_trk_id2trkinfo_href}) { 
+#                    my @obj_dets = $dobj->fetchDetections();         # get all detections
+
+                    # > 0 tracklets pass proximity requirement, so send them to orbit determination.
+                    my %trkid2resid;                # trackletId => residual table
+                    my %trkid2ephemdist;            # trackletId => ephemeris distance table
+                    my $eval_orb;                   # residual/orbit fit result
+                    my %evaluatedOrbits_id2orb;     # table of evaluations
+
+                    # Compute the arc length (in days) to determine whether or 
+                    # not to use IOD.
+                    my $dobj_arclength = 99999999;
+                    if($use_iod) {
+                        $dobj_arclength = arch_length_fast(@dobj_tracklets);
+                        if($verbose) {
+                            $mops_logger->info("$objname arclength: $dobj_arclength");
+                        }
+                    }
+                    
+                    if($verbose) {
+                        $mops_logger->info("Evaluating orbits for $objname...");
+                    }
+                    # Get all the candidate tracklets sorted by distance.
+                    foreach my $item (sort distance_sort (values %{$found_trk_id2trkinfo_href})) {
+                        $trk = $item->{TRACKLET};
+                        if ($dobj_arclength < $max_arclength_for_iod && $use_iod) {
+                            # Attempt to invoke IOD+DIFF combo to get orbit.
+                            if($verbose) {
+                                $mops_logger->info("Using IOD+DC...");
+                            }
+                            $eval_orb = jplorb_evaluateAttribution($inst, 
+                                                                   $dobj, 
+                                                                   $trk);
+                        }
+                        else {
+                            # Just use our old method of DIFF only.
+                            if($verbose) {
+                                $mops_logger->info("Using DC...");
+                            }
+                            $eval_orb = eval_attribution(
+                                DERIVEDOBJECT => $dobj, 
+                                ATTRIBUTED_TRACKLET => $trk, 
+                                # optional, save a fetch each invocation
+                                ORBIT => $dobj_orbit,
+                                # optional, save a fetch each invocation
+                                TRACKLETS_AREF => \@dobj_tracklets
+                            );
+                        }
+                        # save
+                        $evaluatedOrbits_id2orb{$trk->trackletId} = $eval_orb;
+                        $trkid2resid{$trk->trackletId} = $eval_orb->residual if 
+                            ($eval_orb and $eval_orb->residual < 
+                             $attribution_resid_threshold_arcsec);
+                        $trkid2ephemdist{$trk->trackletId} = $item->{EPHEM_DIST_ARCSEC};
+                        # If the IOD+DC/DC worked during precovery, break.
+                        # if($precovery && $trkid2resid{$trk->trackletId}) {
+                        #     last;
+                        # }
+                    }
+
+                    $fail_reason = 'no tracklets passed OD';
+                    if (scalar keys %trkid2resid) {
+                        # Got > 0 orbits that passed orbit determination.
+                        if($verbose) {
+                            $mops_logger->info("Succesfully attributed/precovered tracklet!");
+                        }
+                        my @sorted_trkids = sort {
+                            $trkid2resid{$b} <=> $trkid2resid{$a}
+                        } keys %trkid2resid; # sort reverse, lowest resid first
+
+                        # Choose the best tracklet and update the orbit.
+                        my $best_id = $sorted_trkids[0];
+
+                        # Create new orbit object and stuff in DB.
+                        my $new_orb = $evaluatedOrbits_id2orb{$best_id};
+                        $new_orb->insert();
+
+                        # Retrieve the attributed tracklet and associate it with this derived obj.
+                        $trk = $found_trk_id2trkinfo_href->{$best_id}->{TRACKLET};
+                        $dobj->attributeTracklets(
+                            ORBIT => $new_orb,
+                            TRACKLETS_AREF => [ $trk ], 
+                        );         # add tracklet to orbit
+                        
+                        if ($precovery) {
+                            $mops_logger->info(
+                                sprintf "Precovered tracklet with orbit %s/%s",
+                                $dobj->derivedobjectId, $dobj->objectName);
+                        }
+                        else {
+                            $mops_logger->info(
+                                sprintf "Attributed tracklet to orbit %s/%s",
+                                $dobj->derivedobjectId, $dobj->objectName);
+                        }
+                        
+                        $attributed = 1;    # note it
+                        $fail_reason = 'OK';
+                        $attr_trackletId = $trk->trackletId;
+                        $attr_orbitId = $new_orb->orbitId;
+                        $attr_orbitCode = $MOPS_EFF_ORBIT_OK;
+                        $attr_ephemerisDistance = $trkid2ephemdist{$best_id};
+                    }
+                }
+            }
+
+            if ($attributed) {
+                my $event;
+                if ($precovery) {
+                    if($verbose) {
+                        $mops_logger->info(sprintf "*** Adding new entry to history_precoveries (r=%s).",
+                                           $obj_to_radius{$dobj->{derivedobjectId}}{$fieldId});
+                    }
+                    $event = PS::MOPS::DC::History::Precovery->new(
+                        $inst,
+                        derivedobjectId => $dobj->derivedobjectId,
+                        fieldId => $field->fieldId,
+                        orbitId => $attr_orbitId,
+                        orbitCode => $attr_orbitCode,
+                        classification => $dobj->classification,
+                        trackletId => $attr_trackletId,
+                        ssmId => $dobj->ssmId,
+                        ephemerisDistance => $attr_ephemerisDistance,
+                        ephemerisUncertainty => $obj_to_radius{$dobj->{derivedobjectId}}{$fieldId},
+                    );
+                }
+                else {
+                    $event = PS::MOPS::DC::History::Attribution->new(
+                        $inst,
+                        derivedobjectId => $dobj->derivedobjectId,
+                        fieldId => $field->fieldId,
+                        orbitId => $attr_orbitId,
+                        orbitCode => $attr_orbitCode,
+                        classification => $dobj->classification,
+                        trackletId => $attr_trackletId,
+                        ssmId => $dobj->ssmId,
+                        ephemerisDistance => $attr_ephemerisDistance,
+                        ephemerisUncertainty => $obj_to_radius{$dobj->{derivedobjectId}}{$fieldId},
+                    );
+                }
+                $mops_logger->info(
+                        sprintf "Recording attibution of tracklet %d for orbit %s/%s",
+                            $attr_trackletId, $dobj->derivedobjectId, $dobj->objectName);
+
+                # If this is a clean attribution/precovery, remove it from the provisional table.
+                if ($event->classification eq $MOPS_EFF_CLEAN) {
+                    if (exists($pa_tbl{$event->ssmId})) {
+                        delete $pa_tbl{$event->ssmId};
+                    }
+                    else {
+                        $mops_logger->logwarn(sprintf "Clean attribution but no provisional attr: eventId=%s ssmId=%s",
+                            $event->eventId, $event->ssmId);
+                    }
+                }
+                $event->record;
+
+                # Finally, submit the object to the end-of-night (EON) queue if it is
+                # an attribution.
+                if (!$precovery) {
+                    # Submit the DO to the precovery pipeline.
+                    modcq_submit($inst, $dobj->derivedobjectId, $event->eventId);
+                    $mops_logger->info(
+                        sprintf "Submitted object %s/%s to EON queue",
+                            $dobj->derivedobjectId, $dobj->objectName
+                    );
+                }
+            }
+
+            if ($fail_reason) {
+                $mops_logger->info("Attribution/precovery for $objname status: $fail_reason");
+            }
+        }
+
+        # Insert all attributions.  Some provisional ones will have been deleted earlier
+        # when attributed.
+        foreach my $evt (values %pa_tbl) {
+            # Make sure that we add the positional uncertainty/search radius.
+            if(!$evt->{ephemerisUncertainty}) {
+                my $fid = $evt->{fieldId};
+                my $doid = $evt->{derivedobjectId};
+                $evt->{ephemerisUncertainty} = $obj_to_radius{$doid}{$fid};
+                if(!$evt->{ephemerisUncertainty}) {
+                    $mops_logger->info("*** Ops: ephemerisUncertainty is NULL for $doid/$fid");
+                }
+            }
+            $evt->record;
+        }
+
+        unless ($precovery and !$ignore_field_status) { 
+            $field->status($END_FIELD_STATUS);            # field processed 
+            $mops_logger->info(sprintf "changed status of field %d to $END_FIELD_STATUS", $field->fieldId);
+        }
+    };
+    if ($@ and $@ =~ /^STATUS/) {
+        warn $@;        # field has wrong status, skip and warn
+    }
+    elsif ($@) {
+        die $@;         # some other problem
+    }
+}   # do_field
+
+sub arch_length {
+    # Internal function: given a list of tracklets, return their time span in 
+    # days and fractions of a day.
+    
+    # Feth the input array.
+    my @tracklets  = @_;
+    
+    # Compute the min and max detection epoch (assuming that the 
+    # tracklets/detections are not sorted in time).
+    my $mint = 10e999;
+    my $maxt = 0;
+    foreach my $tracklet (@tracklets) {
+        foreach my $det ($tracklet->{detections}) {
+            if($mint > $det->{epoch}) {
+                $mint = $det->{epoch};
+            }
+            if($maxt < $det->{epoch}) {
+                $maxt = $det->{epoch};
+            }
+        }
+    }
+    return abs($maxt - $mint);
+}
+
+sub arch_length_fast {
+    # Internal function: given a list of tracklets, return their time span in 
+    # days and fractions of a day. We assume that 
+    #   1. Detections within a tracklet are sorted by epoch.
+    #   2. Input tracklets are not sorted in any way.
+    
+    # Feth the input array.
+    my @tracklets  = @_;
+    
+    # Compute the min and max detection epoch (assuming that the 
+    # tracklets/detections are not sorted in time).
+    my $mint = 10e999;
+    my $maxt = 0;
+    foreach my $tracklet (@tracklets) {
+        my @dets = @{$tracklet->{detections}};
+        my $min_det = $dets[0];
+        my $max_det = $dets[-1];
+        if($mint > $min_det->{epoch}) {
+            $mint = $min_det->{epoch};
+        }
+        if($maxt < $max_det->{epoch}) {
+            $maxt = $max_det->{epoch};
+        }
+    }
+    return abs($maxt - $mint);
+}
+
+sub find_candidate_tracklets {
+    my ($trks_aref, $pos, $search_sec) = @_;
+    my $trk;
+    my $det;
+    my %trkid2trkinfo;
+
+    my $dist;
+    my $ra_rad = $pos->{ra} / $DEG_PER_RAD;
+    my $dec_rad = $pos->{dec} / $DEG_PER_RAD;
+    my $search_rad = $search_sec / 3600 / $DEG_PER_RAD;
+    my $thresh_sec = $attribution_proximity_thresh_arcsec;
+    my $thresh_rad = $thresh_sec / 3600 / $DEG_PER_RAD;
+
+    if($search_rad > $thresh_rad) {
+        # if($verbose) {
+            $mops_logger->info("Exceeding search radius threashold: search terminated.");
+        # }
+        return \%trkid2trkinfo;
+    }
+    
+    # if($verbose) {
+        $mops_logger->info("Using a search radius of $search_sec arcsec");
+    # }
+
+    # Look for candidate tracklets.
+    foreach $trk (@{$trks_aref}) {
+        $det = $trk->detections->[-1];      # last detection
+
+        # assert: $det->fieldId == $trk->fieldId
+        if ($det->fieldId != $trk->fieldId) {
+            $mops_logger->logwarn(sprintf "Mismatched field IDs for %s: %s %s", $det->detId, $det->fieldId, $trk->fieldId);
+        }
+
+        $dist = slaDsep($ra_rad, $dec_rad, $det->ra / $DEG_PER_RAD, $det->dec / $DEG_PER_RAD);
+        if ($dist < $search_rad) {
+            $trkid2trkinfo{$trk->trackletId} = {
+                TRACKLET => $trk,
+                EPHEM_DIST_ARCSEC => $dist * $DEG_PER_RAD * 3600,       # convert to arcsec
+            };
+        }
+    }
+
+    return \%trkid2trkinfo;
+}
+
+
+sub eval_attribution {
+    # Given a candidate tracklet and a MOPSDC object, calculate the residual 
+    # of a new orbit that includes detections from the tracklet.
+    my %args = validate(@_, {
+        DERIVEDOBJECT => 1,
+        ATTRIBUTED_TRACKLET => 1,
+        ORBIT => 0,                 # optional
+        TRACKLETS_AREF => 0,        # optional
+    });
+
+    my ($dobj, $trk, $orbit, $tracklets_aref) = @args{qw(DERIVEDOBJECT ATTRIBUTED_TRACKLET ORBIT TRACKLETS_AREF)};
+    my @tracklets;
+
+    unless ($orbit) {
+        $orbit = $dobj->fetchOrbit();
+    }
+    unless ($tracklets_aref) {
+        @tracklets = $dobj->fetchTracklets();
+    }
+    else {
+        @tracklets = @{$tracklets_aref};
+    }
+
+    my @all_dets = ((map { @{$_->detections} } @tracklets), @{$trk->detections});
+    return jplorb_evaluateOrbit(
+        $inst, 
+        orbit => $orbit, 
+        detections => \@all_dets
+    );    # returns hashref
+
+}
+
+
+sub distance_sort {
+    $a->{EPHEM_DIST_ARCSEC} <=> $b->{EPHEM_DIST_ARCSEC};
+}
+
+
+
+
+
+=head1 NAME
+
+attributeOrbits - match objects to tracklets.
+
+=head1 SYNOPSIS
+
+attributeOrbits [options] FIELDS_FILE
+
+  --date_mjd EPOCH_MJD : MJD to process
+  --nn NIGHT_NUMBER : MOPS night number to process
+  --precovery : insert precovery events into history (default is attribution)
+  --ignore_field_status : always process; don't respect or change field statuses
+  --only_field_id=ID : only process field ID specified
+  --debug : process one field then exit
+  --verbose, --superverbose : display more info
+  --help : display this manpage
+  FIELDS_FILE : file containing field-derived orbit associations
+
+=head1 DESCRIPTION
+
+attributeOrbits searches for tracklets that match existing derived orbits.
+Coarse ephemerides are computed for the orbits around the specified EPOCH,
+and FieldProximity is used to associate orbits with fields.
+
+Then for each field, all tracklets that have at least one detection
+in the field are extracted, and precise ephemerides are calculated
+for objects that pass FieldProximity.  Tracklets that are "near" the
+precise ephemeris are provisionally added to the orbit+its detections,
+and the tracklet that fits the orbit best and is within some residual
+tolerance is permanently added to the orbit.
+
+=head1 TODOS
+
+Questions:  what if more than one tracklet fits?  What to do if
+no tracklets fit?
+
+=cut

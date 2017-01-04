@@ -1,0 +1,366 @@
+<?xml version="1.0" encoding="utf-8"?>
+<VOEvent xmlns="http://www.ivoa.net/xml/VOEvent/v1.1" version="1.1" role="observation" ivorn="ivo://mops.lsst.org/VOEvent#psmops_alert_test_64_2008-05-06T19:30:07.63_UnusualLightCurves">
+  
+  <Who>
+    <AuthorIVORN>ivo://voevent.lsst.org/MOPS</AuthorIVORN>
+    <Date>2008-05-06T19:30:07.63</Date>
+  </Who>
+  <WhereWhen>
+    
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-TOPO-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>22.79</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54434.244504</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>317.650949</C1><C2>-12.546267</C2></Value2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-TOPO-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>22.67</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54434.235804</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>317.648516</C1><C2>-12.546647</C2></Value2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-TOPO-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>22.35</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54438.245194</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>318.804651</C1><C2>-12.368444</C2></Value2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-TOPO-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>22.83</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54438.236494</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>318.802139</C1><C2>-12.368839</C2></Value2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-TOPO-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>22.64</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54442.237624</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>319.992742</C1><C2>-12.167103</C2></Value2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-TOPO-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>22.59</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54442.246314</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>319.995313</C1><C2>-12.166656</C2></Value2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-TOPO-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>22.82</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54413.260064</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>312.318447</C1><C2>-13.069401</C2></Value2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-TOPO-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>22.79</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54413.268424</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>312.320272</C1><C2>-13.069341</C2></Value2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-TOPO-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>22.42</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54413.263974</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>312.319329</C1><C2>-13.069376</C2></Value2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-TOPO-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>22.83</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54413.255284</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>312.317414</C1><C2>-13.069428</C2></Value2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-TOPO-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>22.46</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54409.256244</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>311.464193</C1><C2>-13.087475</C2></Value2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-TOPO-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>22.60</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54409.264934</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>311.465937</C1><C2>-13.087472</C2></Value2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="TDB-ECLIPTIC-MOPS">
+          <Time><TimeInstant><MJDTime>54425.000000</MJDTime></TimeInstant></Time>
+          <Orbit>
+            <q unit="AU">2.790977</q>
+            <e>0.095302</e>
+            <i unit="deg">9.645634</i>
+            <Node unit="deg">177.216875</Node>
+            <Aop unit="deg">238.441534</Aop>
+            <T><MJDTime>54825.628570</MJDTime></T>
+            <SRC>
+              <Value21>
+                   <C01>0.000003</C01><C02>-0.000021</C02><C03>0.000012</C03><C04>-0.000233</C04><C05>0.000589</C05>
+                   <C06>0.117267</C06><C07>0.000475</C07><C08>-0.001263</C08><C09>-0.246688</C09><C10>0.000025</C10>
+                   <C11>-0.004791</C11><C12>-0.023980</C12><C13>27.345950</C13><C14>0.000736</C14><C15>0.107703</C15>
+                   <C16>-0.002259</C16><C17>-0.003420</C17><C18>7.534947</C18><C19>-0.000042</C19><C20>0.027759</C20>
+                   <C21>0.000065</C21>
+                 </Value21>
+            </SRC>
+            <h_v>17.0743037916</h_v>
+            <residuals>0.047101156157</residuals>
+            <chiSq>None</chiSq>
+            <convCode>D0</convCode>
+            <moid1>None</moid1>
+            <moid2>None</moid2>
+          </Orbit>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-BARY-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>23.43</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54602.000000</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>84.680014</C1><C2>15.666903</C2></Value2>
+            <Error2><C1>427.466171499</C1><C2>14.9533626841</C2></Error2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-BARY-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>23.43</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54601.000000</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>84.348298</C1><C2>15.639271</C2></Value2>
+            <Error2><C1>428.042777665</C1><C2>15.5828872594</C2></Error2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-BARY-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>23.43</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54600.000000</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>84.017494</C1><C2>15.610674</C2></Value2>
+            <Error2><C1>428.633349383</C1><C2>16.2110871727</C2></Error2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-BARY-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>23.44</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54599.000000</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>83.687626</C1><C2>15.581116</C2></Value2>
+            <Error2><C1>429.23807589</C1><C2>16.8379225289</C2></Error2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-BARY-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>23.44</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54598.000000</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>83.358722</C1><C2>15.550601</C2></Value2>
+            <Error2><C1>429.857153123</C1><C2>17.4633520105</C2></Error2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-BARY-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>23.44</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54597.000000</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>83.030806</C1><C2>15.519135</C2></Value2>
+            <Error2><C1>430.49078281</C1><C2>18.0873326334</C2></Error2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-BARY-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>23.44</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54596.000000</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>82.703909</C1><C2>15.486722</C2></Value2>
+            <Error2><C1>431.139170984</C1><C2>18.7098195302</C2></Error2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-BARY-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>23.45</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54595.000000</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>82.378061</C1><C2>15.453367</C2></Value2>
+            <Error2><C1>431.802525731</C1><C2>19.3307658486</C2></Error2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-BARY-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>23.45</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54594.000000</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>82.053292</C1><C2>15.419076</C2></Value2>
+            <Error2><C1>432.481054171</C1><C2>19.9501228985</C2></Error2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+    <ObsDataLocation xmlns="http://www.ivoa.net/xml/STC/stc-v1.30.xsd">
+      <ObservatoryLocation href="ivo://STClib/Observatories#MOPS" type="simple" id="MOPS" />
+      <ObservationLocation>
+        <AstroCoords coord_system_id="UTC-ICRS-BARY-VMAG">
+          <ScalarCoordinate frame_id="Vmag" unit="mag">
+            <Value>23.45</Value>
+          </ScalarCoordinate>
+          <Time><TimeInstant><MJDTime>54593.000000</MJDTime></TimeInstant></Time>
+          <Position2D unit="deg">
+            <Value2><C1>81.729636</C1><C2>15.383854</C2></Value2>
+            <Error2><C1>433.174958961</C1><C2>20.567840685</C2></Error2>
+          </Position2D>
+        </AstroCoords>
+      </ObservationLocation>
+    </ObsDataLocation>
+  </WhereWhen>
+  <Description>
+      This VOEvent packet resulted from observations made at the LSST/PS
+      facility and analyzed with MOPS.
+  </Description>
+</VOEvent>

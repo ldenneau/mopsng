@@ -1,0 +1,81 @@
+#!/usr/bin/env perl
+# $Id$
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use Params::Validate;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Tracklet;
+
+
+use subs qw(
+);
+
+
+my $inst;
+my $instance_name;
+my $eon_status = $EONQUEUE_STATUS_PRECOVERED;
+my $nodb;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'eon_status=s' => \$eon_status,
+    nodb => \$nodb,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+my $dbh = $inst->dbh();
+
+
+# Get list of tracklet IDs that should be killed.
+my $tlist_aref = modct_getKillableTrackletIDs($inst, eon_status => $eon_status);
+
+if (@{$tlist_aref} > 0) {
+    $inst->atomic($dbh, sub {
+        foreach my $tid (@{$tlist_aref}) {
+            modct_killTrackletByID($inst, $tid);
+        }
+    });
+    $mops_logger->info(sprintf "KILLTRACKLETS: %d tracklets killed.", scalar @{$tlist_aref});
+}
+else {
+    $mops_logger->info("No tracklets to kill.");
+}
+exit 0;
+
+=head1 NAME
+
+killTracklets - mark tracklets as unusable
+
+=head1 SYNOPSIS
+
+killTracklets [options]
+
+  --help : show this manual page
+
+=head1 DESCRIPTION
+
+killTracklets generates a list of all unattributed tracklets that contain
+detections that are used by objects in the EON queue.  These tracklets
+are "unusable" in that they contain detections already used by another
+object, and thus cannot be sensibly used in further MOPS processing.
+
+killTracklets accomplishes this by obtaining a list of killable tracklet IDs,
+then simply calling modct_killTrackletByID() to set their status.
+
+=head1 FURTHER DEVELOPMENT
+
+Probably there will be an "unkillTracklets" procedure when objects are invalidated.
+
+=cut
+

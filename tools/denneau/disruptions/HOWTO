@@ -1,0 +1,5 @@
+# Create and run MOPS 1/10 simulation with all H=18.  We will insert synthetic disruptions into 
+# this simulation.
+
+# Run grids over deltaM=0.5-15 and decay=.001-1, setting the SSM H offset from -4 to 12.75, with H=18 as the ref
+./multigrid --trials 1000 --count ssm ssm10all --ssmhoffsetspec=-4:12.75:18

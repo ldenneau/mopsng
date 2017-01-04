@@ -1,0 +1,76 @@
+#!/usr/bin/perl
+# $Id$
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+use File::Temp;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::GCR qw(:all);
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::DerivedObject;
+
+
+# Forward sub declarations.
+use subs qw(
+);
+
+
+my $inst;
+my $instance_name;
+my $nn;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => '--nn NIGHT not specified') unless $nn;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbh = $inst->dbh;
+$nn = int($nn); # scrub
+my $tidref = $dbh->selectcol_arrayref(<<"SQL");
+select t.tracklet_id from fields f 
+join tracklets t using(field_id) 
+join tracklet_attrib ta using(tracklet_id) 
+where f.nn=$nn
+group by t.tracklet_id
+having count(*) > 2
+SQL
+
+printf STDERR "Processing %d tracklets for night $nn.\n", scalar @$tidref, $nn;
+foreach my $tid (@$tidref) {
+    my $trk = modct_retrieve($inst, trackletId => $tid);
+    my $gcr = PS::MOPS::GCR::compute_gcr($trk->detections);
+    #printf STDERR "$tid %.3f\n", $gcr;
+    $trk->gcr_arcsec($gcr);
+}
+printf STDERR "Done.\n";
+exit 0;
+
+=pod
+
+=head1 NAME
+
+calcgcr - Compute great-circle residuals and stuff them in tracklet objects
+
+=head1 SYNOPSIS
+
+calcgcr --nn NIGHT
+
+  --nn : MOPS night number
+  --help : show man page
+
+=head1 DESCRIPTION
+
+Hi.
+
+=cut

@@ -1,0 +1,25 @@
+#!/bin/sh
+# $Id: eval_lodctl 515 2005-07-26 04:13:53Z denneau $
+
+field_id=$1
+
+# Evaluate
+echo "Unfound"
+perl -ane 'print $F[0], "\n"' $field_id.clean $field_id.recov | sort | uniq -c | sort -rn | grep -v '^ *2' > $field_id.unfound
+wc -l $field_id.recov $field_id.clean $field_id.unfound
+echo "Recoverable"
+perl -ane '$F[0]="XX" unless $F[0]=~/^S/; print $F[0], "\n"' $field_id.recov | cut -c0-2 | sort | uniq -c| sort -rn
+echo "Found"
+perl -ane '$F[0]="XX" unless $F[0]=~/^S/; print $F[0], "\n"' $field_id.clean | sort -u | cut -c0-2 | sort | uniq -c | sort -rn
+echo "Unfound"
+perl -ane '$F[1]="XX" unless $F[1]=~/^S/; print $F[1], "\n"' $field_id.unfound | sort -u | cut -c0-2 | sort | uniq -c | sort -rn
+
+# Evaluate orbit determination.
+echo "OD"
+perl -ane '$F[0]="XX" unless $F[0]=~/^S/; print $F[0], "\n"' $field_id.odobj | sort -u | cut -c0-2 | sort | uniq -c|  sort -rn
+echo "Bogus OD"
+wc $field_id.odbogus
+
+# Evaluate orbit determination prediction.
+#evalgoodorbs --orbfile $field_id.orbits --cleanfile $field_id.clean --segregate --MJD HUH > $field_id.seg
+#evalgoodorbs --orbfile $field_id.orbits --cleanfile $field_id.clean --stats --segregate --MJD HUH > $field_id.segstats

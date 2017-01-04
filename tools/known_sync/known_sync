@@ -1,0 +1,134 @@
+#!/usr/bin/env perl
+
+# $Id: mopper 4632 2011-09-11 03:12:04Z denneau $
+# Separate support code stub for testing.
+
+=head1 NAME
+
+known_sync - keep a known sim in sync with real data.
+ 
+=head1 SYNOPSIS
+
+known_sync [options] [REAL_INSTANCE_NAME]
+
+  REALINSTANCE_NAME : name of real MOPS DB to sync with
+  --mailto ADDR : mail errors to ADDR
+  --efficiency : run efficiency scripts after generating synthetics
+  --quit : quit when nothing to do
+  --debug : testing
+  --help : show usage
+
+=head1 DESCRIPTION
+
+Hi.
+
+=cut
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+use Pod::Usage;
+use Getopt::Long;
+
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+
+
+my $instance_name;
+my $mailto = 'denneau@ifa.hawaii.edu';
+my $efficiency;
+my $debug;
+my $quit;
+my $help;
+GetOptions(
+    instance => \$instance_name,    # specify instance, or use $ENV{MOPS_DBINSTANCE}
+    'mailto=s' => \$mailto,
+    efficiency => \$efficiency,
+    debug => \$debug,
+    quit => \$quit,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+my $real = shift;
+pod2usage(3) unless $real;
+
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbname = $inst->dbname;
+my $dbh = $inst->dbh();
+
+
+while (1) {
+    my $did_stuff;
+
+    # 1.  See if there are any nights of data to sync.
+    my ($nn) = $dbh->selectrow_array(<<"SQL");
+select ff.nn 
+from $real.fields ff 
+    left join fields f on f.field_id=ff.field_id 
+where ff.status in ('U', 'A', 'L') and f.field_id is null 
+group by ff.nn 
+order by ff.nn desc 
+limit 1
+SQL
+
+    if ($nn) {
+        my @fpa_ids = @{$dbh->selectcol_arrayref(<<"SQL")};
+select ff.fpa_id fpa_id 
+from $real.fields ff 
+    left join fields f on f.field_id=ff.field_id 
+where ff.status in ('U', 'A', 'L') and f.field_id is null and ff.nn=$nn
+order by fpa_id
+SQL
+        if (@fpa_ids) {
+            my $sth;
+
+            $sth = $dbh->prepare("insert into fields (select * from $real.fields ff where ff.fpa_id=?)") or maildie $dbh->errstr;
+            foreach my $fpa_id (@fpa_ids) {
+                $sth->execute($fpa_id) or maildie $dbh->errstr;
+            }
+            $sth->finish;
+
+            $sth = $dbh->prepare("update fields set status='N' where fpa_id=?") or maildie $dbh->errstr;
+            foreach my $fpa_id (@fpa_ids) {
+                $sth->execute($fpa_id) or maildie $dbh->errstr;
+            }
+            $sth->finish;
+
+            # At this point, fields have been copied from real DB to synth known DB.
+            cmd('mopper', "--nn=$nn", "--stage=POSTTRACKLET", $dbname) == 0 or maildie($?);
+            if ($efficiency) {
+                cmd('eff_suite', "--instance=$real", "--sim=$dbname", "--nn=$nn") == 0 or maildie($?);
+            }
+            $did_stuff = 1;
+        }
+        else {
+            print STDERR "Got nn=$nn but no FPA_IDs.\n";
+        }
+    }
+    last if $quit && !$did_stuff;
+    next if $did_stuff;     # don't sleep if we did something
+    print STDERR "Sleeping...\n";
+    sleep 600;
+}
+exit;
+
+
+sub cmd {
+    print STDERR join (' ', 'Executing:', @_), "\n";
+    return system @_;
+}
+
+
+sub maildie {
+    use Mail::Send;
+    my ($msg) = @_;
+    my $mail = new Mail::Send;
+    $mail->to($mailto);
+    $mail->subject("Sync job $real => $dbname failed");
+    my $fh = $mail->open();
+    print $fh $msg;
+    $fh->close();
+}

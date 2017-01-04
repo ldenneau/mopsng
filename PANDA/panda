@@ -1,0 +1,1218 @@
+#!/usr/bin/env python
+from __future__ import with_statement
+from __future__ import division
+
+"""
+$Id$
+"""
+
+import sys
+import os
+import os.path
+import copy
+import time
+import tempfile
+import cPickle as pickle
+import subprocess
+import optparse
+
+import numpy
+import ssd
+
+import MOPS.Instance
+import MOPS.Lib
+import MOPS.Constants
+import MOPS.IDManager
+
+import MOPS.EONQueue
+import MOPS.MOIDQueue
+import MOPS.History
+import MOPS.Condor
+
+from MOPS.Field import Field
+from MOPS.Tracklet import Tracklet
+from MOPS.Orbit import Orbit
+from MOPS.DerivedObject import DerivedObject
+from MOPS.Exceptions import ProcessingException
+
+
+
+# Default number of worker jobs to send to the cluster.
+DEFAULT_NUM_JOBS = 16
+
+
+class EffData(object):
+    """
+    Utility class to package lost object data.  Note that field ID here is not
+    necessarily the field the tracklet is in; it's the field that triggered
+    an attribution/precovery event.
+    """
+    def __init__(self, tracklet_id, derivedobject_id, field_id, ssm_id, eonq=False):
+        self.tracklet_id = tracklet_id
+        self.derivedobject_id = derivedobject_id
+        self.field_id = field_id
+        self.ssm_id = ssm_id
+        self.eonq = eonq        # flag indicating this item came from EON queue
+    # <-- end def
+# <-- end class
+
+def _fetchOrbit(dbh, derivedobjectId, memo):
+    # Just snag an orbit from DB and return stuff in a list.  memo 
+    # is a memoization dict; look there first. When we find an orbit,
+    # stuff it there so we don't have to fetch again later.
+
+    if derivedobjectId in memo:
+        # We have a cached copy; return it.
+        return memo[derivedobjectId]
+    # <-- end if
+    cursor = dbh.cursor()
+
+    # Retrieve the orbital params for the derived object.
+    sql = '''
+select o.q, o.e, o.i, o.node, o.arg_peri, o.time_peri,
+o.epoch, o.h_v, o.cov_01, o.cov_02, o.cov_03, o.cov_04,
+o.cov_05, o.cov_06, o.cov_07, o.cov_08, o.cov_09, o.cov_10,
+o.cov_11, o.cov_12, o.cov_13, o.cov_14, o.cov_15, o.cov_16,
+o.cov_17, o.cov_18, o.cov_19, o.cov_20, o.cov_21, o.conv_code,
+o.orbit_id from orbits o, derivedobjects d where
+o.orbit_id = d.orbit_id and d.derivedobject_id=%s
+'''
+    n = cursor.execute(sql, (derivedobjectId,))
+    if(n != 1):
+        raise(ProcessingException('couldn\'t fetch orbit ID %d' %(n)))
+    # <-- end if
+
+    orbit = list(cursor.fetchone())
+    orbit_stuff = orbit[:8] + [orbit[8:-2]] + orbit[-2:]
+
+    # Memoize the orbit.
+    memo[derivedobjectId] = orbit_stuff
+
+    return orbit_stuff
+# <-- end def
+
+def getPrecoveryJobs(dbh):
+    """
+    Fetch the EON queue and retrieve its content in the form of a list of
+    EONQueue instances.
+    """
+    # Query the instance database for precovery jobs.
+    status = MOPS.Constants.EONQUEUE_STATUS_IDENTIFIED
+    return MOPS.EONQueue.retrieve(dbh, status)
+# <-- end def
+
+def getAllDerivedObjectsAsEONQueues(dbh):
+    """
+    Retrieve from the database the full list of known DerivedObjects. In order
+    to reuse the same code from Precovery, we create a fictitious EONQueue
+    instance per DerivedObject.
+    """
+    # Get a cursor from the DB connection.
+    cursor = dbh.cursor()
+
+    # Fetch the DerivedObject ids.
+    sql = 'select derivedobject_id from derivedobjects where status="I"'
+    nRes = cursor.execute(sql)
+    if(not nRes):
+        return([])
+    # <-- end if
+    # Return the fake EONQueue instances.
+    return([MOPS.EONQueue.EONQueueItem(int(row[0]), None, None) for
+            row in cursor.fetchall()])
+# <-- end def
+
+def getSomeDerivedObjectsAsEONQueues(dbh, derivedObjectIds):
+    """
+    Retrieve from the database the full list of known DerivedObjects. In order
+    to reuse the same code from Precovery, we create a fictitious EONQueue
+    instance per DerivedObject.
+    """
+    # Get a cursor from the DB connection.
+    cursor = dbh.cursor()
+
+    # Fetch the DerivedObject ids.
+    ids = ', '.join([str(_id) for _id in derivedObjectIds])
+    sql = 'select derivedobject_id from derivedobjects where ' + \
+          'derivedobject_id in (%s)' % (ids)
+    nRes = cursor.execute(sql)
+    if(not nRes):
+        return([])
+    # <-- end if
+    # Return the fake EONQueue instances.
+    return([MOPS.EONQueue.EONQueueItem(int(row[0]), None, None) for
+            row in cursor.fetchall()])
+# <-- end def
+
+def getAllObservedNights(dbh, gmt_offset_hours, before=None, after=None):
+    """
+    For any simulation of reasonable size (> 1/1000), or with false
+    detections, there will always be unattributed tracklets on any night
+    there are fields.  
+    """
+    # Get a cursor from the DB connection.
+    cursor = dbh.cursor()
+
+    where_str = ''
+    if(before != None and after != None):
+        where_str += 'and epoch_mjd between %f and %f ' % (after, before)
+    elif(before != None):
+        where_str += 'and epoch_mjd <= %s ' % (before)
+    elif(after != None):
+        where_str += 'and epoch_mjd >= %f ' % (after)
+    # <-- end if
+
+    sql = '''\
+select distinct nn
+from `fields` where
+status='%s' %s order by epoch_mjd desc
+''' % (MOPS.Constants.FIELD_STATUS_LINKDONE, where_str)
+
+    # Send the query
+    nRes = cursor.execute(sql)
+    if(not nRes):
+        return([])
+    # <-- end if
+    return([int(row[0]) for row in cursor.fetchall()])
+# <-- end def
+
+def _compute_eph_uncertainty(tracklet, orbit, obscode):
+    """
+    Given a tracklet and orbit, compute the ephemeris distance and uncertainty
+    at the time of the last detection in the tracklet.  If the orbit did
+    not have a sqrt covariance matrix, return None for the uncertainty.
+    """
+
+    # Suss out sqrt covariance.
+    if orbit.src and len(orbit.src) == 21:
+        # looks like sqrtcov
+        sqrcov = orbit.src
+    else:
+        sqrcov = None
+    # <-- end if
+    
+    sorted_dets = copy.copy(tracklet.detections)
+    sorted_dets.sort(lambda a, b: cmp(a.mjd, b.mjd))        # sort by MJD incr
+    last_det = sorted_dets[-1]
+    pos = ssd.ephemerides(numpy.array([orbit.q, orbit.e, orbit.i, orbit.node, orbit.argPeri, orbit.timePeri]),
+                          orbit.epoch,
+                          numpy.array([last_det.mjd, ]),
+                          obscode,
+                          orbit.h_v,
+                          None,     # g param
+                          sqrcov)[0]
+
+    eph_uncertainty_arcsec = pos[6]
+    eph_distance_arcsec = MOPS.Lib.sphericalDistance_arcsec([last_det.ra, last_det.dec], pos[:2])
+    return (eph_distance_arcsec, eph_uncertainty_arcsec)
+# <-- end def
+
+def _bestODCandidate(odCandidates):
+    """
+    Given a list of
+    [(obj, newOrbit, residuals), ]
+    all corresponding to the same tracklet, choose the obj that yields the
+    lowest residuals.
+    """
+    # Sort odCandidates by increasing residuals.
+    odCandidates.sort(cmp=lambda c1, c2: cmp(c1[1].residuals, c2[1].residuals))
+    return(odCandidates[0])
+# <-- end def
+
+def _all_lsds_unseen(trk, audit_state):
+    """
+    Given a tracklet returned from a cluster precov/attr job, return 
+    whether all its LSD detections are "unseen", that is, have not appeared
+    in any other return tracklet from the cluster.  We'll maintain our
+    "seen" table in audit_state.
+    """
+    all_lsds_unseen = True
+    if trk._id is not None:
+        return True                 # real DB tracklet; don't worry about these
+    # <-- end if
+    
+    for det in trk.detections:
+        # Construct an ID to use for LSD detections so that
+        # we can test for seenness.
+        ident = '%d:%d:%d' % (det.fieldId, det.detNum or 0, det._id or 0)
+        if ident in audit_state:
+            return False
+        # <-- end if
+        audit_state[ident] = 1      # mark as seen
+    # <-- end for
+    
+    # If we make it here, the all detections where unseen
+    return True
+# <-- end def
+
+def _cmpasc(a, b):
+    # Sort a list of tracklet assignments (trk, dobj_id, orbit) in ascending
+    # order; if the assignments have the same epoch, sort ascending by residual.
+    # This is the order we want to process tracklets during attribution.
+    if a[0].extEpoch == b[0].extEpoch:
+        return cmp(a[2].residuals, b[2].residuals)  # ascending by residual
+    else:
+        return cmp(a[0].extEpoch, b[0].extEpoch)    # ascending by epoch
+    # <-- end if
+# <-- end def
+
+def _cmpdesc(a, b):
+    # Sort a list of tracklet assignments (trk, dobj_id, orbit) in descending
+    # order; if the assignments have the same epoch, sort ascending by residual.
+    # This is the order we want to process tracklets during precovery.
+    if a[0].extEpoch == b[0].extEpoch:
+        return cmp(a[2].residuals, b[2].residuals)  # ascending by residual
+    else:
+        return cmp(b[0].extEpoch, a[0].extEpoch)    # but descending by epoch
+    # <-- end if
+# <-- end def
+
+class dobjcache(object):
+    """
+    Little memoization cache for derived objects so that we don't have to
+    repeatedly fetch from DB.
+    """
+    def __init__(self, dbh):
+        self.dbh = dbh
+        self.cache = {}
+    # <-- end def
+    
+    def fetch(self, name):
+        if name in self.cache:
+            return self.cache[name]
+        else:
+            obj = DerivedObject.fetch(self.dbh, derivedObjectName=name)
+            self.cache[name] = obj     # cache it
+            return obj
+        # <-- end if
+    # <-- end def
+# <-- end class
+
+class PrecoveryPipeline(object):
+    """
+    The PrecoveryPipeline class provides most of the functionality for both
+    precovery and attribution.
+    """
+    def __init__(self, instance, obscode, nn=None, run_id=None):
+        """
+        instance: MOPS instance (corresponding to $MOPS_DBINSTANCE)
+        obscode: observatory code
+        nn: if specified, process only the night of nn MJD.
+        """
+        # Store the processing variables.
+        self._instance = instance
+        self._dbh = instance.get_dbh()
+        self._obscode = obscode
+        self._nn = nn
+        self._run_id = run_id
+
+        # Logging and config.
+        self._logger = self._instance.getLogger()
+        self._config = self._instance.getConfig()
+
+        # Some extra instance variables.
+        self._concurrency = self.getConcurrency()
+        self._jobs = []
+        self._do2eonq = {}
+
+        # Variables needed for separate performance/efficiency analysis.
+        self.nights = []
+
+        # Set the prefix string for logger messages.
+        self._logPrefix = 'PRECOV'
+        self._historyEventClass = MOPS.History.Precovery
+        
+        # Other mode controls for when we need to behave differently from precovery.
+        self._attrib_mode = False
+        return
+    # <-- end def
+        
+    def getConcurrency(self):
+        """
+        Return the number of concurrent worker jobs to submit.
+        """
+        return self._config['cluster'].get('concurrency', DEFAULT_NUM_JOBS)
+    # <-- end def
+        
+    def getJobs(self):
+        """
+        Fetch precovery jobs from the EON queue.
+        """
+        return getPrecoveryJobs(self._dbh)
+    # <-- end def
+    
+    def buildDO2EONQMap(self):
+        """
+        Populate the self._do2eonq map, which relates DOs that we're evaluating
+        to EONQ records, where we can get useful stuff like event ID and field ID.
+        """
+        for j in self._jobs:
+            self._do2eonq[j.derivedobjectId] = j
+        # <-- end for
+    # <-- end def
+
+    def consolidate_worker_files(self, inFileNames):
+        """
+        Flatten the results obtained from cluster jobs into a single table.  We want
+        to build a table where the keys are tracklet objects, and the values are lists
+        of derived objects that fit the tracklet.  Note that if the same tracklet is
+        used on two different nodes on the cluster, they will be different tracklet
+        objects but have the same ID (except for LSDs; described later).  This is how 
+        we match up tracklets from our global result set.
+
+        The output files are either empty or the result of a pickle of a dictionary
+        The dictionary has the form {tracklet: [(obj, orbit), ], }
+        
+        Return the union of those individual dictionaries.
+
+        In the LSD regime we need to audit thre returned tracklets from the workers.
+        Some of these may be non-DB tracklets that need to be upgraded.  But before
+        we do this we need to audit as follows:
+
+        * Ensure all precovered LSD tracklets do not re-use a LSD detection
+        * Resolve any duplicate use of LSDs across the cluster.  Most likely
+          scenario for this could be binary asteroid.
+        """
+        MOPS.Lib.waitForFiles(inFileNames)
+
+        master_results = {
+            'ASSIGNMENTS' :  [],            # tracklet assignments from cluster
+            'DUPLICATES' : {},              # duplicate assignment working area
+            'STABLE' : [],                  # list of obj IDs that were stable across precov job
+            'UPGRADED' : {},                # dict of upgraded tracklets (from LSD)
+        }
+
+        detection_usage = {}
+        trackletIdLookup = {}           # table of tracklets seen by ID
+        audit_state = {}                # generic table for audit state
+        
+        num_workers = len(inFileNames)
+        for i in range(num_workers):
+            if not os.path.exists(inFileNames[i]):
+                raise ProcessingException('Some files are missing (e.g. %s)' \
+                                          % (os.path.abspath(inFileNames[i])))
+            # <-- end if
+
+            # Read the ith dictionary in.
+            f = file(inFileNames[i])
+            worker_results = pickle.load(f)
+            f.close()
+
+            # Walk the input list, upgrading tracklets as necessary if they contain
+            # LSDs.
+            for (trk, dobj_name, orbit) in worker_results['ASSIGNMENTS']:
+                if trk._id is None:
+                    # Check:
+                    # * Get a provisional LSD ID for this tracklet.
+                    # * Audit its detections by 
+                    #     a) checking if any LSDs in the tracklet
+                    #     match already seen LSDs; if so, bail on this tracklet
+                    #     b) checking if LSD matches some unattributed former-LSD in DB (hard)
+                    # * Otherwise upgrade the tracklet and proceed using its new _id
+                    if _all_lsds_unseen(trk, audit_state):
+                        trk.upgrade(self._dbh)           # put in DB, finally
+                        master_results['UPGRADED'][trk._id] = 'Y'
+                    else:
+                        # The detections in the tracklet are invalid: one of them
+                        # has been "seen" by the auditor (_all_lsds_unseen).  So we
+                        # need to skip this association.
+                        self._logger.info('%s: discarding result for LSD tracklet' % (self._logPrefix))
+                        continue    # <-- for (trk, orbit)
+                    # <- if _all_lsds_unseen
+                # <- if trk._id
+
+                # Now consolidate the tracklet in case it was seen by another worker process.
+                if trk._id not in trackletIdLookup:
+                    trackletIdLookup[trk._id] = trk
+                # <- if
+
+                # Get the master tracklet for this trackletId.
+                master_trk = trackletIdLookup[trk._id]      # unique cluster-wide tracklet object
+
+                assignment = (master_trk, dobj_name, orbit)
+                master_results['ASSIGNMENTS'].append(assignment)
+
+                # Count the usage of this tracklet in our input set.
+                for det_id in [d._id for d in master_trk.detections]:
+                    detection_usage.setdefault(det_id, []).append(assignment)
+            # <- for (trk, orbit)
+
+            # Merge the list of stabilized orbits, as reported by the cluster.
+            master_results['STABLE'] += worker_results['STABLE']
+        # <- for i
+
+
+        # Now record which tracklets have multiple usage.  When we are done we will have a list
+        # of all proposed tracklet assignments, and a separate dict containing a dict of tracklet
+        # IDs and their assignors.
+        master_results['DUPLICATES'] = dict(
+            # how slow is this?
+#            [(key, detection_usage[key]) for key in detection_usage.keys() if len(detection_usage[key]) > 1]
+            [kv for kv in detection_usage.items() if len(kv[1]) > 1]
+        )
+
+
+        # Finally, sort our assignments list by reverse time.
+        if self._attrib_mode:
+            # sort ascending in time
+            master_results['ASSIGNMENTS'].sort(cmp=_cmpasc) # lambda a, b: cmp(a[0].extEpoch, b[0].extEpoch))
+        else:
+            # sort descending in time
+            master_results['ASSIGNMENTS'].sort(cmp=_cmpdesc) # lambda a, b: cmp(b[0].extEpoch, a[0].extEpoch))
+        # <- if self._attrib_mode
+
+        return master_results
+    # <-- end def
+        
+    def arbitrate(self, demoted_tbl, assignment_list, use_id, dobj_cache):
+        """
+        Given a list of duplicate tracklet assignments, attempt
+        to choose a winner for the tracklet using MOPS ID management.
+        Following arbitration, demoted dobjs in assignment_list are
+        marked as such.
+        """
+
+        if len(assignment_list) < 2:
+            return      # somebody called us by mistake
+        # <- if
+
+        # Build mgr input data.
+        mgr = MOPS.IDManager.Manager()
+        for (trk, dobj_name, orbit) in assignment_list:
+            if orbit.residuals:
+                fom = 1.0 / orbit.residuals # FOM for arbitration
+            else:
+                fom = 42e8   # make up something, but don't div by zero
+            mgr.add(MOPS.IDManager.Obj(dobj_name, [use_id], fom))
+        # <- for
+
+        mgr.analyze()       # schwing them
+
+        for mobj in mgr._objs:
+            if mobj.rejected:
+                demoted_tbl[mobj.id] = 1
+            # <- if
+        # <- for mobj
+    # <-- end def
+        
+    def run(self):
+        """
+        Main entry point to the precovery pipeline. Check the database for
+        precovery jobs and process them.
+        """
+
+        # Is precovery disabled? If so, simply mark the precovery jobs as done
+        # and quit.
+        if self._config['debug'].get('disable_precovery'):
+            self._logger.info('%s: disabled.' % (self._logPrefix))
+            return
+        # <-- end if
+
+
+        # Go to eon/nn working directory.  Use a cheap hack temporarily to ensure we have a
+        # unique dir to operate in.  Later we want to use our current MOPS night number.
+#        wd = os.path.join(self._instance.getEnvironment('EONDIR'), 'panda.%f' % time.time())
+#        oldwd = os.getcwd()
+#        if not os.path.exists(wd):
+#            os.mkdir(wd)
+#        os.chdir(wd)
+
+        # Now get all available (i.e. observed) nights.
+        if self._nn != None:
+            # process single night
+            self.nights = [self._nn]
+        else:
+            self.nights = getAllObservedNights(self._dbh, self._config['site']['gmt_offset_hours'])
+        # <-- end if        
+
+
+        # Check a debug hack to see if we are to preload output files from the current directory.
+        if not self._config['debug'].get('precov_preload'):
+            # Check there are nights to precov.
+            if not self.nights:
+                self._logger.info('%s: no nights to precover.' % self._logPrefix)
+                return 
+
+            self._logger.info('%s: found %d night(s) to precover.' \
+                              % (self._logPrefix, len(self.nights)))
+
+            # Get the list of derived objects waiting in the EON queue.
+            self._jobs = self.getJobs()
+            self.buildDO2EONQMap()
+            self._logger.info('%s: found %d precovery jobs.' \
+                              % (self._logPrefix, len(self._jobs)))
+            if not self._jobs:
+                # Nothing to do: quit
+                return
+            # <-- if
+
+            master_results = self.processNights(self.nights)
+        else:
+            # Go!
+            fileNames = ['%s.%d' % ('precov.out', i) for i in range(int(self._config['debug']['precov_preload']))]
+            master_results = self.consolidate_worker_files(fileNames)
+        # <- if
+
+        self.record(master_results)
+        self.nightlyLostEfficiency(self.nights)
+        self.markStableObjects(master_results)
+        return
+    # <-- end def
+        
+    def record(self, master_results):
+        """
+        'Replay' the merged results from our workers.  We will simply process
+        all tracklets in order, and resolve duplicate tracklet assignments by
+        demoting 'losers' in the duplicate set.
+        """
+
+        # Loop through the master_results table and resolve any conflicts we might
+        # find. In any case, update the DerivedObjects and the database as well.
+        # For the efficiency variables, we have to be a bit tricky. The thing is
+        # that we want to compute the efficiency figures using the old orbit but
+        # we also want to reflect the fact that a new orbit was installed.
+        # We do this by leaving (in the efficiency vars) the old orbit in place
+        # but we update its id to that of the latest orbit.
+        dobj_cache = dobjcache(self._dbh)
+        demotion_tbl = {}
+
+        for (tracklet, dobj_name, orbit) in master_results['ASSIGNMENTS']:
+            obj = dobj_cache.fetch(dobj_name)
+
+            # Peek at the dobj status to see if the dobj was demoted
+            # via a duplicate-assignment arbitration.
+            for det_id in [d._id for d in tracklet.detections]:
+                if det_id in master_results['DUPLICATES']:
+                    # Perform an arbitration, which may demote derived objects.  If our dobj
+                    # got demoted, move on!
+                    self.arbitrate(demotion_tbl, master_results['DUPLICATES'][det_id], det_id, dobj_cache)
+                # <- if
+            # <- for
+
+            if dobj_name in demotion_tbl:
+                self._logger.info('%s: tracklet %d/%s was demoted' % (self._logPrefix, tracklet._id, dobj_name))
+                continue            # got demoted by self.arbitrate()!
+
+            # Determine whether the panda is LSD or not (if tracklet was upgraded).
+            is_lsd = master_results['UPGRADED'].get(tracklet._id, 'N')      # returns 'Y' or 'N'
+
+            if self._config['debug'].get('precov_noinsert', None):
+                continue
+
+            # Update the orbit in the DB.
+            with MOPS.Instance.Transaction(self._dbh):
+                # Compute ephemeris distance and uncertainty, since the worker did not provide them.
+                # Note obj.orbit should be the *original* orbit for the derived object.
+                eph_dist_arcsec, eph_unc_arcsec = _compute_eph_uncertainty(tracklet, obj.orbit, self._obscode)
+
+                # Associate tracklet to object, including all the low-level DB operations.
+                obj.attributeTracklets(self._dbh, orbit, tracklet)
+
+                # Write our paper trail.
+                fieldId = self._do2eonq[obj._id].fieldId        # look up triggering field ID for precovs
+                if fieldId is None:
+                    fieldId = tracklet.fieldId                  # get from tracklet (attributions only)
+
+                evt = self._historyEventClass(
+                    obj._id,
+                    fieldId,
+                    orbit._id,
+                    MOPS.Constants.MOPS_EFF_ORBIT_OK,
+                    obj.classification,
+                    obj.ssmId,
+
+                    tracklet._id,
+                    eph_dist_arcsec,    # eph dist
+                    eph_unc_arcsec,     # eph unc
+                    is_lsd,             # Y/N if panda is LSD
+                )
+                evt.record(self._dbh)
+
+                # Update item in EON queue.
+                if self._attrib_mode:
+                    # Put object in EON queue if this is an attribution.
+                    MOPS.EONQueue.submit(self._dbh, obj._id, evt.event_id)
+                else:
+                    MOPS.EONQueue.update(self._dbh, obj._id, MOPS.Constants.EONQUEUE_STATUS_PRECOVERED)
+
+                # Add orbit to MOID queue.
+                MOPS.MOIDQueue.submit(self._dbh, orbit._id, evt.event_id)
+
+            # <- with (auto-commit by hidden context mgr object)
+            
+            self._logger.info('%s: object %d: new orbit w/ tracklet %d (epoch %.5f).' \
+                              % (self._logPrefix, obj._id, tracklet._id, tracklet.extEpoch))
+        # <-- end for
+        return
+    # <-- end def
+        
+    def splitJobList(self):
+        """
+        Split the input jobs in n pieces. A precovery job is an instance of the
+        MOPS.EONqueue class.
+        """
+        tot = len(self._jobs)
+
+        # Now it could happen that the number of available workers (i.e.
+        # self._concurrency) is greater than the number of available jobs. In
+        # this case, we simply submit a number of worker procs = number of jobs.
+        numPieces = min(tot, self._concurrency)
+        
+        result = [[]] * numPieces
+        for i in range(numPieces):
+            result[i] = self._jobs[i:tot:numPieces]
+        # <-- end for
+        return(result)
+    # <-- end def
+        
+    def findLostObjects(self, nn):
+        """ 
+        Return a list of effData objects containing info we need to write
+        lost efficiency records.  Note this implementation is the precovery
+        version, which fetches DOs against the EON queue; for attribution
+        we want to fetch against the existing population of DOs.
+        """
+
+        # Convert our night number to start/end epochs.
+        start_epoch_mjd = MOPS.Lib.nn2mjd(nn, self._config['site']['gmt_offset_hours'])
+        end_epoch_mjd = start_epoch_mjd + 1.0
+
+        # Get a cursor from the DB connection.
+        cursor = self._dbh.cursor()
+
+        # Fetch the DerivedObject ids.
+        sql = '''
+select t.tracklet_id, eonq.derivedobject_id, h.field_id, h.ssm_id, 1 /* true value */
+from tracklets t, eon_queue eonq, history h
+where h.ssm_id is not NULL
+and h.event_id=eonq.event_id
+and t.ssm_id=h.ssm_id
+and t.status='U'
+and t.classification <> 'X'
+and t.ext_epoch between %s and %s
+'''
+        nRes = cursor.execute(sql, (start_epoch_mjd, end_epoch_mjd))
+        if(not nRes):
+            return []
+        # <-- end if
+
+        # Return the list of EffData objects.
+        return [EffData(*row) for row in cursor.fetchall()]
+    # <-- end def
+        
+    def nightlyLostEfficiency(self, nights):
+        """
+        Write efficiency/paper-trail records for unfound synthetic objects.  We do
+        this by locating unattributed tracklets in the current night that have a
+        corresponding derived object (for attribution) or EON record (for precovery).
+        Then it is a simple matter of creating MOPS_EFF_UNFOUND efficiency
+        objects for each tracklet.
+
+        For each lost tracklet, we need
+          - tracklet ID
+          - derived object ID
+          - "triggering" field ID (not tracklet's field for precovery)
+        """
+
+        self._logger.info('%s: starting lost efficiency' % (self._logPrefix,))
+
+        for nn in nights:
+            lost_eff_data = self.findLostObjects(nn)
+            for item in lost_eff_data:
+                # Fetch tracklet.
+                tracklet = Tracklet.retrieve(self._dbh, item.tracklet_id, fetch_detections=True)
+
+                # Fetch orbit.
+                orbit = Orbit.retrieve_derivedobject(self._dbh, item.derivedobject_id)
+
+                # Eph uncertainty.
+                eph_dist_arcsec, eph_unc_arcsec = _compute_eph_uncertainty(tracklet, orbit, self._obscode)
+
+                # Write history records.
+                is_lsd = 'N'                # always false since we only look at 5-sigma for eff
+                with MOPS.Instance.Transaction(self._dbh):
+                    evt = self._historyEventClass(
+                        item.derivedobject_id,
+                        item.field_id,
+                        orbit._id,
+                        MOPS.Constants.MOPS_EFF_ORBIT_FAIL,
+                        MOPS.Constants.MOPS_EFF_UNFOUND,
+                        item.ssm_id,
+
+                        item.tracklet_id,
+                        eph_dist_arcsec,    # eph dist
+                        eph_unc_arcsec,     # eph unc
+                        is_lsd
+                    )
+                    evt.record(self._dbh)
+
+                    # Update in EON queue if necessary.
+                    if item.eonq:
+                        MOPS.EONQueue.update(self._dbh, item.derivedobject_id,
+                            MOPS.Constants.EONQUEUE_STATUS_PRECOVERED)
+                    # <-- if
+                # <-- with
+            # <-- for item
+        # <-- for nn
+    # <-- end def
+    
+    def markStableObjects(self, stuff):
+        """
+        Mark objects that have been returned in the 'STABLE' list in the
+        database as stable so that we no longer have to precover them.
+        """
+        stable_list = stuff['STABLE']
+        if stable_list:
+            with MOPS.Instance.Transaction(self._dbh):
+                sql = "update derivedobjects set stable_pass='Y' where derivedobject_id=%s"
+                cursor = self._dbh.cursor()
+                for dobj_id in stable_list:
+                    nres = cursor.execute(sql, (dobj_id,))
+                # <- for
+            # <-- with, implied commit()
+            self._logger.info('%s: marked %d object(s) as stable' % (self._logPrefix, len(stable_list)))
+        else:
+            self._logger.info('%s: no objects to mark as stable' % self._logPrefix)
+        # <- if stuff
+        return
+            
+    # <-- end def
+    
+    def processNights(self, nights):
+        """
+        Delegate the real night processing to the worker nodes. Each worker node
+        will compute coarse and precise ephemerides, fieldProximity, find
+        candidate tracklets and then do OD on those.
+
+        Return the final raw result of the OD process in the form of
+            {tracklet: (derivedObject, newOrbit), }
+        """
+
+        start_night = nights[0]
+        self._logger.info('%s: processing nights %s' % (
+            self._logPrefix, ' '.join([str(n) for n in nights])
+        ))
+
+
+        # Split the precovery job/orbit list into chunks.
+        precovJobList = self.splitJobList()
+
+        # The number of worker jobs is equal to the number of precovery jobs.
+        num_workers = len(precovJobList)
+        
+        self._logger.info('%s: ready to submit %d worker jobs.' \
+                          % (self._logPrefix, num_workers))
+
+        # Get ready to submit those worker jobs: write the data to disk.
+        self._logger.info('%s: writing input files.' % (self._logPrefix))
+        night_file, ids_file_root = self.writeInputFiles(precovJobList, start_night, self.nights)
+
+        # LSD prep.
+        lsd_rootdir = None
+        if self._config['main'].get('enable_lsd', None):
+            # lsd_rootdir is the name of the directory *on the cluster* where to find
+            # the LSD archive.  We rely on our PS1 NFS setup to map directories in this
+            # fashion.
+            lsd_rootdir = self._config['lsd'].get('lsd_rootdir', None)
+            if lsd_rootdir:
+                lsd_rootdir = os.path.join(lsd_rootdir, self._instance.dbname)
+            # <-- end if
+            self.writeUsedDetections(lsd_rootdir, self.nights)
+        # <-- end if
+        
+        # Create a Condor job manifesto.
+        self._logger.info('%s: sending the worker jobs off to the cluster.' % (self._logPrefix))
+        cmd = os.path.join(os.environ['MOPS_HOME'], 'bin', 'panda_worker')
+
+        if self._attrib_mode:
+            out_file_root = 'attrib.out'
+        else:
+            out_file_root = 'precov.out'
+        # <-- end if
+        
+        workerJob = self._createCondorJob(
+            cmd=cmd,
+            num_workers=num_workers,
+            start_night=start_night,
+            night_file=night_file,
+            ids_file_root=ids_file_root,
+            out_file_root=out_file_root,
+        )
+
+        # Submit the job and wait until it is done.
+        err = MOPS.Condor.submit(workerJob, removeJobFile=True)
+
+        # Consolidate the output files into a list. Each file has data of the
+        # form {tracklet: [(obj, orbit), ...]}
+        fileNames = ['%s.%d' % (out_file_root, i) for i in range(num_workers)]
+        master_results = self.consolidate_worker_files(fileNames)
+        self._logger.info('%s: consolidated cluster results for %d' % (self._logPrefix, start_night))
+
+        return master_results
+    # <-- end def
+    
+    def writeInputFiles(self, precovJobs, start_night, nights):
+        """
+        Given a list of EONqueue lists (precovJobs), a tuple tree and the
+        MJD of a night, write this data to disk. The result of this call will be
+        that a total of n+1 files will be created, where n=len(precovJobs).
+
+        The file names will be: MJD.orbits.i where i=range(len(precovJobs)) and
+        MJD=int(night). The last file name will be MJD.fields
+        """
+        
+        if self._attrib_mode:
+            night_file = 'attrib.nights'
+            orbits_file = 'attrib.ids'
+        else:
+            night_file = 'precov.nights'
+            orbits_file = 'precov.ids'
+        # <-- end if
+        
+        # Write the orbits corresponding to the derivedobjects in each precovJob
+        # to disk.
+        i = 0
+        for job in precovJobs:
+            self.writeWorkerJobData(job, orbits_file + ('.%d' % i))
+            i += 1
+        # <-- end for
+
+        # Write the nights to process.
+        file(night_file, 'w').writelines([str(night) + '\n' for night in nights])
+
+        return night_file, orbits_file
+    # <-- end def
+    
+    def writeWorkerJobData(self, eonq_jobs, fileName):
+        """
+        Write each job's list of derived objects to a file.
+        """
+        derivedobject_id_list = [eonq.derivedobjectId for eonq in eonq_jobs]
+        f = file(fileName, 'wb')
+        f.writelines([str(do_id) + '\n' for do_id in derivedobject_id_list])
+        f.close()
+        return
+    # <-- end def
+        
+    def writeUsedDetections(self, lsd_rootdir, nights):
+        """
+        Invoke a program to write out the detections occurring in all
+        fields during the night that have been used (attributed) to
+        a derived object in MOPS.  The LSD processing needs this information
+        so that it does not attempt to re-use detections during LSD processing.
+        """
+        for nn in nights:
+            ret = subprocess.check_call(['lsd', '--nn', '%d' % nn, 'used'])      # "lsd --nn $night used"
+            if ret:
+                raise RuntimeError("'lsd used' command failed")
+            # <-- end if
+        # <-- end for
+        return
+    # <-- end def
+        
+    def cleanup(self):
+        """
+        Call self.markAsCompleted(self._jobs)
+        """
+        self.markAsCompleted(self._jobs)
+        return
+    # <-- end def
+    
+    def _createCondorJob(self, cmd, num_workers, start_night, night_file, ids_file_root, out_file_root):
+        """
+        Clenup any pre-existing output files and setup the job manifesto for
+        each Condor job.
+        """
+        # Cleanup first.
+        if self._attrib_mode:
+            job_file_root = 'attrib'
+        else:
+            job_file_root = 'precov'
+        # <-- end if
+        
+        for i in range(num_workers):
+            ithFileName = job_file_root + '.out.%d' % i
+            if os.path.exists(ithFileName):
+                os.remove(ithFileName)
+            # <-- end if
+        # <-- end for
+
+        # Create the job instance.
+        job = MOPS.Condor.Job(self._instance, universe='vanilla', executable=cmd, queue=num_workers)
+
+        # Specify input/output and args.
+        job.add_arg('--instance')
+        job.add_arg(self._instance.dbname)
+
+        # Tell worker whether we're doing precov or attrib.
+        job.add_arg('--mode')
+        if self._attrib_mode:
+            job.add_arg('attrib')
+        else:
+            job.add_arg('precov')
+        # <- if self._attrib_mode
+
+        job.add_file_arg(night_file)
+        job.add_file_arg('%s.$(Process)' % (ids_file_root))
+        job.add_arg('%s.$(Process)' % (out_file_root))
+
+        # STDOUT/STDERR for debugging.
+        job.set_stderr_file(job_file_root + '.stderr.$(Process)')
+        job.set_stdout_file(job_file_root + '.stdout.$(Process)')
+        job.set_log_file(job_file_root + '.condorlog')
+
+        # Extra options.
+        job.transfer_files = True
+        job.initial_dir = os.getcwd()
+        return job
+    # <-- end def
+    
+    def markAsCompleted(self, jobs):
+        mark_status = MOPS.Constants.EONQUEUE_STATUS_PRECOVERED
+        dbh = self._dbh
+        with MOPS.Instance.Transaction(dbh):
+            for job in jobs:
+                MOPS.EONQueue.update(self._dbh, job.derivedobjectId, mark_status)
+            # <-- end for
+        # <-- end with (tx commit/rollback by ctx handler)
+        return
+    # <-- end def
+# <-- end class
+
+class AttributionPipeline(PrecoveryPipeline):
+    """
+    PrecoveryPipeline subclass. Provides specialized behaviour for the
+    attribution pipeline.
+    """
+    def __init__(self, instance, obscode, nn, run_id):
+        """
+        instance: MOPS instance (corresponding to $MOPS_DBINSTANCE)
+        obscode: observatory code
+        """
+        # Invoke the super class constructor.
+        super(AttributionPipeline, self).__init__(instance, obscode, nn, run_id)
+
+        # Set the prefix string for logger messages.
+        self._logPrefix = 'ATTRIB'
+        self._historyEventClass = MOPS.History.Attribution
+        self._attrib_mode = True            # mostly for orbit stability handling
+
+        
+        # Determine the night number to process, if not already given.
+        self._nn = [nn]
+        self.nights = self._nn
+        
+        # Setup the directory structure.
+        return
+    # <-- end def
+    
+    def findLostObjects(self, nn):
+        """ 
+        Attribution version of findLostObjects(). See notes in 
+        PrecoveryPipeline.findLostObjects().
+        """
+
+        # Convert our night number to start/end epochs.
+        start_epoch_mjd = MOPS.Lib.nn2mjd(nn, self._config['site']['gmt_offset_hours'])
+        end_epoch_mjd = start_epoch_mjd + 1.0
+
+        # Get a cursor from the DB connection.
+        cursor = self._dbh.cursor()
+
+        # Fetch the DerivedObject ids.
+        sql = '''
+select t.tracklet_id, do.derivedobject_id, t.field_id, do.ssm_id
+from tracklets t, derivedobjects do
+where do.ssm_id is not NULL
+and t.ssm_id=do.ssm_id
+and t.status='U'
+and t.classification <> 'X'
+and t.ext_epoch between %s and %s
+'''
+        nRes = cursor.execute(sql, (start_epoch_mjd, end_epoch_mjd))
+        if(not nRes):
+            return []
+        # <-- end if
+
+        # Return the list of EffData objects.
+        return [EffData(*row) for row in cursor.fetchall()]
+    # <-- end def
+    
+    def run(self):
+        """
+        Main entry point to the attribution pipeliene.
+        """
+        # Prepare for the processing of the only night, if any.
+        if not self.nights or self.nights[0] == None:
+            self._logger.info('%s: No available night/fields.' \
+                              % (self._logPrefix))
+            return
+        # <-- end if
+
+        # Is attribution disabled?
+        if self._config['debug'].get('disable_attributions'):
+            self._logger.info('%s: disabled.' % (self._logPrefix))
+            return
+        # <-- end if
+
+
+        # Set up working dirs.
+        work_dir = self._instance.makeNNDir(self._nn[0], 'attrib')
+        os.chdir(work_dir)
+
+        
+        # Get the list of all known derived objects.
+        self._jobs = getAllDerivedObjectsAsEONQueues(self._dbh)
+        self.buildDO2EONQMap()
+
+        self._logger.info('%s: found %d derived objects.' \
+                          % (self._logPrefix, len(self._jobs)))
+        if not self._jobs:
+            # Nothing to do: quit
+            return
+        # <-- end if
+
+        # Process the one night.
+        master_results = self.processNights(self.nights)
+        self.record(master_results)
+        self.nightlyLostEfficiency(self.nights)
+        return
+    # <-- end def
+    
+    def cleanup(self):
+        """
+        Instead of flushing the EONQueue, here we mark all the fields for
+        self.nights[0] as attributed.
+        """
+        self.markAsAttributed()
+        return
+    # <-- end def
+    
+    def markAsAttributed(self):
+        """
+        Mark all fields in the tuple tree with status attributed.
+        """
+        if self.nights:            
+            with MOPS.Instance.Transaction(self._dbh):
+                cursor = self._dbh.cursor()
+
+                # Update fields to indicate that they have gone through the 
+                # attribution process.
+                sql = 'update `fields` set status=%s where nn=%s and status=%s'
+                nRes = cursor.execute(sql, (MOPS.Constants.FIELD_STATUS_ATTRIBUTIONS, self.nights[0], MOPS.Constants.FIELD_STATUS_POSTTRACKLET))
+                self._logger.info('%s: %d fields attributed' % (self._logPrefix, nRes))                
+
+                if (self._run_id) :
+                    # Get a list of the fields ids that have been processed by panda
+                    sql = 'select field_id from fields where nn=%s and status=%s'
+                    nRes = cursor.execute(sql, (self.nights[0], MOPS.Constants.FIELD_STATUS_POSTTRACKLET))
+                    if not nRes:
+                        # There were no fields with a status of posttracklet so no
+                        # attributions were performed.
+                        return
+                    # <-- end if
+                    fieldIds = []
+                    field = cursor.fetchone()
+                    while field:
+                        fieldIds.append(field[0])
+                        field = cursor.fetchone()
+                    #<-- end while
+                #<-- end if
+            # <-- end with
+            
+            # Update runs table with the field ids of the updated fields.
+            if (self._run_id) :
+                self.updateRunsTable(self._run_id, fieldIds, MOPS.Constants.FIELD_STATUS_ATTRIBUTIONS)
+            # <-- end if
+        # <-- end if
+        return
+    # <-- end def
+    
+    def updateRunsTable(self, runId, fieldIds, status):
+        """
+        Update runs table to indicate that fields have been sucessfully 
+        attributed.
+        """
+        ins_sql = "INSERT INTO export.runs (run_id, field_id, db_name, status) VALUES (%s, %s, %s, %s)"
+        up_sql = "UPDATE export.runs SET status=%s WHERE run_id=%s AND field_id=%s"
+        sel_sql = "SELECT COUNT(*) FROM export.runs WHERE run_id=%s AND field_id=%s";
+        cursor = self._dbh.cursor()
+        for id in fieldIds:
+            with MOPS.Instance.Transaction(self._dbh):  
+                # Determine if field was previously updated during the run
+                cursor.execute(sel_sql, (runId, id))
+                (count,) = cursor.fetchone() 
+                if (count > 0):
+                    # Update run with new field status.
+                    cursor.execute(up_sql, (status, runId, id))
+                else:
+                    # Insert new run into run table.
+                    cursor.execute(ins_sql, (runId, id, self._instance.dbname, status))
+                # <-- end if
+            # <-- end with
+        # <-- end for
+    # <-- end def
+# <-- end class        
+
+if __name__ == '__main__':
+    # Constants
+    USAGE = '''\
+    Usage: precov (--attrib --nn NIGHT_NUMBER|--precov) [options]
+
+    Options:
+      --instance INSTANCE_NAME
+      --precov
+      --attrib --nn NIGHT_NUMBER
+      --run : id of the run that panda is a part of. This parameter is used by  
+          the mopper script and should not be specified when manually running 
+          panda.  
+      --help'''
+
+    t0 = time.time()
+        
+    # Get user input (tracks file) and make sure that it exists.
+    parser = optparse.OptionParser(USAGE)
+    parser.add_option('--instance', dest='instance_name', type='string', help="specify instance name")
+    parser.add_option('--precov', action='store_true', dest='precov_mode', help="precovery mode (all previous nights)")
+    parser.add_option('--attrib', action='store_true', dest='attrib_mode', help="attribution mode (latest night)")
+    parser.add_option('--nn', dest='nn', type='int', help="night number to process (required for --attrib)")
+    parser.add_option('--run', dest='run_id', type='int', help="Run id that panda process is executing under")
+    options, args = parser.parse_args()
+
+    if options.precov_mode:
+        subsys_name = 'PRECOV'
+        pipeline_class = PrecoveryPipeline
+    elif options.attrib_mode:
+        subsys_name = 'ATTRIB'
+        if options.nn is None:
+            parser.error('--nn NIGHT_NUMBER is required with --attrib')
+        pipeline_class = AttributionPipeline
+    else:
+        parser.error('--attrib or --precov must be specified')
+    # <-- end if        
+        
+    # Determine the name of MOPS DB instance.
+    mops_instance = MOPS.Instance.Instance(dbname=options.instance_name or os.environ['MOPS_DBINSTANCE'])
+    mops_config = mops_instance.getConfig()
+    mops_logger = mops_instance.getLogger()
+
+    mops_logger.info(subsys_name + ': starting.')
+
+    obscode = mops_config['site']['obscode']
+
+    pp = pipeline_class(mops_instance, obscode, options.nn, options.run_id)
+    rc = pp.run()
+    pp.cleanup()
+
+    mops_logger.info(MOPS.Lib.formatTimingMsg(subsystem=subsys_name, time_sec=(time.time() - t0), nn=options.nn))
+
+    # Run the MOPS moid calculation on new orbits.  Sorry we have to call
+    # out to another executable.
+    moid_ret = subprocess.check_call(['moid', '--file_prefix=' + subsys_name])      # "moid --file_prefix=SUBSYS"
+    if moid_ret:
+        fail_msg = subsys_name + "/MOID failed"
+        mops_logger.warning(fail_msg)
+        raise RuntimeError(fail_msg)
+    # <-- if
+
+    exit(0)
+# <-- end if

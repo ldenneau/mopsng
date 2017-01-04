@@ -1,0 +1,65 @@
+#!/usr/bin/env perl
+
+# $Id: jd2cal 4068 2010-08-13 00:05:42Z denneau $
+# Convert MJD or JD to calendar dates
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Astro::Time;
+use PS::MOPS::Constants qw(:all);
+
+
+sub usage {
+    return <<"EOF";
+usage: jd2cal [--jd] [--raw] [--help] date
+  --jd : always treat input as JD
+  --raw : write raw Astro::Time output (day, month, year, dayfrac)
+  --time : write time instead of day fraction
+  --help : show usage
+  date : numeric JD or MJD; if "large", treat as JD
+EOF
+}
+
+my $jd;    # always treat input as JD if set
+my $raw;
+my $time;
+my $help;
+my $result = GetOptions(
+    jd => \$jd,
+    raw => \$raw,
+    time => \$time,
+    help => \$help,
+);
+die usage() if ($help or !@ARGV);
+
+my $date;
+while ($date = shift) {
+    $date -= $MJD2JD_OFFSET if ($date > 1_000_000 or $jd);
+    my @res = mjd2cal($date);
+
+    if ($raw) {
+        print join(" ", @res), "\n";
+    }
+    else {
+        if ($time) {
+            print
+                join (" ",
+                    $res[2],    # year
+                    $res[1],    # month
+                    $res[0],
+                    turn2str($res[3], 'H', 2)
+                ),
+                "\n";
+        }
+        else {
+            print
+                join (" ",
+                    $res[2],    # year
+                    $res[1],    # month
+                    $res[0] + $res[3],  # day + dayfrac
+                ),
+                "\n";
+        }
+    }
+}

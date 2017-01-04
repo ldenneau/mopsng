@@ -1,0 +1,141 @@
+#!/usr/bin/env perl
+# Program to take synthetic detections from SYNTHEPH and "hide" them in
+# LSD files so that we can test LSD processing.  Typical usage would be
+# to run a simulation for a single lunation, then enable SYD-hiding
+# so that subsequent attribution/precovery would occur in LSD-space.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::LSD;
+
+use subs qw(
+);
+
+
+my $inst;
+my $instance_name;
+my $nn;
+my $fileroot = 'synth.out';
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=f' => \$nn,
+    'fileroot=s' => \$fileroot,
+    help => \$help,
+) or pod2usage(2);
+
+#pod2usage(-message => "out_fileroot is not specified") unless $out_fileroot;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+pod2usage(-message => "No night number specified") unless $nn;
+
+
+# OK, go to the night's synth directory.
+my $synth_dir = $inst->makeNNDir(NN => $nn, SUBSYS => 'synth');
+my $lsd_dir = $inst->makeNNDir(NN => $nn, SUBSYS => 'lsdingest');
+
+chdir $synth_dir or die "can't chdir to $synth_dir";
+
+# Snarf all synth.out.* files.
+opendir DIR, '.' or die "can't open $synth_dir";
+my @all = readdir DIR;
+closedir DIR;
+my @synth_files = grep { /^$fileroot\./ } @all;
+$mops_logger->info(sprintf "Found %d synth files.", scalar @synth_files);
+
+# Now for each synth file, snag its field ID and the MIF-SYNTH detections then
+# append them to the appropriate .nsd.src.bin file in the lsdingest directory.
+foreach my $file (@synth_files) {
+    $mops_logger->info("Hiding detections in $file...");
+    my $field_id;
+    my $fh = new FileHandle $file or die "can't open $file";    
+    my $head = <$fh>;
+    chomp $head;
+
+    if ($head =~ /^#\s+FIELD_ID\s+(\d+)/) {
+        $field_id = $1;
+    }
+    else {
+        die "can't get field ID from file $file";
+    }
+
+    my @lines = <$fh>;
+    if (@lines) {
+        chomp @lines;
+        my $out_file = "$lsd_dir/$field_id.nsd.src.bin";
+        my $det_num = (-s $out_file) / PS::MOPS::LSD::NSD_TEMPLATE_LENGTH;
+        my $out_fh = new FileHandle ">>$lsd_dir/$field_id.nsd.src.bin" or die "can't open .src.bin file for $field_id";
+
+        my ($dummy, $dummy_id);
+        foreach my $line (@lines) {
+            next if $line =~ /^#/;  # comment, skip
+            my %det;
+            my $packed_det;
+            ($dummy, $dummy_id, @det{qw(
+                ra
+                dec
+                epoch
+                mag
+                refMag
+                filter
+                isSynthetic
+                detNum
+                status
+                s2n
+                raSigma
+                decSigma
+                magSigma
+                orient_deg
+                length_deg
+                objectName
+                fieldId
+                obscode
+            )}) = split /\s+/, $line;
+
+            # Manufacture packed LSD det.
+            $det{s2n} = 4.9 + rand() / 11;       # something between 4.9 and 5
+            print $out_fh pack PS::MOPS::LSD::NSD_PACK_TEMPLATE, 
+                $field_id,
+                $det_num++,
+                @det{qw(epoch ra dec mag s2n raSigma decSigma magSigma)};
+        }
+        $out_fh->close();
+    }
+    $fh->close();
+
+    # Now re-write empty synth file.
+    $fh = new FileHandle ">$file" or die "can't re-open $file for writing";
+    print $fh $head, "\n";
+    print $fh map { "# $_\n" } @lines;
+    $fh->close();
+}
+
+exit 0;
+
+=head1 NAME
+
+hideSYDs - Hide synthetic detections in LSD files
+
+=head1 SYNOPSIS
+
+hideSYDs [options] 
+
+  --nn NIGHT_NUMBER : which night number to operate on
+  --fileroot NAME : use NAME as root of files to look for, should be 'synth.out' or 'synth.visible'
+  --help : show manpage
+
+=head1 DESCRIPTION
+
+Examines the specified night's SYNTH directory for SYNTHEPH output files,
+then copies the detections to NSD files for the same night and removes
+the synthetic detections.  During the copy the S/N of the detections is
+modified to fall below the high-significance threshold.
+
+=cut

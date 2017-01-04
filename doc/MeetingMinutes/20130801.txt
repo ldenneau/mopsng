@@ -1,0 +1,102 @@
+ATTENDING (alphabetical):
+
+Bolin, Chambers, Chastel (chair), Engelhardt, Hsieh, Jedicke (scribe), Schunova, Wainscoat, Veres
+
+
+MINUTES:
+* Telescope Status (KC)
+things are in relatively good shape
+there has been a little degradation from bad focus but they think they can get it fixed soon
+they had shut down everything due to Flossie
+probably prudent given all the lightning
+
+* IPP Issues (while KC is in)
+  * Trail fitting (PV)
+showed figs of IPP fitted trails
+it seems like measured 'width' of untrailed objects with trail fitting is about right
+but 'length' of trail is strange
+  - PV's original code had length=0 corresponding to untrailed object
+  - IPP code seems to have length=1 for untrailed object
+PSF flux of untrailed objects does not match trailed flux of untrailed objects
+there is ~-0.4 mag offset at zero motion
+KC: need to determine if PV's code has the same offset
+  * Photometry issues (SC for AF)
+good photometry seems to happen when ZP>25.98
+AF has provided email description and SC will forward to ps-mops-dev
+80% of IPP data is ubercaled
+if data is photometric and ubercaled then photometry is good
+otherwise treat photometry with suspicion
+it will take 3 years to get photometric conditions on every sky pixel
+RJ? are the uncertainties trustworthy?  i.e. do they reflect real photometry
+not known, should be studied by DRAVG
+  * 1d convolution (SC)
+IPP/Waters produced new convolution data for test study
+total tracklets decreased 90%!
+still needs to investigate how it impacts efficiency
+
+  * Dual convolution (SC for AF)
+AF is investigating results
+neither of the convolutions are currently in production mode
+IPP is waiting for MOPS to decide whether to 'pull the trigger'
+KC thinks the data looks much better (by eye)
+RJ reminds that if the false detection rate really goes down the actual detection efficiency with the current parameters might also go down - but this OK
+the current cut parameter space needs to be explored to find new 'best' thresholds
+SC is currently only looking at a couple different fields, needs to test different filters, conditions, etc.
+KC recommends a more aggressive iteration to better parameters to find more NEOs
+SC a little more cautious, informed decision to be made by SC w/ RW & AF
+
+* Communication with the IPP (while KC is in)
+KC would like all tickets to be managed in the PS1 management system
+SC wants to have clear communication channels that are well defined
+IPP tickets can only be closed by the group/person that opens them
+
+* Data Processing (SC)
+problems with processing last night's data
+currently processing
+
+* NEO Status (RW/PV)
+there were about 10 objects from last lunation MPECd with only F51 + one other observatory
+PV is working on automating precovery of NEOs
+he has submitted about half a dozen objects that were missed by F51
+we need to know what they were missed
+he is currently unable to submit them as precoveries
+initial stats:
+* detections in MOPS but no tracklet created! (has not yet determined why tracklet was not created)  SC will investigate
+* no detections in MOPS db, need to investigate if the were found by IPP
+
+* NEO Czaring (BB)
+not much happening due to weather, mechanical problems, bright time
+
+* ps-mops / ps-mops-dev mailing lists
+SC has not been using a mailing list
+SC says LD abandoned use of the mailing lists
+SC will begin maintaining the lists
+
+* Comets
+no report, no comets found recently
+one definite comet on the CP now has large ephemeris uncertainty (3 deg)
+it is in the MSS
+
+* MOPS efficiency studies
+TE provided his latest automated fits to all nightly MOPS *detection* efficiencies for all filters  i.e. the efficiency for identifying detections in IPP+MOPS
+TE & PV suggest that the width values might be fixed at say 0.25 mags
+we will do study to check
+SC suggests that a study could be done looking for correlation between PSF & width
+good idea but probably too complicated
+SC will implement code in MOPS
+and make it updated each night
+might want to set upper limit for eff0
+SC thinks implementing figs would also be useful for czar to assess data
+TE will provide documentation
+TE will provide code to SC
+
+* ATLAS
+w/in weeks ATLAS sw should exist to generate synthetic images at each ATLAS footprint w/ real stars and asteroids that are then processed thru a proto-IPP and proto-MOPS
+
+* AOB
+-condor_wait problem
+ES and PV have been constantly having problems with MOPS simulations failing
+they have to restart w/o difficulty but it is hassle
+SC thinks he may have a clue about what is happening
+SC will get together with PV to investigate the problem
+

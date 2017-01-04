@@ -1,0 +1,60 @@
+ATTENDING (alphabetical): Bryce Bolin (BB), Serge Chastel (SC/chair),
+Tony Engelhardt (TE), Peter Veres (PV/scribe), Richard Wainscoat (RW)
+
+AGENDA:
+
+* PS1 status: Telescope, IPP, MOPS data czaring (SC)
+  - nothing new since last week: bad weather, IPP delays (pixels
+    servers were moved to a new switch operating only at 100 MB/s
+    instead of 1GB/s, nebulous node failed)
+  - w band photometry (Alan Fitzsimmons) issues, will be discussed on
+ Skype on Friday morning 8:30 am (HST), with Alan, Gene, ...
+  - trail fitting: no progress (IPP)
+  - trail fitting: PV altered the code (to provide additional parameters
+  and to use input parameters from the tracklet), SC will implement it
+  and add ellipse to the jpeg as an overlay ds9 region (ellipse is
+  based on trail fitted parameters)
+  - convolution: no progress (IPP, Mark)
+
+* NEO status (RW, BB or PV)
+  - we lost 4 high scoring NEO candidates (score 100) due to high rate
+  of motion, faint, UH2.2 had technical issues, CFHT did not have
+  wide-field imager (full moon), posted on NEOCP, nobody did the
+  follow-up.
+  - attempt to do the self-follow up of P107mHT the next night, did
+  not find it (PV searched for MOPS detections with expected PA and
+  length by moments and IPP trail length), expected v_tot~30 deg/day
+  at 19.8 mag. PV thinks that the IPP S/N too low to be detected.
+  - 10,000th NEO discovery (PS1)
+
+* NEO czaring (RW, BB or PV)
+  - 3 objects from pairs that we are not sure they are real submitted
+    to NEOCP, we follow the NEOCP if someone confirm them (some of
+    them had crosstalk flag, but the shape and motion look
+    realistic). All at relatively high declination (40 deg). Sometime,
+    the false pairs are aligned with a position angle and rate of
+    motion. PV has an idea to display histogram of PA and v_tot for
+    pairs interface. RW suggested to talk to IPP (Chris) and
+    investigate crosstalk options for these candidates.
+
+* Comets: Template, AOB (HH or JK)
+  - nothing new
+
+* IPP Synthetics (SC)
+  - work in progress (SC), will need details on what statistics we
+    need from synthetics
+
+* Replication of production databases to neohq1 (SC)
+  - TE requested access to the production database (for mdrm152 and
+    mdrm137 data), concerns about the security and privileges,
+    replication in progress (SC)
+
+* Power outages in Manoa on Thursday (Jun 27th) and Saturday (Jun
+  29th) (SC)
+  - concern about the MOPS cluster: batteries for CMOS, 
+  - czaring will be disturbed
+
+* AOB
+  - We need to change naming of chunks (A, B, C), tessellations,
+    should be ecliptic-based. This will be needed as we go toward more
+    observing time (RW).

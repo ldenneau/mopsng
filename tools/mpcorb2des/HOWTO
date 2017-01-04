@@ -1,0 +1,4 @@
+
+http://www.minorplanetcenter.net/iau/MPCORB/MPCORB.DAT.gz
+gunzip MPCORB.DAT.gz
+./mpcorb2des MPCORB.DAT > MPCORB.DES

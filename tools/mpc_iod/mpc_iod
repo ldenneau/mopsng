@@ -1,0 +1,111 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+ 
+mpc_iod - Wrapper for MPC IOD program
+ 
+=head1 SYNOPSIS
+ 
+mpc_iod < tracks > orbits
+
+=head1 DESCRIPTION
+
+This wrapper invokes the IOD program provided by Gareth Williams at the CfA.
+Input file is MOPS tracks format:
+
+TRACK_ID EPOCH_MJD RA_DEG DEC_DEG MAG_V OBSCODE OBJECT_NAME
+
+Output orbits are Milani DES format.
+
+=cut
+
+
+use strict;
+use warnings;
+
+use FileHandle;
+use File::Temp qw(tempfile);
+use PS::MOPS::Lib;
+
+
+# How to invoke program.  See ReadMe.txt.
+my $COMMAND = "env MPCIOD_DATA=$ENV{CAET_DATA}/jpleph.405.mpc IOD.x -quitpass=3";
+
+
+my $verbose;
+my ($fh, $fn) = tempfile('.mpciodXXXXXX', DIR => '.');
+my $n = 0;
+my $last_track_id = 'ZUG';
+my %mops2mpciodtbl;     # map MOPS track IDs to base-62 L00000000 IDs
+
+my $rootname = shift || die "no filename specified";
+
+print STDERR "Loading tracks.\n" if $verbose;
+my ($track_id, $epoch_mjd, $obs_type, $ra_deg, $dec_deg, $mag_v, $obscode, $object_name);
+my $b62;
+
+my $in_fn = "$rootname.tracks";
+die "can't find $in_fn" unless -e $in_fn;
+my $in_fh = new FileHandle $in_fn or die "can't open $in_fn";
+
+while (<$in_fh>) {
+    chomp;
+    next unless $_;         # empty
+    next if /^#|^#!|^!!/;   # comment
+
+    ($track_id, $epoch_mjd, $obs_type, $ra_deg, $dec_deg, $mag_v, $obscode, $object_name) = split;
+
+    if ($track_id ne $last_track_id) {
+        $n++;
+    }
+    $last_track_id = $track_id;
+
+    $object_name = 'NA' unless $object_name;
+    $b62 = mopslib_toB62($n, 'L00000000');
+    $mops2mpciodtbl{$b62} = $track_id;      # save mapping to original MOPS track ID
+    print $fh <<"EOF";
+$b62 S$n $epoch_mjd $obs_type $ra_deg $dec_deg $mag_v r $obscode 0.0 0.0 0.0 5.0
+EOF
+
+}
+$fh->close();
+
+print STDERR "Executing IOD: $COMMAND.\n" if $verbose;
+#system("env MPCIOD_DATA=jpleph.405 ./IOD < $fn") == 0 or die "IOD failed";
+eval {
+    $fh = new FileHandle "$COMMAND < $fn |" or die "can't create pipe to IOD program";
+    my @all = <$fh>;
+    $fh->close();
+    
+    # Convert MPC track IDs back to MOPS and do other cleanup.
+    my ($id, $COM, $q_au, $ecc, $i_deg, $node_deg, $arg_peri_deg, $time_peri_mjd, $h_v, $epoch_mjd, $resid_arcsec, @etc);
+    foreach my $line (@all) {
+        ($id, $COM, $q_au, $ecc, $i_deg, $node_deg, $arg_peri_deg, $time_peri_mjd, $h_v, $epoch_mjd, $resid_arcsec, @etc)
+            = split /\s+/, $line;
+        $id =~ s/^(L\w+)/$mops2mpciodtbl{$1}/;    # re-map track ID
+
+        # Manufacture a fake Orbit object so we can test the elements for validity.
+        my $orbit = {
+            q => $q_au,
+            e => $ecc,
+            i => $i_deg,
+            node => $node_deg,
+            argPeri => $arg_peri_deg    
+        };
+        unless (mopslib_validOrbit($orbit)) {
+            print STDERR "Rejecting bad orbit $id: $line\n";
+            next;       # bogus, skip
+        }
+
+        print <<"MIF";
+MIF-O $id $q_au $ecc $i_deg $node_deg $arg_peri_deg $time_peri_mjd $epoch_mjd $h_v $resid_arcsec undef undef undef I
+MIF
+    }
+#    s/^(L\w+)/$mops2mpciodtbl{$1}/ foreach @all;
+#    print @all; 
+};
+
+# Clean up.
+unlink $fn;
+die $@ if $@;
+print STDERR "Done.\n" if $verbose;

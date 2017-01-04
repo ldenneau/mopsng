@@ -1,0 +1,44 @@
+# Full sequence for download & processing of files.
+
+set -x -e
+
+#export PATH=~denneau/tr/tools/mpcknown:$PATH
+
+# 1. Gets all files from web
+sh get
+
+# Extract F51 observations
+echo Extracting F51 observations.
+perl -ane 'print if substr($_,77,3) eq "F51"' < CmtObs.txt NumObs.txt UnnObs.txt > F51.obs
+#perl -ane 'print if substr($_,77,3) eq "F51"' < CmtObs.txt NumObs.txt UnnObs.txt | head -1000 > F51.obs
+#exit
+
+# For each one, look it up and generate SQL for it for our master MPC table.
+echo Munging.
+munge --sql F51.sql F51.obs 2>F51.err | tee F51.out
+
+
+# Clean up strange records.
+echo Cleaning up strange records and quote dopiness.
+#
+# 1. concatenate multiline SQL statements
+# 2. convert empty mags to NULL  
+# 3. convert all single quotes to @ (MPC names can contain single quotes)
+# 4. convert all @ surrounded by letters to -APO-
+#   4b. do #4 twice to handle weird cases
+#   4c. convert \w@@ to \w-APO-@ for names that end in '
+# 5. convert -APO- back to ', should only be apostrophes in names at this point
+# 6. convert @ to "
+perl -pe 'chomp if /\)\s*$/' < F51.sql | \
+    sed 's/, *,/, NULL,/g' | \
+    sed s/\'/@/g | \
+    perl -ape 's/(\w)@(\w)/$1-APO-$2/g; s/(\w)@(\w)/$1-APO-$2/g; s/(\w)@",/$1-APO-@,/g' | \
+    sed s/-APO-/\'/g | \
+    sed 's/, , 1)/, NULL, 1)/' | \
+    sed 's/, , 0)/, NULL, 0)/' | \
+    sed s/@/\"/g > F51-2.sql
+# perl -pe 'chomp if /\)\s*$/' < F51.sql |     sed 's/, *,/, NULL,/g' |     sed s/\'/@/g |     perl -ape 's/(\w)@(\w)/$1-APO-$2/g; s/(\w)@(\w)/$1-APO-$2/g; s/(\w)@",/$1-APO-@,/g' |     sed s/-APO-/\'/g |     sed s/@/\"/g  | sed 's/, , 1)/, NULL, 1)/' | sed 's/, , 0)/, NULL, 0)/'> F51-2.sql
+
+# Insert into DB.
+#mysql -umopsroot -ppanstar1 -hmops01 mpc < createdb.sql 
+#mysql -umopspipe -pepip -hmops01 mpc < F51-2.sql 

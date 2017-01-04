@@ -1,0 +1,34 @@
+Attendees: Bolin, Chastel, Veres, Wainscoat
+
+Minutes:
+* Telescope Status
+No report
+
+* IPP Issues
+  - IPP Trail fitting
+SC: Webpage with IPP vs PV comparison http://mopshq2.ifa.hawaii.edu/studies/trailfitting/
+SC: Waiting for comments
+  - Photometry
+No report
+  - Convolution
+SC: Needs to talk to EAM about it
+
+* Data Processing
+Nothing to report
+* NEO Status
+Bad weather
+Large PHA discovered: 2013UP8
+
+* NEO Czaring
+No report / bad weather
+
+* Comets
+No report
+
+* ATLAS
+No report
+
+* AOB
+-> SC for LD: digest2 parameter value confirmed with MPC for obserrF51=0.2
+
+

@@ -1,0 +1,110 @@
+#! /usr/bin/env perl
+# $Id$
+
+=head1 NAME
+
+upgrade_fields_solar_elong - Upgrade fields table
+
+=head1 SYNOPSIS
+
+upgrade_fields_solar_elong [options] [FILENAMES]
+
+  --instance=INSTANE_NAME : specify simulation to use
+
+=head1 DESCRIPTION
+
+Add solar elongation and galactic latitude to a MOPS instance that
+does not have these columns present.
+
+=cut
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Copy;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::Constants qw(:all);
+
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::Orbit;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::DerivedObject;
+use PS::MOPS::DC::History;
+use PS::MOPS::DC::History::Derivation;
+use PS::MOPS::DC::History::Attribution;
+use PS::MOPS::DC::History::Identification;
+use PS::MOPS::DC::History::Precovery;
+use PS::MOPS::DC::Efficiency;
+use PS::MOPS::JPLEPH;
+
+
+my $instance_name;
+my $inst;
+my $skip_ddl;
+my $help;
+
+GetOptions(
+    'instance=s' => \$instance_name,
+    skip_ddl => \$skip_ddl,
+    help => \$help,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+my $long_deg = $mops_config->{site}->{site_longitude_deg} || 0;
+my $lat_deg = $mops_config->{site}->{site_latitude_deg} || 0;
+
+unless ($skip_ddl) {
+    die "can't locate mopsql" unless `which mopsql`;
+    system(qq{echo "alter table fields add column se_deg real" | mopsql --rw}) == 0 or die "alter table 1 failed";
+    system(qq{echo "alter table fields add column b_deg real" | mopsql --rw}) == 0 or die "alter table 2 failed";
+}
+
+
+# Now put values in these columns.
+my $field_i = modcf_retrieve($inst, all => 1);
+my @fields;
+my $field;
+while ($field = $field_i->next) {
+    push @fields, $field;
+}
+
+
+my $se_deg;
+my $b_deg;
+my $dbh = $inst->dbh;
+my $sth;
+my $t0 = time;
+
+$sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+update fields set se_deg=?, b_deg=? where field_id=?
+SQL
+
+foreach $field (@fields) {
+    $se_deg = mopslib_computeSolarElongation(
+        $field->epoch, 
+        $field->ra,
+        $field->dec,
+        $long_deg,
+        $lat_deg,
+    );
+    $b_deg = mopslib_computeGalacticLatitude(
+        $field->ra,
+        $field->dec,
+    );
+
+    $sth->execute($se_deg, $b_deg, $field->fieldId);
+}
+$sth->finish;
+
+printf STDERR "%d fields updated in %.2f seconds.\n", scalar @fields, (time - $t0);
+exit;

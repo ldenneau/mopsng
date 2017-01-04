@@ -1,0 +1,47 @@
+Attendees:
+Bolin, Chastel, Denneau, Kleyna, Veres
+
+Minutes:
+* Telescope Status (KC)
+No report
+* IPP
+  - IPP Trail fitting (PV)
+Action PV: Send EAM TODO
+  - Photometry (AF)
+No report
+  - Convolution (SC)
+No report
+
+* Data Processing (SC)
+- RJW is admin czar
+- Send an e-mail (1) to mopsadmin when chunks are made ready ; (2) to mopsczar when tracklet starts
+- Reduce the mopsczar mailing-list to BB, PV, LD, RW, SC
+
+* NEO Status (RW/PV)
+- 15 items on the confirmation page
+- ESS was good: 5 high-scorers in 20 minutes
+
+* NEO Czaring (BB)
+- Good so far in the current lunation
+- Action SC: Add a "Czared" button telling the czars if somethign has been already czared
+- Action SC: Add a Quiet NEO submission button
+
+* Comets (JK)
+- Nothing to report
+
+* ATLAS (LD)
+- Concerns with OpenOrb: "broken" since revision 2500
+- ATLAS uses go (google language) to replace Perl/Python.
+
+* AOB
+ - OpenOrb: if we want to run a new version of OO, we need to tell explicitely how the new parameters/features will be used.
+
+  - IASC/outreach (SC)
+RW: score >= 15 czarable in mops
+LD: boresight as close to ecliptic and opposition as possible
+Action SC: Ask Burgett about what he wants to do if no OSS.w => 3pi, wait?
+
+  - Split comet (BB): seems to be a main belt comet. Follow-up soon on cfht. More follow-up expected in late oct and mid dec period.
+
+  - MOPS meetings (SC/RW): Thursdays 11am
+

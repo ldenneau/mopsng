@@ -1,0 +1,8 @@
+#!/bin/sh
+
+FPA_ID=$1
+RA_DEG=$2
+DEC_DEG=$3
+
+URL="http://pstamp.ipp.ifa.hawaii.edu/request.php?project=gpc1&select_by=exposure_id&img_type=chip&id=$FPA_ID&center_type=sky&RA=$RA_DEG&DEC=$DEC_DEG&range_type=Pixels&W=1000&H=1000&cmd_mode=Make%20Stamps"
+wget -O - --keep-session-cookies --user=ps1sc --password=skysurveys "$URL"

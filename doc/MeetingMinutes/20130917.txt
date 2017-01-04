@@ -1,0 +1,36 @@
+Attendees:
+Bolin, Chambers, Chastel (chair/script), Denneau, Veres, Wainscoat
+
+Minutes:
+* Telescope Status (KC)
+Improvement in image quality (software...).
+
+* IPP
+  - IPP Trail fitting (PV)
+Length under-estimated => wrong magnitude; wrong centroid position.
+PV sent report and figures to Magnier and IPP dev team.
+=> PV will send a set of 50-60 references: exposure, ra, dec, length, orientation, flux
+
+  - Photometry (AF)
+No report
+
+  - Convolution (SC)
+No report
+
+* Data Processing (SC)
+  - mops11 dead: leaking capacitors
+  - Draft of a replacement/migration plan for the MOPS cluster needed.
+
+* NEO Status (RW/PV)
+  - Bad weather
+  - Concerns about observing plans for which it is impossible to find NEOs
+  - Unused "stare" and PI and calibration times are used exclusively for 3pi
+
+* NEO Czaring (BB)
+  - Double-comet is still on the confirmation page: apparently not a known one
+  - P5 cfht images
+* ATLAS (RJ/LD/AS)
+  - No report
+* AOB
+  - Moon Room is too noisy. LD suggests to do MOPS meeting in the Atlas lab. We could even move it to 10am (on Tuesdays). Please tell Serge if it is a concern...
+

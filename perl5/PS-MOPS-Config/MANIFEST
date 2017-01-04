@@ -1,0 +1,6 @@
+Changes
+Makefile.PL
+MANIFEST
+README
+t/PS-MOPS-Config.t
+lib/PS/MOPS/Config.pm

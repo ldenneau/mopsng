@@ -1,0 +1,109 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::LSD;
+
+use subs qw(
+);
+
+
+my $inst;
+my $instance_name;
+my $nn;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=f' => \$nn,
+    help => \$help,
+) or pod2usage(2);
+
+#pod2usage(-message => "out_fileroot is not specified") unless $out_fileroot;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+
+my $command = shift;
+pod2usage(-message => "No command specified") unless $command;
+pod2usage(-message => "No night number specified") unless $nn;
+
+if ($command eq 'merge') {
+    # Merge all low-significance detections (LSDs) into the LSD archive for each
+    # night processed.
+    $mops_logger->info("Merging archive files for night $nn.");
+    use PS::MOPS::LSD;
+    use PS::MOPS::DC::Instance;
+    if ($inst->getConfig()->{main}->{enable_lsd}) {
+        PS::MOPS::LSD::MergeNSDFields($inst, $nn);
+        $mops_logger->info("NSDs ingested for night $nn.");
+        PS::MOPS::LSD::MergeSYDFields($inst, $nn);
+        $mops_logger->info("SYDs ingested for night $nn.");
+    }
+    else {
+        $mops_logger->info("LSD processing is disabled; skipping.");
+    }
+}
+elsif ($command eq 'used') {
+    # Merge all low-significance detections (LSDs) into the LSD archive for each
+    # night processed.
+    $mops_logger->info("Writing used detections for night $nn.");
+    use PS::MOPS::LSD;
+    use PS::MOPS::DC::Instance;
+    if ($inst->getConfig()->{main}->{enable_lsd}) {
+        my $used_filename = PS::MOPS::LSD::WriteUsedDetections($inst, $nn);
+        $mops_logger->info("Used detections written for night $nn to file $used_filename.");
+    }
+    else {
+        $mops_logger->info("LSD processing is disabled; skipping.");
+    }
+}
+else {
+    pod2usage(-message => "Unknown command: $command");
+}
+
+
+
+=head1 NAME
+
+lsd - Manage MOPS low-significance (LSD) archives
+
+=head1 SYNOPSIS
+
+lsd [options] command
+
+  --nn NIGHT_NUMBER : which night number to operate on
+  --help : show manpage
+
+=head1 DESCRIPTION
+
+Performs various options on a MOPS simulation's LSD archive.  Legal commands are
+listed below.
+
+=item MERGE
+
+lsd --nn 54178 merge
+
+Merge the field-based archives for the current simulation by combining and sorting the
+appropriate NSD and SYD binary files.  The format of the packed files and their indexes
+can be found in the PS::MOPS::LSD documentation.
+
+=item USED
+
+lsd --nn 54200 used
+
+Write out in a packed format all the detections for the night that
+are attributed to some derived object, including attributed synthetic
+detections and previously upgraded LSDs.  The format of the packed format can be
+found in the PS::MOPS::LSD documentation.
+
+=head1 SEE ALSO
+
+PS::MOPS::LSD documentation.
+
+=cut

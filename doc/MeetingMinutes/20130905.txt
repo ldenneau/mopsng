@@ -1,0 +1,45 @@
+Attending:
+Bolin, Chastel (chair/scribe), Kleyna, Veres
+
+Minutes:
+* Telescope Status (KC)
+n/a
+
+* IPP
+  * IPP Trail fitting (PV)
+No progress
+  * mdrm137 Uebercal (AF)
+No progress
+  * Convolution (SC)
+No progress
+
+* Data Processing (SC)
+  * Should we keep the SYNTH stage? (LD)
+We will drop the SYNTH stage: It's not used and we will shorten the processing time by about 30 minutes.
+
+* NEO Status (PV)
+- 21 new NEO in one week (one of the best weeks so far).
+- 35 for this lunation at new moon
+- We have already more NEOs than last year
+- A few fast-mover candidates are likely lost
+
+* NEO Czaring (BB)
+- bad weather during the last 2 nights but good so far
+- 2 fast movers are being hunted on cfht
+- follow-ups will be difficult in one week (end of dark time) on cfht and on the 88
+- One less e-mail
+- Quiet "Submit NEO" button:
+SC: Will be implemented
+- Ergonomy: Add the "Review" link to the right of the the table.
+SC: OK
+- Once PV's study about IPP extended parameters is complete, add a page for "fast movers" that have not been linked
+
+* Comets (JK)
+- Nothing to report
+
+* ATLAS (RJ/LD/AS)
+- No ATLASter to report.
+
+* AOB
+- BB: Install pyfits, pyslalib, astropy on mops13
+SC: Will do.

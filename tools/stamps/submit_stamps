@@ -1,0 +1,642 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+submit_stamps - Submit requests to Kleyna's postage stamp server
+
+=head1 SYNOPSIS
+
+submit_stamps [options] [OBJECT_NAMES]
+
+  OBJECT_NAMES : list of MOPS object names to submit individually; 
+    can be derived object (L00000000) or tracklet (T123458)
+  --nn NIGHTNUM : submit requests for all tracklets in night
+  --field_status=X : only use tracklets from fields with specified status (usually 'T')
+  --type=warp|diff : type of stamp, default diff
+
+  --czarpairs : all pairs (known or unknown)
+  --known_pairs : pairs with KNOWN_ID set
+  --quads : all quads for specified night
+  --fuzzy : "fuzzy" tracklets (comet candidates)
+  --fuzzy2 : "fuzzy" tracklets (comet candidates) using old scoring
+  --unknownfuzzy : requests stamps for unknown comets
+  --knownfuzzy : requests stamps for known comets
+  --slow : requests stamps for slow movers
+  --survey_mode NAME : only exposures like NAME survey mode
+  --derived : all tracklets in derivations for specified night
+  --field_id FIELD_ID : all detections in field
+  --fpaID FPA_ID : all detections in field
+  --det_file FILENAME : all detections from file
+  --minv MINV_DEGPERDAY : specify min velocity for quads
+
+  --min_prob F : require min probability of F
+  --nuke : ask mops13 to nuke existing stamps (use carefully)
+  --debug : summarize what would be fetched, but don't fetch
+  --cleaned : force submit even if IPP exposures are cleaned (off-disk)
+  --help : show this manpage
+
+  --direct : requests stamps directly from the IPP
+
+=head1 DESCRIPTION
+
+Submit via HTTP requests to Kleyna's postage stamp server on mops13.  This is
+an asynchronous request; the stamps appear at a hardcoded directory location.
+
+=cut
+
+
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Slurp;
+use File::Temp qw/tempfile/;
+use FileHandle;
+use Pod::Usage;
+
+# Just a stub for quick debugging.
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::Stamp;
+use PS::MOPS::IPPDB;
+
+# Start program here.
+my $instance_name;
+my $nn;
+my $field_status;
+my $czarpairs;
+my $known;
+my $known_pairs;
+my $quads;
+my $derived;
+my $all;
+my $limit;
+my $type = $STAMP_DIFF;
+my $nuke;
+my $submit_cleaned;
+my $fuzzy;
+my $fuzzy2;
+my $unknownfuzzy;
+my $knownfuzzy;
+my $slow;
+my $fuzzy_limit = 2500;
+my $survey_mode;
+my $field_id;
+my $fpa_id;
+my $det_file;
+my $log;
+my $debug;
+my $help;
+my $minv_degperday = 0.025;
+my $min_prob = 0.5;
+my $min_fuzzy_prob = 0.4;
+my $direct;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    'field_status=s' => \$field_status,
+    'limit=i' => \$limit,
+    fuzzy => \$fuzzy,
+    fuzzy2 => \$fuzzy2,
+    unknownfuzzy => \$unknownfuzzy,
+    knownfuzzy => \$knownfuzzy,
+    slow => \$slow,
+    'fuzzy_limit=i' => \$fuzzy_limit,
+    'survey_mode=s' => \$survey_mode,
+    czarpairs => \$czarpairs,
+    known => \$known,
+    known_pairs => \$known_pairs,
+    quads => \$quads,
+    'field_id=i' => \$field_id,
+    'fpa_id=s' => \$fpa_id,
+    'det_file=s' => \$det_file,
+    derived => \$derived,
+    'type=s' => \$type,
+    nuke => \$nuke,
+    cleaned => \$submit_cleaned,
+    'min_prob=f' => \$min_prob,
+    'min_fuzzy_prob=f' => \$min_fuzzy_prob,
+    'minv=f' => \$minv_degperday,
+    'log' => \$log,
+    debug => \$debug,
+    help => \$help,
+    direct => \$direct,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+die "Night number not specified" unless ($nn or @ARGV or $field_id or $fpa_id or $det_file);
+
+$type = $STAMP_WARP if ($type eq 'warp');
+$type = $STAMP_CHIP if ($type eq 'chip');
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => undef);
+my $logger = $inst->getLogger();
+my $dbh = $inst->dbh;
+my $sth;
+
+my @diff_tids;
+
+my $limit_str = defined($limit) ? " limit $limit" : '';
+my $field_status_str = $field_status ? "f.status='$field_status' and" : '';
+
+# IPP queries to ask if diffs are on disk.
+my %cleaned;
+my $idbh;
+my $isth;
+
+my $logfh;
+if ($log && $nn) {
+    my $dir = $inst->makeNNDir(NN => $nn, SUBSYS => 'stamp', FORCE_EMPTY => 1);
+    $logfh = new FileHandle ">$dir/stamplog";
+}
+
+if (@ARGV) {
+    my $id;
+    while ($id = shift @ARGV) {
+        if ($id =~ /^L\d+/) {
+            # Add tracklets from tracklet/derived object.
+            $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select doa.tracklet_id tracklet_id 
+from derivedobject_attrib doa
+    join derivedobjects do using(derivedobject_id)
+where object_name=? and do.classification='N'
+SQL
+            $sth->execute($id) or die $sth->errstr;
+            while (my $href = $sth->fetchrow_hashref()) {
+                push @diff_tids, $href->{tracklet_id};
+            }
+            $sth->finish;
+        }
+        elsif ($id =~ /^T(\d+)/) {
+             # Add tracklets from tracklet/derived object.
+            push @diff_tids, $1;
+        }
+        else {
+            die "don't understand $id";
+        }
+    }
+}
+elsif ($det_file) {
+    die "can't read $det_file" unless -r $det_file;
+    my @det_ids = grep /^\d+$/, read_file $det_file;
+    $logger->info(sprintf "STAMP: found %s detections in $det_file.", scalar @det_ids);
+    my @dets;
+    push @dets, modcd_retrieve($inst, detId => $_) foreach @det_ids;
+    my $prefix = $inst->dbname() . '-auto';
+    foreach my $det (@dets) {
+        next if is_cleaned($det->fieldId);
+        submit_detection($prefix, $det, $type, undef, $logfh);
+    }
+    exit;   # bail here!
+}
+elsif ($field_id or $fpa_id) {
+    my @dets;
+
+    if ($fpa_id) {
+        my $field = modcf_retrieve($inst, fpaId => $fpa_id) or die "can't retrieve field $fpa_id";
+        $field_id = $field->fieldId;
+    }
+
+    # Pairs. tracklets from quads.
+    $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select det_id
+from detections
+where field_id=?
+and is_synthetic <> '1'
+SQL
+    $sth->execute($field_id) or die $sth->errstr;
+    while (my $href = $sth->fetchrow_hashref()) {
+        push @dets, modcd_retrieve($inst, detId => $href->{det_id});
+    }
+    $logger->info(sprintf "STAMP: about to submit %d detections.", scalar @dets);
+    my $prefix = $inst->dbname() . '-auto';
+    foreach my $det (@dets) {
+        submit_detection($prefix, $det, $type, undef, $logfh);
+    }
+    exit;   # bail here!
+}
+else {
+    my @dos;
+    my @pairs;
+    my @quads;
+    my @fuzzy;
+    my @fuzzy2;
+
+    # Pairs. tracklets from quads.
+    if ($czarpairs) {
+        my $survey_mode_str = '';
+        if ($survey_mode) {
+            $survey_mode_str = "and survey_mode like '%$survey_mode%'";
+        }
+        $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select t.tracklet_id tracklet_id 
+from tracklet_attrib ta 
+    join tracklets t ignore index(classification) using(tracklet_id) 
+    join fields f using(field_id) 
+where $field_status_str f.nn=? 
+and t.classification='N' 
+/*and t.v_tot >= 0.15*/
+and t.v_tot >= 0.30
+and t.digest >= 0
+and t.probability > ?
+$survey_mode_str
+group by tracklet_id
+having count(*) = 2
+order by t.digest desc, t.v_tot desc
+$limit_str
+SQL
+        $sth->execute($nn, $min_prob) or die $sth->errstr;
+        while (my $href = $sth->fetchrow_hashref()) {
+            push @pairs, $href->{tracklet_id};
+        }
+        $sth->finish;
+    }
+
+    if ($known) {
+        $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select t.tracklet_id tracklet_id 
+from tracklets t 
+    join fields f using(field_id) 
+    join known k using(known_id)
+where $field_status_str f.nn=? and t.classification='N'
+group by tracklet_id
+$limit_str
+SQL
+        $sth->execute($nn) or die $sth->errstr;
+        while (my $href = $sth->fetchrow_hashref()) {
+            push @pairs, $href->{tracklet_id};
+        }
+        $sth->finish;
+    }
+
+    if ($known_pairs) {
+        $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select t.tracklet_id tracklet_id 
+from tracklet_attrib ta
+    join tracklets t using(tracklet_id)
+    join fields f using(field_id) 
+    join known k using(known_id)
+where $field_status_str f.nn=? and t.classification='N'
+group by tracklet_id
+having count(*) = 2
+$limit_str
+SQL
+        $sth->execute($nn) or die $sth->errstr;
+        while (my $href = $sth->fetchrow_hashref()) {
+            push @pairs, $href->{tracklet_id};
+        }
+        $sth->finish;
+    }
+
+    # Quads.
+    # Limit to v_tot > 0.025 deg/day; Slow-movers in MD giving us problems.
+    if ($quads) {
+        my $survey_mode_str = '';
+        if ($survey_mode) {
+            $survey_mode_str = "and survey_mode like '%$survey_mode%'";
+        }
+        $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+/* normal quads */
+select t.tracklet_id tracklet_id, t.digest, t.gcr_arcsec
+from tracklet_attrib ta 
+join tracklets t ignore index(classification) using(tracklet_id) 
+join fields f using(field_id) 
+where $field_status_str f.nn=? 
+and t.classification='N' 
+and t.digest >= 0
+and t.probability > ?
+and t.v_tot > $minv_degperday
+$survey_mode_str
+group by tracklet_id
+having count(*) > 2
+
+union
+
+/* fast pairs */
+select t.tracklet_id tracklet_id, t.digest, t.gcr_arcsec
+from tracklet_attrib ta 
+join tracklets t ignore index(classification) using(tracklet_id) 
+join fields f using(field_id) 
+where $field_status_str f.nn=? 
+and t.classification='N' 
+and t.digest >= 0
+and t.probability > ?
+and t.v_tot > 1.2
+$survey_mode_str
+group by tracklet_id
+having count(*) = 2
+
+order by digest desc, gcr_arcsec 
+$limit_str
+SQL
+
+        $sth->execute($nn, $min_prob, $nn, $min_prob) or die $sth->errstr;
+        while (my $href = $sth->fetchrow_hashref()) {
+            push @quads, $href->{tracklet_id};
+        }
+        $sth->finish;
+    }
+
+    # Add tracklets from derived objects.
+    if ($derived) {
+        $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select hd.tracklet_id tracklet_id 
+from history h
+    join history_derivations hd using(event_id)
+    join fields f using(field_id) 
+where $field_status_str f.nn=? and h.classification='N'
+SQL
+        $sth->execute($nn) or die $sth->errstr;
+        while (my $href = $sth->fetchrow_hashref()) {
+            push @dos, $href->{tracklet_id};
+        }
+        $sth->finish;
+    }
+
+    if ($fuzzy) {
+#        $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+        my $fsql = <<"SQL";
+select 
+    t.tracklet_id tracklet_id,
+    sum(1) ndet,
+    group_concat(concat(det_id,'=',round(sqrt(moments_xx*moments_yy/(psf_major*psf_minor)),2))) ffuzzmap,
+    sum(if(dr.psf_quality*dr.ratio_bad*dr.f_pos > 0.5,1,0)) nfuzz,
+    sum(if(
+        (0 < moments_xx / moments_yy and moments_xx / moments_yy < 3)
+        and (-30 < ext_sig and ext_sig < 60)
+        and t.probability > .5
+        and 5 < sky_sigma and sky_sigma < 30
+        and 25 < ap_flux_sig and ap_flux_sig < 200
+        and ap_flux / psf_inst_flux < 2.5
+        and (dr.psf_chi2 / dr.psf_dof < 7 or dr.ratio_bad > .97)
+        and sqrt(moments_xx*moments_yy/(psf_major*psf_minor)) < 4
+        /* majorminorratio */
+        and sqrt(0.5*(moments_xx + moments_yy + sqrt(pow(moments_xx-moments_yy,2) + 4*pow(moments_xy,2)))) /
+            sqrt(0.5*(moments_xx + moments_yy - sqrt(pow(moments_xx-moments_yy,2) + 4*pow(moments_xy,2)))) < 1.5
+
+    ,1,0)) ngood,
+
+    /* max of comet fuzz moment ratios */
+    max(if(dr.psf_quality*dr.ratio_bad*dr.f_pos > 0.5 and sqrt(moments_xx*moments_yy/(psf_major*psf_minor))<4,sqrt(moments_xx*moments_yy/(psf_major*psf_minor)),NULL)) as ffuzz,
+
+
+    f.se_deg sol_elong,
+    f.eb_deg ecl_lat,
+    f.survey_mode
+from  fields f
+    join tracklets t ignore index(classification,known_id) using(field_id)
+    join tracklet_attrib ta using(tracklet_id)
+    join detections d using(det_id)
+    join det_rawattr_v2 dr using(det_id)
+where f.nn = $nn 
+and t.classification='N' /* and t.known_id is null */
+and t.probability > $min_fuzzy_prob
+group by tracklet_id
+having ffuzz > 1.5
+and ndet >= 2
+and nfuzz > ndet / 2
+and ngood > ndet / 2
+order by ffuzz desc
+limit $fuzzy_limit
+SQL
+
+        $sth = $dbh->prepare($fsql) or die $dbh->errstr;
+        $sth->execute() or die $sth->errstr;
+        while (my $href = $sth->fetchrow_hashref()) {
+            push @fuzzy, $href->{tracklet_id};
+        }
+        $sth->finish;
+    }
+
+    if ($unknownfuzzy) {
+        my $fsql = <<"SQL";
+select SQL_CALC_FOUND_ROWS
+    t.tracklet_id tracklet_id,
+    t.gcr_arcsec gcr_arcsec,
+    t.probability probability,
+    t.digest digest,
+    sum(1) ndet, 
+    group_concat(concat(det_id,'=',round(sqrt(moments_xx*moments_yy/(psf_major*psf_minor)),2))) ffuzzmap,
+    sum(if(dr.psf_quality*dr.ratio_bad*dr.f_pos > 0.5,1,0)) nfuzz,
+    max(if(dr.psf_quality*dr.ratio_bad*dr.f_pos > 0.5 and sqrt(moments_xx*moments_yy/(psf_major*psf_minor))<5,sqrt(moments_xx*moments_yy/(psf_major*psf_minor)),NULL)) as ffuzz,
+    f.se_deg sol_elong,      
+    f.eb_deg ecl_lat,      
+    f.survey_mode 
+from  fields f 
+   join tracklets t ignore index(classification,known_id) using(field_id)      
+   join tracklet_attrib ta using(tracklet_id)  
+   join detections d using(det_id) 
+   join det_rawattr_v2 dr using(det_id)  
+where f.nn = $nn and t.classification='N' and t.known_id is null
+   and t.v_tot > 0
+   and t.probability > $min_fuzzy_prob
+   and survey_mode not like '%MD%'
+ group by tracklet_id 
+   having ffuzz > 1.5
+   and ndet >= 2
+   and nfuzz > ndet / 2
+order by ffuzz desc
+limit $fuzzy_limit
+SQL
+        $sth = $dbh->prepare($fsql) or die $dbh->errstr;
+        $sth->execute() or die $sth->errstr;
+        while (my $href = $sth->fetchrow_hashref()) {
+            push @fuzzy, $href->{tracklet_id};
+        }
+        $sth->finish;
+    }
+
+    if ($knownfuzzy) {
+        my $fsql = <<"SQL";
+select SQL_CALC_FOUND_ROWS
+    t.tracklet_id tracklet_id,
+    t.gcr_arcsec gcr_arcsec,
+    t.probability probability,
+    t.digest digest,
+    sum(1) ndet, 
+    group_concat(concat(det_id,'=',round(sqrt(moments_xx*moments_yy/(psf_major*psf_minor)),2))) ffuzzmap,
+    sum(if(dr.psf_quality*dr.ratio_bad*dr.f_pos > 0.5,1,0)) nfuzz,
+    max(if(dr.psf_quality*dr.ratio_bad*dr.f_pos > 0.5 and sqrt(moments_xx*moments_yy/(psf_major*psf_minor))<5,sqrt(moments_xx*moments_yy/(psf_major*psf_minor)),NULL)) as ffuzz,
+    f.se_deg sol_elong,      
+    f.eb_deg ecl_lat,      
+    f.survey_mode 
+from  fields f 
+   join tracklets t ignore index(classification,known_id) using(field_id)      
+   join tracklet_attrib ta using(tracklet_id)  
+   join detections d using(det_id) 
+   join det_rawattr_v2 dr using(det_id)  
+where f.nn = $nn and t.classification='N' and t.known_id is NOT null
+   and t.v_tot > 0
+   and t.probability > $min_fuzzy_prob
+   and survey_mode not like '%MD%'
+ group by tracklet_id 
+   having ffuzz > 1.5
+   and ndet >= 2
+   and nfuzz > ndet / 2
+order by ffuzz desc
+limit $fuzzy_limit
+SQL
+        $sth = $dbh->prepare($fsql) or die $dbh->errstr;
+        $sth->execute() or die $sth->errstr;
+        while (my $href = $sth->fetchrow_hashref()) {
+            push @fuzzy, $href->{tracklet_id};
+        }
+        $sth->finish;
+    }
+
+    if ($slow) {
+	$sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+SELECT
+  t.tracklet_id tracklet_id,
+  group_concat(d.det_id order by d.epoch_mjd) det_ids,
+  t.digest digest,
+  t.v_tot v_tot,
+  t.ext_mag ext_mag,
+  t.pos_ang_deg pos_ang_deg,
+  t.gcr_arcsec gcr_arcsec,
+  t.probability probability,
+  k.q q,
+  k.known_name known_name,
+  f.se_deg sol_elong,
+  f.eb_deg ecl_lat,
+  f.survey_mode,
+  f.fpa_id
+from fields f
+  join tracklets t ignore index(classification) using(field_id)
+  join tracklet_attrib ta using(tracklet_id)
+  join detections d using(det_id)
+  left join known k using(known_id)
+where f.nn = $nn and t.classification='N' and (not f.survey_mode like 'MD%')
+and t.digest >= 0 and v_tot > 0.0 and v_tot < 0.1
+and t.probability > 0.5
+and t.gcr_arcsec < 0.4
+group by t.tracklet_id
+having count(*) >= 3
+order by digest desc, t.gcr_arcsec
+SQL
+        $sth->execute() or die $sth->errstr;
+        while (my $href = $sth->fetchrow_hashref()) {
+            push @quads, $href->{tracklet_id};
+        }
+        $sth->finish;
+    }
+
+    if ($fuzzy2) {
+        $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select 
+    t.tracklet_id tracklet_id,
+    sum(1) ndet,
+    sum(if((dr.psf_qf_perfect*dr.ratio_all*dr.f_pos > 0.5 or t.probability > .8) and dr.moments_r1*dr.moments_r1/(dr.psf_major*dr.psf_minor) < 10,1,0)) nfuzz,
+    avg(dr.moments_r1*dr.moments_r1/(dr.psf_major*dr.psf_minor)) as ffuzz
+from  fields f
+    join tracklets t using(field_id)
+    join tracklet_attrib ta using(tracklet_id)
+    join detections d using(det_id)
+    join det_rawattr_v2 dr using(det_id)
+where $field_status_str f.nn = ? 
+and t.classification='N'
+and t.probability > ?
+group by tracklet_id
+having ndet >= 2 and ffuzz < 10
+and nfuzz > ndet / 2
+order by ffuzz desc
+limit $fuzzy_limit
+SQL
+        $sth->execute($nn, $min_fuzzy_prob) or die $sth->errstr;
+        while (my $href = $sth->fetchrow_hashref()) {
+            push @fuzzy, $href->{tracklet_id};
+        }
+        $sth->finish;
+    }
+
+    @diff_tids = (@quads, @fuzzy, @pairs, @dos);
+    if (@diff_tids) {
+        $logger->info(sprintf "STAMP: requesting %d $type tracklets (%d pairs, %d quads+fast, %d derived, %d fuzzy) for night $nn.", scalar @diff_tids, scalar @pairs, scalar @quads, scalar @dos, scalar @fuzzy);
+    }
+}
+
+exit if $debug;
+
+my %seen;   # don't double-submit stuff
+my $href;
+my $prefix = $inst->dbname() . '-auto';
+$instance_name = $inst->dbname();
+
+if ($direct) {
+    $logger->info("direct is set");
+}
+
+# Request diff stamps.
+my $stampsFH;
+my $stampsFN;
+my $stampsPath = "/data/nmops01.0/stamps/$instance_name-auto";
+
+if ($direct) {
+    system("mkdir -p $stampsPath /tmp/dstamp");
+    system("chmod -f 775 $stampsPath");
+    ($stampsFH, $stampsFN) = tempfile( DIR => "/tmp/dstamp");
+    $logger->info("Generating $stampsFN");
+    print $stampsFH "PACKAGING_FORMAT = BY_DETECTION\n";
+    print $stampsFH "MOPS_RSYNC_PREFIX = mops\@nmops01:/export/nmops01.0/stamps/$instance_name-auto\n";
+
+}
+
+foreach my $tid (@diff_tids) {
+    #$logger->info("$tid");
+    unless ($seen{$tid}++) {
+	#$logger->info("  $tid not seen");
+        my $trk = modct_retrieve($inst, trackletId => $tid) or die ("can't fetch tracklet ID " . $tid);
+        next if is_cleaned($trk->fieldId);
+	if ($direct) {
+	    #$logger->info("direct is set");
+	    # Alternative to Jan+Bill servers is here
+        my $stamp = new_submit_tracklet($prefix, $trk, $type, defined $nuke, $stampsPath, $logger);
+        if ($stamp ne "") {
+            #print "Adding $stamp";
+    	    print $stampsFH $stamp;
+        }
+	} else {
+	    #$logger->info("direct is not set");
+	    submit_tracklet($prefix, $trk, $type, $nuke, $logfh);
+	}
+    }
+}
+
+if ($direct) {
+    print $stampsFH "END\n";
+    close $stampsFH;
+    # Now submit it...
+    $logger->info("Stamps file [$stampsFN] is ready for submission");
+    my $command = "/usr/bin/scp -P 9032 $stampsFN mops\@ipp5u:/export/ipp032.0/mops/dstamp/todo";
+    $logger->info("Command to generate stamps: [ $command ]");
+    system($command)==0 or die "Could not run [$command]";
+    $command = "/bin/rm -f $stampsFN";
+    system($command)==0 or die "Could not run [$command]";
+}
+
+exit(0);
+
+
+sub is_cleaned {
+    # Returns true if the field is on disk at IPP.
+    return 0 if $submit_cleaned;
+    return 0 if $type ne 'diff';
+
+    if (!$idbh) {
+        $idbh = PS::MOPS::IPPDB::dbh();
+        $isth = $idbh->prepare(<<"SQL") or die $idbh->errstr;
+select state from diffRun where diff_id=?
+SQL
+    }
+
+    my ($field_id) = @_;
+    if (!exists($cleaned{$field_id})) {
+        my $field = modcf_retrieve($inst, fieldId => $field_id);
+        $isth->execute($field->diffId) or die $isth->errstr;
+        my ($status) = $isth->fetchrow_array;
+        $cleaned{$field_id} = ($status =~ /cleaned/) ? 1 : 0;
+        $logger->info(sprintf "STAMP: field %s (diff %d) has been cleaned", $field->fpaId, $field->diffId) if $cleaned{$field_id};
+    }
+
+    return $cleaned{$field_id};
+}

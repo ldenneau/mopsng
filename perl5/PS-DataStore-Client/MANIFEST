@@ -1,0 +1,6 @@
+Changes
+Makefile.PL
+MANIFEST
+README
+t/PS-DataStore-Client.t
+lib/PS/DataStore/Client.pm

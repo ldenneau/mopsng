@@ -1,0 +1,469 @@
+#!/usr/bin/env perl
+
+=pod
+
+=head1 NAME
+
+syntheph - Master scatter/gather script for synthetic detection creation
+
+=head1 SYNOPSIS
+
+syntheph [options] NN INPUT_FP FIELDS
+
+  NN : night number
+  INPUT_FP : coarseEphem+fieldProximity output
+  FIELDS : list of field IDs and centers
+  --instance : finish all linking, not just first night
+  --run : id of the run that syntheph is a part of. This parameter is used by  
+          the mopper script and should not be specified when manually running 
+          syntheph.  
+  --help : show man page
+
+=head1 DESCRIPTION
+
+syntheph distributes ephemerides generation for synthetic detections
+across a MOPS cluster using Condor.  Each worker job writes its output to
+a synth.out.* that contains complete detection definitions.  syntheph
+collects all output and inserts the detections transactionally for
+each field.  After a field's detections are inserted, the field's status
+is changed to 'D', then the synthetic detections are archived to the
+LSD archive.
+
+The INPUT_FP file should consist of field ID-object name pairs indicating
+which synthetic objects appear near various fields.  The worker module,
+synthpp, computes precise positions for these objects at the field times
+and inserts those that actually lie within their near-fields.
+
+=head1 EXIT VALUE
+
+syntheph exits with the following values:
+
+  0 - successful completion
+  nonzero - internal failure
+
+=cut
+
+use strict;
+use warnings;
+
+use Cwd;
+use FileHandle;
+use Getopt::Long;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+
+
+# Forward sub declarations.
+use subs qw(
+    split_fp_data
+    create_condor_job
+    process_output_files
+    setup
+    cleanup
+);
+
+
+my %xyidx_mask = ();    # hacky mask on XY det index to simulate fill factor
+
+
+my $inst;
+my $instance_name;
+my $finish;
+my $run_id;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'run=i' => \$run_id,
+    finish => \$finish,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+my $nn = shift or pod2usage(-msg => 'NN must be specified');
+my $fp_fn = shift or pod2usage(-msg => 'INPUT_FP must be specified');
+my $fields_fn = shift or pod2usage(-msg => 'FIELDS must be specified');
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+$mops_logger->info("SYNTHEPH starting");
+$0 = sprintf "SYNTHEPH MASTER %s", $inst->dbname;      # update ps info
+my $t0 = time;
+
+
+# Allow special detections-only processing via synth->{end_status}.  If this is
+# $FIELD_STATUS_LINKDONE, then we skip all additional MOPS processing.
+my $END_STATUS = $mops_config->{synth}->{end_status} || $FIELD_STATUS_SYNTH;
+
+
+my $xyidx_file;
+if ($xyidx_file = $mops_config->{site}->{xyidx_mask_filename}) {
+    # Found an entry for XY index mask.  Read it in, and set the hash's
+    # index positions to 1.
+    my $fh = new FileHandle $xyidx_file or $mops_logger->logdie("can't read $xyidx_file");
+    my $line;
+    foreach $line (<$fh>) {
+        chomp $line;
+        $xyidx_mask{$line} = 1;
+    }
+    $fh->close();
+
+    my $num_masked_items = scalar keys %xyidx_mask; 
+    $mops_logger->info(
+        sprintf "Found XY index mask with %d entries (%.2f masked).", 
+            $num_masked_items, 100 * $num_masked_items / 
+                ($mops_config->{site}->{field_xyidx_size} * $mops_config->{site}->{field_xyidx_size})
+    );
+}
+
+
+eval {
+    my $fields_href = read_fields($fields_fn);
+    my $field_fp_table = split_fp_data($fp_fn, $fields_href);
+
+    if (scalar keys %{$field_fp_table}) {
+        # Skip the following line if the .fp files exists and we want to skip
+        # the cluster work but test DB insert.
+        execute_condor_job($field_fp_table);                        # compute detections on cluster
+
+        # If detectability queries are enabled, simulate an IPP round-trip detectability query.
+        my $enable_detectability = $mops_config->{main}->{enable_detectability};
+        if ($enable_detectability) {
+            do_detectability($nn, $field_fp_table);
+        }
+
+        # Now process the output files.
+        process_output_files(
+            $field_fp_table, 
+            $fields_href, 
+            $enable_detectability,
+        );
+    }
+    else {
+        # No fields to process, so just mark stuff as completed.
+        $mops_logger->info("Zero fields to process.");
+    }
+
+    # Set the status any unseen fields.  This can happen if a field
+    # does not have any candidates via fieldProximity; thus the field 
+    # is not "seen" in the process_output_files() routine.
+    my $field;
+    foreach $field (values %{$fields_href}) {
+        $field->status($END_STATUS, $run_id) unless $field->status eq $END_STATUS;
+    }
+    unless ($inst->dbh()->{AutoCommit}) {
+        $inst->dbh()->commit;                       # commit status changes
+    }
+    cleanup();                                      # delete files
+};
+
+$mops_logger->logdie($@) if $@;
+$mops_logger->info(
+    mopslib_formatTimingMsg(
+        subsystem => 'SYNTH',
+        subsubsystem => 'SYNTHEPH',
+        time_sec => (time - $t0),
+        nn => 0,
+    )
+);
+exit;
+
+
+sub read_fields {
+    # Return a list of fields from the NN.fields file.
+    my ($fields_fn) = @_;
+    my $fields_href = {};
+    my $fields_fh = new FileHandle($fields_fn) or die "can't open $fields_fn";
+    my $line;
+    my @stuff;
+    my $field;
+    while ($line = <$fields_fh>) {
+        @stuff = split /\s+/, $line;
+        $field = modcf_retrieve($inst, fieldId => $stuff[0]) || die "can't retrieve field ID $stuff[0]";
+        $fields_href->{$stuff[0]} = $field;
+    }
+
+    return $fields_href;
+}
+
+
+sub split_fp_data {
+    # Parse the output from fieldProximity (fileName) and create a dictionary
+    # of the form {fieldID: [objectName, ....]}.
+    # 
+    # FileName has the following structure: fieldID objectName fieldFileLineNo
+    # orbitFileLineNo
+    my ($fp_fn, $fields_href) = @_;
+    my $fp_fh = new FileHandle($fp_fn) or die "can't open $fp_fn";
+
+    my $num_dets = 0;
+    my $fp_table = {};
+
+    my $fieldId;
+    my $objectName;
+    my $line;
+
+    while ($line = <$fp_fh>) {
+        ($fieldId, $objectName) = split /\s+/, $line;
+        push @{$fp_table->{$fieldId}}, $objectName;
+        $num_dets++;
+    }
+    $fp_fh->close();
+
+    $mops_logger->info(sprintf "Found %d detections in %d fields.", $num_dets, scalar keys %{$fp_table});
+
+    # Split files by field.
+    my $file_num = 0;
+    my $field_table = {};
+    foreach $fieldId (sort keys %{$fp_table}) {
+        my $field = $fields_href->{$fieldId} || die "unknown field ID $fieldId";
+       
+        # Put the field in our table to process, and assign the field a Condor input filename.
+        $field_table->{$fieldId} = $file_num;
+        my $synth_filename = "synth.fp.$file_num";
+        my $fh = new FileHandle ">$synth_filename";
+        foreach $objectName (@{$fp_table->{$fieldId}}) {
+            $fh->print("$fieldId $objectName\n");
+        }
+
+        $file_num++;
+    }
+
+    $mops_logger->info(sprintf "Wrote %d files.", scalar keys %{$field_table});
+    return $field_table;
+}
+
+
+sub execute_condor_job {
+    my ($field_table) = @_;
+    my $label = 'synth';
+    my $num_jobs = scalar keys %{$field_table};     # should validate contents here
+
+    # Extract the environment the remote jobs run in.
+    my $remote_mops_home = $mops_config->{cluster}->{MOPS_HOME} || $ENV{'MOPS_HOME'};
+    my $remote_path = $mops_config->{cluster}->{PATH} || $ENV{'PATH'};
+    my $remote_perl5lib = $mops_config->{cluster}->{PERL5LIB} || "$remote_mops_home/lib/perl";
+    my $remote_pythonpath = $mops_config->{cluster}->{PYTHONPATH} || "$remote_mops_home/lib/python";
+    my $remote_ld_library_path = $mops_config->{cluster}->{LD_LIBRARY_PATH} || "$remote_mops_home/lib";
+    my $remote_caet_data = $mops_config->{cluster}->{CAET_DATA} || $ENV{'CAET_DATA'};
+    my $remote_oorb_data = $mops_config->{cluster}->{OORB_DATA} || $ENV{'OORB_DATA'};
+    my $remote_orbfit_data = $mops_config->{cluster}->{ORBFIT_DATA} || $ENV{'ORBFIT_DATA'};
+    my $environment = "MOPS_HOME=$remote_mops_home CAET_DATA=$remote_caet_data OORB_DATA=$remote_oorb_data ORBFIT_DATA=$remote_orbfit_data PATH=$remote_path PERL5LIB=$remote_perl5lib PYTHON_PATH=$remote_pythonpath LD_LIBRARY_PATH=$remote_ld_library_path";
+    my $dbname = $inst->dbname();
+
+    my $job_str = <<"JOB";
+universe = vanilla
+executable = $ENV{'MOPS_HOME'}/bin/syntheph_worker
+arguments = --outfile synth.out.\$(Process) synth.fp.\$(Process)
+environment = "$environment MOPS_DBINSTANCE=$dbname"
+# Dummy memory line to prevent vacate due to large process size
+#requirements = Memory > 1024
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+transfer_input_files = synth.fp.\$(Process)
+log = $label.condorlog
+error = $label.stderr.\$(Process)
+output = $label.stdout.\$(Process)
+input = /dev/null
+notification = Error
+queue $num_jobs
+JOB
+
+    my $job_fh = new FileHandle ">$label.cmd";
+    $job_fh->print($job_str);
+    $job_fh->close;
+
+    # Read stuff created by condor when creating the job so we can 
+    # guess job ID.
+    open CONDUH, "condor_submit $label.cmd|" or $mops_logger->logdie("$label: condor_submit failed");
+    my @submit_stuff = <CONDUH>;
+    close CONDUH;
+
+    # Suss out the Condor job ID.
+    my $job_id = '';
+    if ($submit_stuff[-1] =~ /submitted to cluster (\d+)/) {
+        $job_id = $1;
+    }
+    
+    # Sleep for a fraction of a second to give condor_submit the time to 
+    # create the log file. Is this necessary?
+    sleep(0.5);
+
+    #$mops_logger->info("SYNTHEPH: monitoring $label.condorlog (job ID $job_id)");
+    system("condor_wait $label.condorlog $job_id") == 0 or $mops_logger->logdie("$label: condor_wait failed");
+}
+
+
+sub process_output_files {
+    my ($field_table, $fields_href, $enable_detectability) = @_;           # fieldId => file_num mapping
+    my $fieldId;
+    my $filename;
+
+    my $inp_file_root;
+    if ($enable_detectability) {
+        $inp_file_root = 'synth.visible';
+    }
+    else {
+        $inp_file_root = 'synth.out';
+    }
+
+    $inst->pushAutocommit(0);                       # disable autocommit for transactions
+    my $dbh = $inst->dbh();
+    eval {
+        foreach $fieldId (sort keys %{$field_table}) {
+            my $field = $fields_href->{$fieldId} || die "unknown field ID $fieldId";
+            $filename = "$inp_file_root.$field_table->{$fieldId}";
+            die "$filename doesn't exist" unless -e $filename;
+
+            # If our debug switch to hide SYDs is on, run a program to hide them.
+            my $cfg = $mops_config->{debug}->{hide_syds} || '';
+            if ($cfg =~ /^(\d+)/) {
+                $cfg = ($field->ocnum == $1);       # enable hideSYD only if matching OCNUM
+            }
+
+            if ($cfg) {
+                system(
+                    'hideSYDs',
+                    '--fileroot', $inp_file_root,
+                    '--nn', $nn,
+                ) == 0 or die "hideSYDs failed";
+            }
+
+            my $fh = new FileHandle $filename;
+
+            my @detections;
+            my $line;
+            my %det_args;
+            my $dummy;
+            my $dummy_id;
+            my $det;
+            my $xyidx;
+
+            while ($line = <$fh>) {
+                next if $line =~ /^(#|!)/;  # looks like comment, skip
+
+                ($dummy, $dummy_id, @det_args{qw(
+                    ra
+                    dec
+                    epoch
+                    mag
+                    refMag
+                    filter
+                    isSynthetic
+                    detNum
+                    status
+                    s2n
+                    raSigma
+                    decSigma
+                    magSigma
+                    orient_deg
+                    length_deg
+                    objectName
+                    fieldId
+                    obscode
+                )}) = split /\s+/, $line;
+
+                $det = PS::MOPS::DC::Detection->new($inst, %det_args);
+                if (%xyidx_mask) {
+                    $xyidx = mopslib_computeXYIdx($field, $det);
+                    $det->{status} = $DETECTION_STATUS_UNFOUND if $xyidx_mask{$xyidx};        # XY index is masked, skip det
+                }
+                $det->xyidx($xyidx);                        # save it since we got it
+                push @detections, $det;
+            }
+
+            $field->addDetections(@detections);
+            $field->status($END_STATUS, $run_id);
+            $dbh->commit();
+
+            # Archive the newly created synthetic detections to the LSD archive.
+            # We don't really want to do this outside the transaction ($inst->atomic),
+            # but we risk leaving the transaction open if there is a network condition
+            # preventing the LSD files from being written.
+            if ($mops_config->{main}->{enable_lsd}) {
+                use PS::MOPS::LSD;
+                PS::MOPS::LSD::ArchiveSYDField($field, \@detections);
+            }
+        }
+    };  # eval
+    if ($@) {
+        $dbh->rollback();
+        die $@;
+    }
+}
+
+
+sub setup {
+    # If we want a dedicated directory for synth files, create it here.
+}
+
+
+sub cleanup {
+    # Conserve a little disk space by removing all the intermediate
+    # .fp files and the stdout/stderrs from the Condor job.
+}
+
+
+sub do_detectability {
+    my ($nn, $fp_table) = @_;
+    my @cmd;
+    # $fp_table is a hashref whose keys are the Condor job input files.
+
+    # Just execute some commands in a row.
+    # create_detectability_fileset --register NN FILES...
+    # fakedq DBNAME.NN
+    # process_detectability_fileset NN FILES...
+    # register_fileset --del ...
+    my @files = map { "synth.out.$_" } values %{$fp_table};
+    my $fileset = $inst->dbname() . ".$nn";
+
+    @cmd = (
+        'create_detectability_fileset',
+        '--register',
+        $nn,
+        @files,
+    );
+    system(@cmd) == 0 or $mops_logger->logdie("@cmd failed");
+
+    # The following command is a substitute for IPP processing.
+    @cmd = (
+        'fakedq',
+        $fileset,
+    );
+    system(@cmd) == 0 or $mops_logger->logdie("@cmd failed");
+
+    # Now read the result.
+    @cmd = (
+        'process_detectability_fileset',
+        $nn,
+        @files,
+    );
+    system(@cmd) == 0 or $mops_logger->logdie("@cmd failed");
+
+    # Finally, de-register the original query fileset.
+    @cmd = (
+        'register_fileset',
+        '--del',
+        '--product=mops-detectability-requests',
+        '--type=mops_detectability_query',
+        "--fileset=$fileset",
+    );
+    system(@cmd) == 0 or $mops_logger->logdie("@cmd failed");
+
+    # And finafinally, de-register the response fileset.  Normally this will be IPP's 
+    # responsibility, but we're simulating them at the moment.
+    @cmd = (
+        'register_fileset',
+        '--del',
+        '--product=mops-detectability-responses',
+        '--type=mops_detectability_response',
+        "--fileset=$fileset",
+    );
+    system(@cmd) == 0 or $mops_logger->logdie("@cmd failed");
+
+    $mops_logger->info("Processed detectability query for night $nn");
+}

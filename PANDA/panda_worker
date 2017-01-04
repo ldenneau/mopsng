@@ -1,0 +1,1414 @@
+#!/usr/bin/env python
+
+from __future__ import division
+
+import cPickle as pickle
+import logging
+import math
+import os
+import shutil
+import tempfile
+import time
+import operator
+
+import numpy
+
+import MOPS.Constants
+import MOPS.Lib
+
+from MOPS.Field import Field
+from MOPS.Orbit import Orbit
+from MOPS.Detection import Detection
+from MOPS.DerivedObject import DerivedObject
+from MOPS.Exceptions import *
+
+import MOPS.TupleTree
+import MOPS.LSD.Search
+
+import ssd
+import auton
+
+
+DAYS_PER_SECOND = 1.0 / 86400
+SQRT2_DIV_2 = math.sqrt(2) / 2
+
+
+class timer(object):
+    """
+    Just a little utility class to do timings within a module.
+    """
+    def __init__(self, logger):
+        # Set up.
+        self.t0 = time.time()
+        self.logger = logger
+
+    def mark(self, subsys, subsubsys=None):
+        # Print at message with delta_t from the previous mark; save mark.
+        t1 = time.time()
+        self.logger.info(MOPS.Lib.formatTimingMsg(
+            subsystem=subsys, 
+            nn=0, 
+            subsubsystem=subsubsys,
+            time_sec=(t1 - self.t0)
+        ))
+        self.t0 = t1
+
+
+class Position(object):
+    """
+    Utility class encapsulating an ephemeris for an object, so that we
+    can descriptive names instead of pos[0], pos[1], etc.
+    """
+    def __init__(self, ra_deg, dec_deg, mag, epoch_mjd, ra_sigma_arcsec, dec_sigma_arcsec, unc_smaa_arcsec, unc_smia_arcsec, unc_pa_deg, id=None):
+        self.ra_deg = ra_deg                            # RA of prediction
+        self.dec_deg = dec_deg                          # Dec of prediction
+        self.mag = mag                                  # V-mag
+        self.epoch_mjd = epoch_mjd                      # epoch
+        self.ra_sigma_arcsec = ra_sigma_arcsec          # RA error
+        self.dec_sigma_arcsec = dec_sigma_arcsec        # Dec error
+        self.unc_smaa_arcsec = unc_smaa_arcsec          # uncertainty semi-major axis
+        self.unc_smia_arcsec = unc_smia_arcsec          # uncertainty semi-minor axis
+        self.unc_pa_deg = unc_pa_deg                    # uncertainty semi-major position angle
+        self.id = id                                    # obj id or name
+
+
+def _unpickle(fileName):
+    f = file(fileName, 'rb')
+    data = pickle.load(f)
+    f.close()
+    return data
+
+
+def _fitinminmax(fmin, fmax, f):
+    """
+    Little util routine:
+    if f < fmin, set f=fmin
+    if f > fmax, set f=fmax
+    """
+    if f < fmin:
+        f = fmin
+    elif f > fmax:
+        f = fmax
+    return f
+
+
+def _predictPosition(obj, mjds, obscode):
+    """
+    Thin wrapper around ssd.ephemerides.
+    ssd.ephemerides() returns [RA, Dec, mag, mjd, RAErr, DecErr, SemiMajAxis, SemiMinAxis, PA]
+
+    What to do when we have no SRC?  Use max uncertainty radius?
+    """
+
+    # Extract the orbital params.
+    orbitalParams = numpy.array([obj.orbit.q,
+                                 obj.orbit.e,
+                                 obj.orbit.i,
+                                 obj.orbit.node,
+                                 obj.orbit.argPeri,
+                                 obj.orbit.timePeri])
+    epoch = obj.orbit.epoch
+    absMag = obj.orbit.h_v
+
+    # See if we have a square root covariance matrix so that we can compute
+    # uncertainties.
+    if obj.orbit.src:
+        src = numpy.array(obj.orbit.src)
+    else:
+        src = None
+    # <- if
+
+    # positions = [[RA, Dec, mag, mjd, uncertainties], ]
+    positions = [
+        Position(id=obj.objectName, *eph)
+        for eph in 
+            ssd.ephemerides(
+                orbitalParams,
+                epoch,
+                numpy.array(mjds),
+                obscode,
+                absMag,
+                covariance=src
+            )
+    ]
+    return positions
+
+
+def _makeFieldIdLookup(fields_list, position_list):
+    """
+    Given a list of tuples that were used to generate predictions, and
+    the predictions (Position objects) themselves, create a table where
+    the keys are field IDs from the tuples and the values are the positions.
+    We rely on unique MJDs for the fields to map predictions to fields.
+    """
+
+    mjd_table = dict([(pos.epoch_mjd, pos) for pos in position_list])
+    field_id_lookup = dict([(f._id, mjd_table[f.mjd]) for f in fields_list])
+    return field_id_lookup
+
+
+def _getTupleTree(dbh, nn, options):
+    """
+    Given a night number, fetch all the fields observed during that night.  If we are 
+    in attrib mode, we only want to look at fields that were just processed 
+    (FIELD_STATUS_TRACKLET or FIELD_STATUS_POSTTRACKLET).
+    """
+
+    if options.mode == 'attrib':
+        field_status_str = "and f.status in ('%s', '%s')" % (MOPS.Constants.FIELD_STATUS_TRACKLET, MOPS.Constants.FIELD_STATUS_POSTTRACKLET)
+    else:
+        field_status_str = ''
+
+    cursor = dbh.cursor() 
+    sql = '''
+select distinct(f.field_id), f.epoch_mjd, f.ra_deg, 
+      f.dec_deg, f.survey_mode, f.time_start, f.time_stop, 
+      f.filter_id, f.limiting_mag, 
+      f.ra_sigma, f.dec_sigma, f.obscode, 
+      f.de1, f.de2, f.de3, f.de4, f.de5, f.de6, f.de7, f.de8, 
+      f.de9, f.de10, f.ocnum, f.status, 
+      f.parent_id, f.xyidx_size, f.fov_deg
+from `fields` f
+where f.nn=%s
+''' + field_status_str
+
+    n = cursor.execute(sql, (nn,))
+    if not n:
+        return []       # no fields
+    # <-- end if
+
+    fields = []
+    all_rows = cursor.fetchall()
+    for row in all_rows:
+        row = list(row)
+        field = Field(*(row[:12] + [row[12:22]] + row[22:]))
+        fields.append(field)
+
+    # Build the tuple tree from the list of fields.
+    tuple_tree = MOPS.TupleTree.TupleTree(fields)
+    return tuple_tree
+
+
+def _find_zonal_tracklets(dbh, field, field_shape, pos, unc_tester, min_probability, minv_degperday):
+    """
+    Return a list of all tracklets that intersect the specified field
+    and fall within the uncertainty ellipse stored in unc_tester.  We
+    will use our zoned XY index of detections in the database to retrieve
+    a small number of detections, then convert this back to a list
+    of tracklets.
+
+    select d.det_id, t.tracklet_id from detections d join tracklet_attrib ta using (det_id) join tracklets t using (tracklet_id) where d.field_id=2;
+    """
+
+    # FieldProximity only gives us nearby field-tracklet associations, as it does not know
+    # precise positions at field times.  So now, since we have precise positions, we can
+    # screen out fields for which the position + uncertainty does not intersect the
+    # field.
+    search_radius_deg = unc_tester.smaa_deg
+    if not MOPS.Lib.inField(field, field_shape, pos.ra_deg, pos.dec_deg, search_radius_deg):
+        return []
+
+#    zone_list = MOPS.Lib.computeXYZones(field, pos, search_radius_rad)
+    # Construct our zone list from the four extreme corners of a rectangle bounding our
+    # search area. This rectangle is a bit of overkill, as the ephemeris uncertainty
+    # is an ellipse; thus the rectangle covers the worst-case scenario.
+    ztl = MOPS.Lib.computeXYIdx(field, pos.ra_deg - search_radius_deg, pos.dec_deg + search_radius_deg)
+    ztr = MOPS.Lib.computeXYIdx(field, pos.ra_deg + search_radius_deg, pos.dec_deg + search_radius_deg)
+    zbr = MOPS.Lib.computeXYIdx(field, pos.ra_deg + search_radius_deg, pos.dec_deg - search_radius_deg)
+    zbl = MOPS.Lib.computeXYIdx(field, pos.ra_deg - search_radius_deg, pos.dec_deg - search_radius_deg)
+
+    # Sanity-check these values.  They should for the corners of a subsection
+    # of a grid laid out as follows:
+    # 20 21 22 23 24
+    # 15 16 17 18 19
+    # 10 11 12 13 14
+    #  5  6  7  8  9
+    #  1  2  3  4  5
+    #
+    # e.g., the corners 6, 8, 16, 17
+#    if zbr < zbl or ztr < ztl or ztl < zbl or zbr == -1 or zbl == -1 or ztr == -1 or ztr == -1:
+    if zbr == -1 or zbl == -1 or ztr == -1 or ztr == -1:
+        return []       # bogus zone setup, or out of bounds
+
+    # Now we just make a list that spans the full grid of our index zones.
+    # What this does is totally non-obvious. XXXLD
+    zone_list = []
+    zl = zbl
+    zr = zbr
+    while zl <= ztl:
+        zone_list += range(zl, zr + 1)
+        zl += field.xyidxSize
+        zr += field.xyidxSize
+
+    zonal_tracklets = field.fetchTrackletsByDetIndex(dbh, pos, search_radius_deg, zone_list=zone_list, min_probability=min_probability, minv_degperday=minv_degperday)
+    return zonal_tracklets
+
+
+def merge_results(results_list, orbit_results):
+    """
+    Take our normalized results of all orbit determination and merge with our
+    running result set.
+    """
+
+    for (dobj, assignments) in orbit_results.items():
+        for (trk, orbit) in assignments:
+            # Update our derived object for further processing.
+            dobj.tracklets.append(trk)  # add tracklet
+            dobj.orbit = orbit          # update orbit (need to preserve original?)
+            results_list.append((trk, dobj.objectName, orbit))
+        # <- for (trk, orbit)
+    # <- for (dobj, res)
+
+
+def process_night(results_list, mops_instance, mops_dbh, mops_logger, nn, dobj_list, options):
+
+    # Scam our options from the options block.
+    deltaMJD = options.delta_mjd
+    fov_area_deg2 = options.fov_area_deg2
+    fov_shape = options.fov_shape
+    max_arclength_for_iod_days = options.max_arclength_for_iod
+    iod_program = options.iod_program
+    diffcor_program = options.diffcor_program
+    fallback_iod_arcsec = options.fallback_iod_arcsec
+    resid_threshold_arcsec = options.resid_threshold_arcsec
+
+    mops_logger.info('Night %d: start processing' %(nn))
+
+    ttt = timer(mops_logger)
+    ttt.mark('START')
+
+    # Convert our night number into a central epoch that we 
+    # use for coarse ephem predictions.
+    mjd = MOPS.Lib.nn2mjd(nn, options.gmt_offset_hours)
+
+    
+    # Read in the list of fields for the night.
+    tuple_tree = _getTupleTree(mops_dbh, nn, options)
+    if not tuple_tree:
+        mops_logger.info('getTupleTree() returned no fields for night %d.' %(mjd))
+        return
+
+    all_fields = [tuple[-1] for tuple in tuple_tree.GetAllTuples()]      # get last (parent) item from each tuple
+    all_fields.sort(cmp=lambda x, y: cmp(x._id, y._id))                 # sort by field ID
+
+    # Use a global obscode for all processing based on the first field.
+    global_obscode = all_fields[0].obscode
+    ttt.mark('FETCHTUPLETREE')
+
+    # What is the radius we should use for fieldProximity?
+    field_radius_deg, field_padding_deg = _computeFieldProximityRadius(fov_area_deg2, fov_shape)
+
+    # Determine which orbits/derived objects intersect which fields.
+    mapping = _orbitFieldIntersection(mops_logger, all_fields, dobj_list,
+                                      mjd, deltaMJD, global_obscode,
+                                      options.limiting_mag + options.mag_delta,
+                                      fov_area_deg2, fov_shape, options.max_search_radius_arcsec,
+                                      field_radius_deg, field_padding_deg,
+                                      iod_max_days_from_epoch=options.max_arclength_for_iod)
+    ttt.mark('ORBITFIELDINTERSECTION')
+    if not mapping:
+        mops_logger.info('Night %d: no orbit/field intersection.' %(mjd))
+        return
+    # end if
+    
+    # Invert the mapping from fields => [objects] to object => [fields]
+    objFields = {}
+    for fieldId in mapping.keys():
+        for orbitId in mapping[fieldId]:
+            orbitId = int(orbitId)
+            objFields.setdefault(orbitId, []).append(int(fieldId))
+        # <-- end for orbitId
+    # <-- end for fieldId
+    ttt.mark('INVERTMAPPING')
+
+    # Setup lookup tables.
+    fieldLookup = dict([(f._id, f) for f in all_fields])            # field ID => field obj
+    objLookup = dict([(do._id, do) for do in dobj_list])            # dobj ID => dobj
+    dobjname2dobj = dict([(do.objectName, do) for do in dobj_list]) # dobj name => dobj
+
+    # Process all the derived objects that passed fieldProximity.
+    candidate_assignments = {}
+
+    # LSD prep.
+    lsd_archive = None
+
+
+    # Master loop through all of the objects we're PANDAing.
+    for objId in objFields.keys():
+        obj = objLookup[objId]
+
+        # Make a table of field IDs where this object already can be found.  We want to
+        # skip processing for these fields.
+        if options.mode == 'precov':
+            obj.fetchTracklets(mops_dbh);
+            used_field_ids = dict([(foo, 1) for foo in [t.fieldId for t in obj.tracklets]])
+
+            # Now clean up objFields[objId] so that the used fields are removed.
+            candidate_field_ids = objFields[objId]      # current list
+            new_field_ids = []                          # new list, will replace current
+            for field_id in candidate_field_ids:
+                if field_id not in used_field_ids:
+                    new_field_ids.append(field_id)      # append (copy) only if not already used by object
+                # <- if field_id
+            # <- for field_id
+            if new_field_ids:
+                objFields[objId] = new_field_ids
+            else:
+                continue    # next object
+            # <- if new_field_ids
+        # <- if options.mode
+
+        # For this object, evaluate ephs for all relevant fields in the
+        # tuple_tree, and extract ephs for parent fields for normal (HSD)
+        # processing.  objFields contains a mapping of fields to an particular
+        # object as calculated by FieldProximity.  These fields are only parent
+        # fields, so we need to extract all fields from the tuple_tree so that
+        # we can compute positions at all field times for the object, not just
+        # for the parent field.  The reason for this is that in LSD space we
+        # are searching detections, not tracklets, so we need predictions for
+        # every field.
+        relevant_tuples = tuple_tree.FindRelevantTuples([fieldLookup[fid] for fid in objFields[objId]])
+        relevant_fields = reduce(operator.add, relevant_tuples)     # flattened field list
+        positions = _predictPosition(
+            # object of interest
+            # mjds of all fields where we might find object
+            # obscode for prediction
+            obj,
+            [f.mjd for f in relevant_fields],
+            global_obscode,         # provide list instead?
+        )
+        ttt.mark('PREDICTPOSITION')
+
+        # What we really want is a table where we can look up an object's
+        # prediction by field ID.  The positions from _predictPosition() come
+        # from ssd.ephemerides() and may be in a different order, so walk
+        # the MJDs from our result and map to fields.  Then we are good.
+        #positionMJDLookup = dict([(p[3], p) for p in positions])
+        positionFieldIdLookup = _makeFieldIdLookup(relevant_fields, positions)
+
+        # Loop through fields.
+        for fieldId in objFields[objId]:
+            field = fieldLookup[int(fieldId)]
+            pos = positionFieldIdLookup[field._id]          # precise position in field
+
+            # Perform a strict check that the field intersects the uncertainty ellipse 
+            # of the prediction.  Bail if:
+            # * we have an IOD and we're outside 30-days of epoch
+            # * field does not intersect uncertainty region
+
+            # If we do have an IOD, make a fake uncertainty region using a nominal value.
+            # Bail on a tracklet if it does not intersect the uncertainty region
+            if pos.unc_smaa_arcsec < 0:                     # comes from IOD, unc < 0, so use nominal
+                # IOD case; manufacture uncertainty info
+                unc_smaa_arcsec = options.iod_only_search_radius_arcsec
+                unc_smia_arcsec = unc_smaa_arcsec           # both axes same size (circular)
+                unc_pa_deg = 0          # dummy position angle for circle
+            else:
+                unc_smaa_arcsec = pos.unc_smaa_arcsec * options.uncertainty_sigma        # use 3-sigma error ellipse
+                unc_smia_arcsec = pos.unc_smia_arcsec * options.uncertainty_sigma        # use 3-sigma error ellipse
+                unc_pa_deg = pos.unc_pa_deg
+
+                # Ensure the search radius is at least as large as our configured minimum
+                # but smaller than our configured maximum.  This will help us find tracklets 
+                # beyond 3 * the eph uncertainty when the uncertainty is very small.
+                unc_smaa_arcsec = _fitinminmax(
+                    options.min_search_radius_arcsec,
+                    options.max_search_radius_arcsec,
+                    unc_smaa_arcsec
+                )
+                unc_smia_arcsec = _fitinminmax(
+                    options.min_search_radius_arcsec,
+                    options.max_search_radius_arcsec,
+                    unc_smia_arcsec
+                )
+                # <-- if search_radius_arcsec
+            # <-- else
+
+            # Now create a class that we can use to query proximity to our uncertainty ellipse.
+            unc_tester = MOPS.Lib.UncertaintyTester(
+                pos.ra_deg, pos.dec_deg,
+                unc_smaa_arcsec / 3600, unc_smia_arcsec / 3600, unc_pa_deg
+            )
+
+            # First thing to do with our unc_tester is reject the field if it
+            # does not intersect our uncertainty ellipse.
+            if not unc_tester.PointInEllipse(field.ra, field.dec, padding_deg=field_radius_deg):
+                continue    # skip this field
+
+            # Now use our DB detection zonal index to locate tracklets with detections in our zone.
+            zonal_tracklets = _find_zonal_tracklets(mops_dbh, field, options.fov_shape, pos, unc_tester, options.min_probability, options.minv_degperday)
+            if not zonal_tracklets:
+                continue            # no matching tracklets
+
+            for ztrk in zonal_tracklets:
+#                if unc_tester.PointInEllipse(ztrk.extRa, ztrk.extDec, padding_deg=0):
+                last_det = ztrk.detections[-1]
+                if unc_tester.PointInEllipse(last_det.ra, last_det.dec, padding_deg=0):
+                    candidate_assignments.setdefault(obj, []).append(ztrk)
+            # <-- end for near_det_ids
+        # <-- end for fieldId
+        ttt.mark('FINDZONAL')
+
+
+        # Perform LSD search here; add candidates to candidate_assignments.  relevant_tuples contains
+        # the tuples where we expect to find the object, and positionFieldIdLookup tells us the
+        # predicted positions in those tuples.  With all this information we can perform the LSD
+        # search.
+        if options.lsd_enable and options.lsd_rootdir:
+            # Create an LSD uncertainty tester for our position.
+            unc_smaa_arcsec = _fitinminmax(
+                options.min_search_radius_arcsec,
+                options.lsd_max_search_radius_arcsec,
+                unc_smaa_arcsec
+            )
+            unc_smia_arcsec = _fitinminmax(
+                options.min_search_radius_arcsec,
+                options.lsd_max_search_radius_arcsec,
+                unc_smia_arcsec
+            )
+            lsd_unc_tester = MOPS.Lib.UncertaintyTester(
+                pos.ra_deg, pos.dec_deg,
+                unc_smaa_arcsec / 3600, unc_smia_arcsec / 3600, unc_pa_deg
+            )
+
+            # Create LSD archive object on-demand.
+            if lsd_archive is None:
+                lsd_archive = MOPS.LSD.Search.Archive(options.lsd_rootdir, nn)
+                ttt.mark('LSDSEARCH', 'ARCHIVE')
+
+            # Search the LSD archives.
+            lsd_candidates = MOPS.LSD.Search.FindTracklets(
+                lsd_archive, 
+                positionFieldIdLookup, 
+                relevant_tuples, 
+                lsd_unc_tester,
+                options.hsd_s2n_cutoff,
+                options.lsd_tti_size,
+            )
+            ttt.mark('LSDSEARCH', 'FINDTRACKLETS')
+
+            if lsd_candidates:
+#                sys.stderr.write("Found candidate tracklets for %s (%d).\n" % (obj.objectName, obj._id))
+                for tracklet in lsd_candidates:
+                    candidate_assignments.setdefault(obj, []).append(tracklet)
+            # <-- if lsd_candidates
+
+        # <-- if options.lsd_rootdir
+        ttt.mark('LSDSEARCH')
+    # <-- end for obj
+
+    if not candidate_assignments:
+        mops_logger.info('Night %d: no tracklet-derived object associations.' %(mjd))
+        return 
+    # <-- end if
+
+
+    # In the LSD regime, it is possible that some tracklets originated in
+    # LSD processing and thus do not have a database ID (_id == None instead).
+    # Previously we passed the tracket._id through as the tracklet identifier
+    # for orbit determination, but now to accomodate LSD tracklets, we need
+    # a temporary relabeling of tracklets using Python ID.  Our plan is to
+    # use the DB tracklet ID if available, otherwise 'P'+id(tracklet).
+    trk2id_mapping = {}         # map tracklets to their temp IDs for OD processing
+    id2trk_mapping = {}         # map temp IDs back to tracklets
+    for tracklet in reduce(operator.add, candidate_assignments.values()):
+        if tracklet._id is None:
+            ident = 'P' + str(id(tracklet))
+        else:
+            ident = str(tracklet._id)
+        trk2id_mapping[tracklet] = ident
+        id2trk_mapping[ident] = tracklet       # store id => tracklet mapping
+    # <-- end for tracklet
+
+
+
+    # ORBIT DETERMINATION PHASE
+    # In this phase, we evaluate all tracklet-object associations and keep the
+    # ones which produce a good orbit.  This would be straightforward, except
+    # for the cases of multiple available associations.  When this happens,
+    # we must form batch-loops to evaluate all 2-tracklet, 3-tracklet, etc.
+    # associations.
+    # 
+    # When we are done, we will have a dictionary of objects whose values
+    # are lists of (tracklet, orbit) pairs in the order they were associated.
+    batch_results = batch_od(
+        mops_logger, mops_dbh,
+        candidate_assignments, max_arclength_for_iod_days, global_obscode,
+        iod_program, diffcor_program, resid_threshold_arcsec, fallback_iod_arcsec,
+        dobjname2dobj, id2trk_mapping, trk2id_mapping)
+    ttt.mark('BATCHOD')
+
+    # Now we need to identify multiple-assignment cases of different tracklets to the 
+    # same derived object.  From these, we will choose the earliest assignment,
+    # then perform a "batch loop" that tests successive assigments while preserving
+    # previous assignments.
+    multi_od(
+        mops_logger, mops_dbh,
+        batch_results, max_arclength_for_iod_days, global_obscode,
+        iod_program, diffcor_program, resid_threshold_arcsec, fallback_iod_arcsec,
+        dobjname2dobj, id2trk_mapping, trk2id_mapping)
+    ttt.mark('MULTIOD')
+
+    merge_results(results_list, batch_results)
+    ttt.mark('MERGERESULTS')
+
+    mops_logger.info('Night %d: done processing.' %(mjd))
+    return
+
+
+def _orbitFieldIntersection(logger, fields, derivedObjects,
+                            mjd, deltaMJD, obscode, limitingMag,
+                            fov_area_deg2, fov_shape, max_search_radius_arcsec,
+                            field_radius_deg, field_padding_deg,
+                            iod_max_days_from_epoch=45):
+    """
+    Given a list of Field instances (fields), a list of DerivedObject instances
+    (derivedObjects), a central date (mjd), a time interval (deltaMJD), a
+    location on Earth (obscode) and a limiting magnitude (limitingMag),
+    determine which orbits intersect (while remaining visible) which fields.
+
+    Return the field/orbit mapping in the form
+        {field._id: [derivedObject1._id, derivedObject2._id, ...], }
+
+    2009-07-20: Originally the intent of the "padding" around a field was to
+    compensate for the lack of orbital uncertainty information.  The padding
+    gives us some margin for error when deciding whether an object is "near"
+    a field.
+
+    Now that we have precise uncertainty, we can be more rigorous about
+    using the uncertainty information. For objects whose uncertainty is
+    smaller than the padding, we process as before.  For objects with larger
+    uncertainty, we will use a different, more accurate method of associating
+    objects with fields.  The reason we need to do this is that the uncertainty
+    can be as large as a 1-deg semimajor axis, causing too many fields to be
+    candidates, and thus too many tracklets to be extracted.
+    """
+    ttt = timer(logger)
+
+    if not fields or not derivedObjects:
+        # Nothing to do here.
+        return {}
+    # <-- end if
+    
+    # Extract orbital parameters from the derivedObjects.
+    orbParams = [[d._id,
+                  numpy.array([d.orbit.q, d.orbit.e, d.orbit.i, d.orbit.node, d.orbit.argPeri, d.orbit.timePeri]),
+                  d.orbit.epoch,
+                  d.orbit.h_v,
+                  d.orbit.src] for d in derivedObjects 
+                  if (d.orbit.src or (abs(d.orbit.epoch - mjd) < iod_max_days_from_epoch))
+                    # restrict to orbits with SRC or IOD within 45 days
+                ]
+
+    # Do coarse ephems on the derived objects.
+    ephems = ssd.coarseEphem(orbParams, mjd, obscode, deltaMJD)
+    ttt.mark('ORBITFIELDINTERSECTION', 'COARSE')
+
+    # Remove objects that are not visible and prepare the input for
+    # fieldProximity.
+    small_unc_orbits = []
+    large_unc_orbits = []
+    for _id in ephems.keys():
+        # RA, Dec, mag, MJD, uncertainties for the 3 times.
+        positions = [Position(*eph) for eph in ephems[_id]]     # convert raw eph list to list of Position objs
+
+        # Is the object too dim?
+        # Since predicting mags is hard and error prone, we assume a 0.5 mag
+        # margin of error.
+        if(positions[0].mag > limitingMag and
+           positions[1].mag > limitingMag and
+           positions[2].mag > limitingMag):
+            # Yup: too dim since none of the three positions is visible!
+            continue
+        # <-- end if
+        
+        # ID, MJD, RA, Dec, mag
+        _id = str(_id)
+
+        if positions[0].unc_smaa_arcsec > field_padding_deg:
+            large_unc_orbits.append([_id, positions[0].epoch_mjd, positions[0].ra_deg, positions[0].dec_deg, positions[0].mag])
+            large_unc_orbits.append([_id, positions[1].epoch_mjd, positions[1].ra_deg, positions[1].dec_deg, positions[1].mag])
+            large_unc_orbits.append([_id, positions[2].epoch_mjd, positions[2].ra_deg, positions[2].dec_deg, positions[2].mag])
+        else:
+            small_unc_orbits.append([_id, positions[0].epoch_mjd, positions[0].ra_deg, positions[0].dec_deg, positions[0].mag])
+            small_unc_orbits.append([_id, positions[1].epoch_mjd, positions[1].ra_deg, positions[1].dec_deg, positions[1].mag])
+            small_unc_orbits.append([_id, positions[2].epoch_mjd, positions[2].ra_deg, positions[2].dec_deg, positions[2].mag])
+    # <-- end for
+
+    # Just make sure that we indeed still have some orbits!
+    if not small_unc_orbits and not large_unc_orbits:
+        return {}
+    # <-- end if
+    
+    # Now do fieldProximity and quit.
+    result = {}
+    if small_unc_orbits:
+        fp_fields = [[int(f._id), f.mjd, f.ra, f.dec, field_radius_deg + field_padding_deg] for f in fields]
+        result = auton.fieldproximity(fp_fields, small_unc_orbits, method=1)
+        ttt.mark('ORBITFIELDINTERSECTION', 'SMALLUNC')
+    # <- if
+
+    # XXX LD want max_search_radius_arcsec
+    if large_unc_orbits:
+        fp_fields = [[int(f._id), f.mjd, f.ra, f.dec, field_radius_deg + max_search_radius_arcsec / 3600] for f in fields]
+        result2 = auton.fieldproximity(fp_fields, large_unc_orbits, method=1)
+        result.update(result2)
+    # <- if
+    ttt.mark('ORBITFIELDINTERSECTION', 'LARGEUNC')
+
+    return result
+
+
+def batch_od(logger, dbh, candidate_assignments, max_arclength_for_iod_days, obscode,
+        iod_program, diffcor_program, resid_threshold_arcsec, fallback_iod_arcsec, dobjname2dobj, 
+        id2trk_mapping, trk2id_mapping):
+    """
+    Given a list of lists of detections, do a full orbit determination on each
+    of them and return the new orbit, the residuals and covariance matrix.
+
+    candidate_assignments has the form
+        {obj: [trk1, trk2, ...], }
+
+    Full orbit determination is IOD+DC if the derivedobject arc length in days
+    is below max_arclength_for_iod_days and only DC otherwise.
+
+    The result is a dictionary of the form
+         { id: orbit, }
+    where tid is 'derivedObject.objectName=tracklet._id'
+          orbit is the new orbit derived from the OD process
+
+    dobjname2dobj is a dict of (do.objectName, do) that we will use to
+    look up whether a DO previously had a differentially corrected orbit
+    (via do.orbit.src).  If the evaluted attr/precov is an IOD (D9),
+    but the DO has src, then do not accept the new orbit.
+
+    NOTE: we are doing orbit determination by invoking some command line
+    executables in a system call. This is not the way to do it in reliable s/w.
+
+    NOTE: "full" => IOD + DC; "fast" => DC only
+
+    When the arc length is greater than our configured limit, we always
+    use the "fast", using the previous differentially-corrected orbit for
+    the derived object.  When the arc length is shorter than this limit, 
+    we'll try DC first, and if that fails, IOD+DC.
+    """
+
+
+    # Build two lists: one for IOD+DC and one for only DC.
+    ioddc_list = []
+    dc_list = []
+
+
+    # Prepare input sets for fast and full OD.
+    for dobj in candidate_assignments.keys():
+        for tracklet in candidate_assignments[dobj]:
+
+            # Make sure we have our detections.
+            dobj.fetchTracklets(dbh)
+
+            # Prepare ODDC and DC input lists.
+            dc_list.append((dobj, tracklet))            # all objects attempt DC
+            if dobj.arcLength(dbh) < max_arclength_for_iod_days:
+                ioddc_list.append((dobj, tracklet))     # short arcers do IOD+DC as well
+            # <-- end if
+        # <-- end for dobj
+    # <-- end for tracklet
+
+    ioddc_results = od_ioddc(
+        logger,
+        ioddc_list,
+        obscode,
+        iod_program,
+        diffcor_program,
+        resid_threshold_arcsec,
+        fallback_iod_arcsec,
+        dobjname2dobj,
+        trk2id_mapping
+    )
+
+    dc_results = od_dc(
+        logger,
+        dc_list,
+        obscode,
+        iod_program,
+        diffcor_program,
+        resid_threshold_arcsec,
+        fallback_iod_arcsec,
+        trk2id_mapping
+    )
+
+    # Combine the results from DC into full (IOD+DC) results so we can return a single dict.  If
+    # one of the fast results has a matching entry in ioddc_results, then it was a short-arc
+    # orbit, and we accept the IOD+DC orbit.
+    for key in dc_results.keys():
+        if key not in ioddc_results:
+            ioddc_results[key] = dc_results[key]
+        # <- if key
+    # <- for key
+
+    # Finally, chop up our results into something parallelling our input:
+    # { dobj: (trk, orbit), }
+    results = {}
+    for orb_id, orbit in ioddc_results.items():
+        dobjname, trk_id = orb_id.split('=')        # split into consitituent IDs
+        dobj = dobjname2dobj[dobjname]              # lookup python obj
+        trk = id2trk_mapping[trk_id]                # lookup python obj
+        results.setdefault(dobj, []).append((trk, orbit))
+    # <- for orbit_id, orbit
+
+    return results
+
+
+def multi_od(logger, dbh, batch_results, max_arclength_for_iod_days, obscode,
+        iod_program, diffcor_program, resid_threshold_arcsec, fallback_iod_arcsec, dobjname2dobj, 
+        id2trk_mapping, trk2id_mapping):
+    """
+    Our job here is to
+
+    1. identify objects that have multiple successful tracklet assignments
+    2. attempt progressive assignment with these tracklets so that they
+      may be treated as a succession of assignments.
+
+    Our general method will be to:
+
+    1. Extract all multi-assignment objects from batch_results.
+    2. For each object, sort its tracklets by ascending residual
+    3. Execute a pass for 2nd, 3rd, etc. objects as necessary, recording
+       orbit from the previous pass
+    4. Keep all successful passes.
+    5. Restore results back into batch_results.
+    """
+
+
+    # Copy assignments from original batch results where there are > 1 assignments.
+    multi_assignments = dict([(k, v) for (k, v) in batch_results.items() if len(v) > 1])
+    logger.info('panda_worker: found %d object(s) with multiple associations' % len(multi_assignments))
+
+    for (dobj, assignments) in multi_assignments.items():
+        del batch_results[dobj]                     # remove from original result set; we'll put something back later
+
+        # Sort each set of assignments by residuals ascending.
+        multi_assignments[dobj].sort(
+            cmp=lambda a, b: cmp(a[1].residuals, b[1].residuals)
+        )
+    # <- for
+
+    # Initialize our multi-results by taking the first assignment for each
+    # object.
+    for (dobj, assignment_list) in multi_assignments.items():
+        assn = assignment_list.pop(0)
+        dobj.tracklets.append(assn[0])          # add trk to dobj (assn is (tracklet, orbit) tuple)
+        dobj.orbit = assn[1]                    # update DO's orbit
+        batch_results[dobj] = [ assn ]
+    # <- for
+
+
+    # Process each "wave" of orbit determinations.  When we are done, we will keep what
+    # is left in our working results and copy it back to batch_results.
+    keep_truckin = reduce(operator.add, [0] + [len(assignment_list) for assignment_list in multi_assignments.values()]) > 0
+    num_pass = 1
+    while keep_truckin:
+        batch_input = {}
+        logger.info('panda_worker: executing multi pass %d' % num_pass)
+        for (dobj, assignment_list) in multi_assignments.items():
+            if len(assignment_list) > 0:    # still stuff in list for this obj
+                batch_input[dobj] = [ assignment_list.pop(0)[0] ]       # input for OD (tracklet)
+            # <- if
+        # <- for
+
+        # Now execute the orbit determination.
+        results = batch_od(logger, dbh, batch_input, max_arclength_for_iod_days, obscode,
+            iod_program, diffcor_program, resid_threshold_arcsec, fallback_iod_arcsec, dobjname2dobj, 
+            id2trk_mapping, trk2id_mapping)
+
+        # For each of the successful results, tack the tracklet onto our
+        # master results set (batch_results).
+        for (dobj, assignment_list) in results.items():
+            assn = assignment_list[0]               # first (should be only) result
+            dobj.tracklets.append(assn[0])          # add trk to dobj (assn is (tracklet, orbit) tuple)
+            dobj.orbit = assn[1]                    # update DO's orbit
+            batch_results[dobj].append(assn)        # add tracklet to object assignment list
+        # <- for
+
+        # If any of our multi_results objects still has tracklets left, perform another pass.
+        num_pass += 1
+        keep_truckin = reduce(operator.add, [0] + [len(assignment_list) for assignment_list in multi_assignments.values()]) > 0
+    # <- while
+
+# <-eofn
+
+
+def make_ioddc_package(root, candidates, obscode, trk2id_mapping):
+    """ 
+    Construct a package of files for preliminary orbit determination:
+    a DES manifest (.in.manifest, .in.tracklets, .in.request), and a
+    .tracks file for the differential corrector.  
+    """
+
+    tracksFile = file(root + '.tracks', 'w')
+
+    desTrackletsFile = file(root + '.in.tracklet', 'w')
+    desTrackletsFile.write("!!OID TIME OBS_TYPE RA DEC APPMAG FILTER OBSERVATORY RMS_RA RMS_DEC RMS_MAG S2N Secret_name\n")
+
+    desRequestFile = file(root + '.in.request', 'w')
+    desRequestFile.write("!!ID_OID NID TRACKLET_OIDs OP_CODE N_OBS N_SOLUTIONS N_NIGHTS ARC_TYPE NO_RADAR PARAM(4)\n")
+
+    # loop through all the candidate derivedobject-tracklet pairs.
+    lineno = 0
+    for (obj, candidateTracklet) in candidates:
+        tracklets = obj.tracklets + [candidateTracklet, ]                   # assemble tracklet list for this candidate
+        tracklets.sort(cmp=lambda t1, t2: cmp(t1.extEpoch, t2.extEpoch))    # sort by time
+
+        # Create an identifier for this candidate.
+        ident = '%s=%s' %(obj.objectName, trk2id_mapping[candidateTracklet])       # mapping
+
+        objDets = reduce(operator.add, [t.detections for t in obj.tracklets])   # assemble detection list
+        objDets.sort(cmp=lambda obj1, obj2: cmp(obj1.mjd, obj2.mjd))        # sort by time
+        allDets = objDets + candidateTracklet.detections                    # all detections used in for this eval
+
+        # Write all the detections to the tracks file in DES format.
+        for detection in allDets:
+            tracksFile.write('%s %.10f O %.10f %.10f %.10f %s %s %.10f %.10f %.10f %.10f NS\n' \
+                             %(ident,
+                               detection.mjd,
+                               detection.ra,
+                               detection.dec,
+                               MOPS.Lib.filt2v(detection.mag, detection.filt),
+                               detection.filt,
+                               str(obscode),
+                               detection.raErr * MOPS.Constants.ARCSECONDS_PER_DEG,
+                               detection.decErr * MOPS.Constants.ARCSECONDS_PER_DEG,
+                               detection.magSigma,
+                               detection.s2n))
+        # <-- end for
+
+        # Write the tracklets for OrbFit.
+        for trk in tracklets:
+            for detection in trk.detections:
+                desTrackletsFile.write('%s %.10f O %.10f %.10f %.10f %s %s %.10f %.10f %.10f %.10f NS\n' \
+                                 %(trk2id_mapping.get(trk, str(trk._id)),       # fetch ID or mapped ID
+                                   detection.mjd,
+                                   detection.ra,
+                                   detection.dec,
+                                   MOPS.Lib.filt2v(detection.mag, detection.filt),
+                                   detection.filt,
+                                   str(obscode),
+                                   detection.raErr * MOPS.Constants.ARCSECONDS_PER_DEG,
+                                   detection.decErr * MOPS.Constants.ARCSECONDS_PER_DEG,
+                                   detection.magSigma,
+                                   detection.s2n))
+            # <-- end for detection
+        # <-- end for trk
+
+        # Write a line in the request header.
+        #!!ID_OID NID TRACKLET_OIDs OP_CODE N_OBS N_SOLUTIONS N_NIGHTS ARC_TYPE NO_RADAR PARAM(4)
+        desRequestFile.write('%s %d %s REQUEST_PRELIM %d 0 0 0 0 0.0 0.0 0.0 0.0\n' % (
+            ident,
+            len(tracklets),
+            (' '.join([trk2id_mapping.get(x, str(x._id)) for x in tracklets])),
+            len(allDets)
+        ))
+    # <-- end for
+
+    # Close the files.
+    tracksFile.close()
+    desTrackletsFile.close()
+    desRequestFile.close()
+
+    # DES options file.
+    desOptionsFile = file(root + '.opt', 'w')
+    opt_str = \
+"""
+! Machine generated!
+orbsrv.
+         .inpdir='.'            ! input directory
+         .outdir='.'            ! output directory
+         .cooy='COM'            ! output cometary orbital elements (COM); or COT (cometary true anomaly)
+! logical and parametric controls of main
+        .force_difcor= .T.     ! diff cor even if REQUEST_PRELIM (def F)
+        .prelim_rms= 1000.d0    ! threshold for two-body fit; default 100.d0
+!       .output_unidentif= .T. ! output unidentified tracklets (def. F)
+"""
+    desOptionsFile.write(opt_str)
+    desOptionsFile.close()
+
+    # Write our DES manifest.
+    desManifestFile = file(root + '.in.manifest', 'w')
+    manifest_str = \
+"""
+%s.in.manifest
+%s.in.tracklets
+%s.in.request
+""" % (root, root, root)
+    desManifestFile.write(manifest_str)
+    desManifestFile.close()
+    return
+
+
+def od_ioddc(logger, candidates, obscode, iod_program, diffcor_program, 
+    resid_threshold_arcsec, fallback_iod_arcsec, dobjname2dobj, trk2id_mapping):
+    """
+    Given a list of lists of detections, do a full IOD + DC orbit
+    determination on each of them and return the new orbit, the residuals
+    and covariance matrix.
+
+    candidates has the form [(dobj, tracklet), ]
+
+    The result is a dictionary of the form { id: orbit, }
+    where 
+        id is 'derivedObject.objectName=tracklet._id'
+        orbit is the new orbit derived from the OD process
+    """
+    if not candidates:
+        return {}
+    
+    here = os.getcwd()
+    root = 'precov'
+    
+    # Create a temporary work directory and cd into it.
+    tmpstuff = os.environ.get('PRECOV_TMPDIR', '/tmp/precov')
+    dirName = tempfile.mkdtemp(prefix=tmpstuff)
+    os.chdir(dirName)
+
+    # Write out our input files for orbit determination.
+    make_ioddc_package(root, candidates, obscode, trk2id_mapping)
+
+    # Execute IOD+DC > out
+    fallback_iod_str = ''
+    if fallback_iod_arcsec:
+        fallback_iod_str = '--fallback_iod %f' %(fallback_iod_arcsec)
+    # <-- end if
+    cmd = '%s %s | %s --covariance %s --threshold_arcseconds %f - %s out' \
+          %(iod_program,
+            root,
+            diffcor_program,
+            fallback_iod_str,
+            resid_threshold_arcsec,
+            root + '.tracks')
+   
+    sys.stderr.write('Executing %s\n' % cmd)
+    err = os.system(cmd)
+    if err:
+        logger.info('cmd %s failed with exit code %d' %(cmd, err))
+        return {}
+    # <-- end if
+    
+    # Read the results back and return derived objects, orbits and residuals.
+    result = _deserializeOrbits(logger, file('out').readlines(), dobjname2dobj)
+
+    # Cleanup the tmp dir and files and goback to the original dir.
+    os.chdir(here)
+
+    if not os.environ.get('PRECOV_TMPDIR'):
+        shutil.rmtree(dirName, ignore_errors=True)
+    return result
+
+
+def od_dc(logger, candidates, obscode, iod_program, diffcor_program, 
+    resid_threshold_arcsec, fallback_iod_arcsec, trk2id_mapping):
+    """
+    Given a list of lists of detections, do a simple differential correction on
+    each of them and return the new orbit, the residuals and covariance matrix.
+
+    candidates has the form [(dobj, tracklet), ]
+
+    The result is a dictionary of the form { id: orbit, }
+    where 
+        id is 'derivedObject.objectName=tracklet._id'
+        orbit is the new orbit derived from the OD process
+    """
+    if not candidates:
+        return {}
+    
+    here = os.getcwd()
+    
+    # Create a temporary work directory and cd into it.
+    tmpstuff = os.environ.get('PRECOV_TMPDIR', '/tmp/precov')
+    dirName = tempfile.mkdtemp(prefix=tmpstuff)
+    os.chdir(dirName)
+
+    # Open the output files for writing.
+    root = 'precov'
+    iodFile = file(root + '.iod', 'w')
+    detFile = file(root + '.det', 'w')
+
+    # loop through all the candidate derivedobject-tracklet pairs.
+    for (obj, candidateTracklet) in candidates:
+        # Put all the detections together and sort them by mjd.
+        detections = reduce(lambda d1, d2: d1 + d2,
+                            [t.detections
+                             for t in obj.tracklets + [candidateTracklet, ]])
+        detections.sort(cmp=lambda d1, d2: cmp(d1.mjd, d2.mjd))
+
+        # Create an identifier for this candidate.
+        ident = '%s=%s' %(obj.objectName, trk2id_mapping[candidateTracklet])
+
+        # Write the known orbit to the IOD file.
+        # Patch the orbit id with our custom identifier.
+        origId = obj.orbit._id
+        obj.orbit._id = ident
+        # Write the wntry in the IOD file.
+        iodFile.write('%s\n' %(str(obj.orbit)))
+        # Patch the orbit back.
+        obj.orbit._id = origId
+        
+        # Write out detections for JPL code in MITI format.
+        # Extract the object detections. Also add detections we want to test.
+        for detection in detections:
+            detFile.write('%s %.10f O %.10f %.10f %.10f %s %s %.10f %.10f %.10f %.10f NS\n' \
+                             %(ident,
+                               detection.mjd,
+                               detection.ra,
+                               detection.dec,
+                               MOPS.Lib.filt2v(detection.mag, detection.filt),
+                               detection.filt,
+                               str(obscode),
+                               detection.raErr * MOPS.Constants.ARCSECONDS_PER_DEG,
+                               detection.decErr * MOPS.Constants.ARCSECONDS_PER_DEG,
+                               detection.magSigma,
+                               detection.s2n))
+        # <-- end for
+    # <-- end for
+
+    # Close the files.
+    detFile.close()
+    iodFile.close()
+
+    # Execute DC > out
+    cmd = '%s --threshold_arcsec %f --covariance %s %s %s' \
+          %(diffcor_program,
+            resid_threshold_arcsec,
+            root + '.iod',
+            root + '.det',
+            root + '.out')
+    
+    err = os.system(cmd)
+    if err:
+        logger.info('cmd %s failed with exit code %d' %(cmd, err))
+        return({})
+    # <-- end if
+    
+    # Read the results back and return derived objects, orbits and residuals.
+    result = _deserializeOrbits(logger, file(root+'.out').readlines())
+
+    # Cleanup the tmp dir and files and goback to the original dir.
+    os.chdir(here)
+    if not os.environ.get('PRECOV_TMPDIR'):
+        shutil.rmtree(dirName, ignore_errors=True)
+    return result
+
+
+def _deserializeOrbits(logger, data, dobjname2dobj=None):
+    """
+    This is actually a factory method for Orbit classes. Given a data stream,
+    possibly coming form the orbit determination process output, parse it and
+    build Orbit instances. Return a list of Orbit instances.
+
+    Lines prefixed with MIF-OC have additional covariance elements.
+    MIF-O lines contain just cometary elements.
+
+    If dobjname2dobj is not None, look up whether a new, computed orbit is
+    an IOD (D9).  If so, and the original orbit is differentially corrected
+    (has .src), then do not accept he orbit.
+    """
+    orbitData = {}                      # orbitId: [newOrbit, residual,
+                                        #           chiSq, moid_1, arcLength, convCode]
+    for line in data:
+        line = line.strip()
+        if(not line):
+            continue
+        # <- end if
+        
+        tokens = line.split()
+        if(tokens[0] == 'MIF-O'):
+            # _id, q, e, i, node, argPeri, timePeri, h_v, epoch, src
+            src = None
+        elif(tokens[0] == 'MIF-OC'):
+            src = [float(x) for x in tokens[15:]]
+        else:
+            # Ummm... this should never happen.
+            logger.debug('_deserializeOrbits(): malformed entry. SKIPPED')
+            continue
+        # <-- end if
+
+    	if dobjname2dobj:
+            stuff = tokens[1].split('=')    # stuff = [dobj_name, trk_id] hopefully
+            if (len(stuff) != 2):
+                logger.warn("can't split ID for " + tokens[1])
+                continue
+            else:
+                dobj_name, trk_id = stuff
+                obj = dobjname2dobj.get(dobj_name, None)
+                if obj and obj.orbit.src and tokens[0] == 'MIF-O':
+                    # obj has src (thus diffcored), but new orbit is IOD (MIF-O), so reject
+                    logger.info('rejecting IOD for DCed object ' + dobj_name + '+' + str(trk_id) + (' (%f)' % float(tokens[10])))
+                    continue
+                # <- if obj
+            # <- if/else len(stuff)
+        # <- if dobjname2dobj
+                
+        # Create the Orbit instance. We keep _id=None so that when we write to
+        # the DB, a new id is automatically assigned.
+        # Also, we need to swap h_v and epoch...
+
+        # _id, q, e, i, node, argPeri, timePeri
+        # epoch, hV
+        # residual, chiSquared, moid_1, arcLength_days, moid_2, convCode
+        args = [None, ] + [float(x) for x in tokens[2:8]] + \
+               [float(tokens[9]), float(tokens[8])] + [src, ] + \
+               [float(tokens[10]), None, None, tokens[14], None, float(tokens[13])]
+        orbitData[tokens[1]] = Orbit(*args) 
+    # <-- end for
+    return(orbitData)
+
+    
+
+def _computeFieldProximityRadius(fov_area_deg2, fov_shape='circle', padding=0.2):
+    """
+    The (search) radius the fieldProximity uses is the maximum distance between
+    any orbit that intersect the full field of view and the center of the FoV.
+
+    Of course, if we have a circular FOV, then the radius is simply the radius
+    of the circle. If the FOV is rectangular, then the radius is the half
+    diagonal.
+
+    If padding is specified, we increase the readius by that ammount:
+        r = r * (1. + padding)
+    """
+    if fov_shape == 'circle':
+        r_deg = math.sqrt(fov_area_deg2 / math.pi)
+    else:
+        # We assume a square FoV...
+        r_deg = math.sqrt(fov_area_deg2) / SQRT2_DIV_2
+    # <-- end if
+    return r_deg, padding * r_deg
+
+
+def _parse_list_file(filename):
+    try:
+        nums = [int(foo) for foo in file(filename).readlines()]
+    except Exception, e:
+        raise RuntimeError('error parsing items in %s: %s' % (filename, str(e)))
+    return nums
+
+
+def compute_orbit_stability(dbh, dobj_list, min_nn, max_nn, obscode, 
+    min_time_range_days, min_arclength_days, max_uncertainty_arcsec):
+
+    # For each of our objects, compute 30-day ephemerides over our precov
+    # time interval and decide if the orbit is "stable".  If so, add it to
+    # our list, and the master will mark the object as permanently stable
+    # so that it is not precovered any longer.
+
+    if max_nn - min_nn < min_time_range_days:
+        return []               # precov range does not exceed min range
+
+    stable_ids = []
+
+    # Set up our range of uncertainty calculation.  There's no need to compute
+    # past the range specified by min_time_range_days.  Our max time is the
+    # night we're precovering, and the min time is the greater of min_nn - 30
+    # and max_nn - min_time_range_days.
+    mjds = numpy.arange(max(min_nn - 30.0, max_nn - min_time_range_days), max_nn, 30.0)
+
+    for dobj in dobj_list:
+        # See if we have a square root covariance matrix so that we can compute uncertainties.
+        # If we don't, the orbit is an IOD and by definition cannot be stable.
+        orb = dobj.orbit
+        if orb.src:
+            src = numpy.array(orb.src)
+        else:
+            continue        # IOD, unstable, next
+        # <- if
+
+        if dobj.arcLength(dbh) < min_arclength_days:
+            continue        # arc not long enough
+
+        # Extract the orbital params.
+        orbit_params = numpy.array([orb.q, orb.e, orb.i, orb.node, orb.argPeri, orb.timePeri])
+        epoch_mjd = orb.epoch
+        h_v = orb.h_v
+
+        # positions = [[RA, Dec, mag, mjd, uncertainties], ]
+        unc_smaas_arcsec = [
+            eph[6] for eph in 
+                ssd.ephemerides(
+                    orbit_params,
+                    epoch_mjd,
+                    mjds,
+                    obscode,
+                    h_v,
+                    covariance=src
+                )
+        ]
+
+        # If the max of the uncertainties exceeds our limit, the orbit is not stable.
+        if max(unc_smaas_arcsec) > max_uncertainty_arcsec:
+            continue
+
+        # We made it.   Orbit is stable.
+        stable_ids.append(dobj._id)
+
+    # <- for dobj
+
+    return stable_ids
+
+    
+if __name__ == '__main__':
+    import optparse
+    import sys
+    
+    
+    # Constants
+    USAGE = """\
+Usage: panda_worker [options] --mode=MODE NIGHT_FILE ID_FILE OUT_FILE
+
+  --instance INSTANCE_NAME: name of MOPS instance to process, optional
+  --mode MODE : MODE must be 'attrib' or 'precov'
+  NIGHT_FILE : input list of night numbers to process
+  ID_FILE: input list of derived objects IDs to process
+  OUT_FILE : output filename
+ """
+    
+    # Get user input (tracks file) and make sure that it exists.
+    parser = optparse.OptionParser(USAGE)
+    parser.add_option('--instance',
+                      dest='instance_name',
+                      type='str',
+                      help="MOPS instance name")
+    parser.add_option('--mode',
+                      dest='mode',
+                      type='str',
+                      help="precov or attrib mode")
+
+    # Debuggish.
+    parser.add_option("-v",
+                      action="store_true",
+                      dest="verbose",
+                      default=False)
+    
+    options, args = parser.parse_args()
+
+    # Make sure that we have what we need.
+    if not options.instance_name:
+        options.instance_name = os.environ.get('MOPS_DBINSTANCE', None)
+    if not options.instance_name:
+        parser.error('--instance must be specified.')
+    if not options.mode:
+        parser.error('--mode=precov or --mode=attrib must be specified.')
+        
+    if len(args) < 3:
+        parser.error('Wrong number of arguments.')
+    
+    nn_list = _parse_list_file(args[0])
+    do_id_list = _parse_list_file(args[1])
+    output_filename = args[2]
+
+    mops_instance = MOPS.Instance.Instance(dbname=options.instance_name)
+    mops_config = mops_instance.getConfig()
+    mops_dbh = mops_instance.get_dbh()
+
+    # Get other stuff from config.
+    main_config = mops_config['main']
+    site_config = mops_config['site']
+    options.obscode = site_config['obscode']
+    options.gmt_offset_hours = int(site_config['gmt_offset_hours'])
+    options.fov_shape = site_config['field_shape']     # 'square' or 'circular'
+    options.fov_area_deg2 = float(site_config['field_size_deg2'])
+
+    correction = options.limiting_mag_correction = float(mops_config['site'].get('limiting_mag_correction', '0'))
+    options.limiting_mag = float(mops_config['site']['limiting_mag']) + correction
+
+    # Panda-related options.
+    panda_config = mops_config['panda']
+    options.delta_mjd = 1.0
+    options.mag_delta = float(panda_config['mag_delta'])
+    options.max_search_radius_arcsec = float(panda_config['max_search_radius_arcsec'])
+    options.lsd_max_search_radius_arcsec = float(panda_config.get('lsd_max_search_radius_arcsec', 600.))
+    options.iod_only_search_radius_arcsec = float(panda_config.get('iod_only_search_radius_arcsec', 600.))
+    options.min_search_radius_arcsec = float(panda_config['min_search_radius_arcsec'])
+    options.max_arclength_for_iod = float(panda_config['max_arclength_for_iod'])
+    options.uncertainty_sigma = float(panda_config['uncertainty_sigma'])
+    options.min_probability = float(panda_config.get('min_probability', 0.0))
+    options.minv_degperday = float(panda_config.get('minv_degperday', 0.0))
+
+    # Orbit stability options.
+    stability_config = mops_config['orbit_stability']
+    options.min_arclength_days = float(stability_config['min_arclength_days'])
+    options.min_time_range_days = float(stability_config['min_time_range_days'])
+    options.max_uncertainty_arcsec = float(stability_config['max_uncertainty_arcsec'])
+
+    # Panda orbit determination options.  Allow overriding of the IOD and diffcor
+    # programs in our panda config section.
+    od_config = mops_config['orbit_determination']
+    options.iod_program = panda_config.get('iod_program', None) or od_config['iod_program']
+    options.diffcor_program = panda_config.get('diffcor_program', None) or od_config['diffcor_program']
+    options.fallback_iod_arcsec = float(panda_config['fallback_iod'])
+    options.resid_threshold_arcsec = float(panda_config['resid_threshold_arcsec'])
+
+    # LSD options.
+    lsd_config = mops_config['lsd']
+    options.lsd_enable = int(main_config['enable_lsd'])
+    options.lsd_rootdir = os.path.join(lsd_config['lsd_rootdir'], options.instance_name)
+    options.hsd_s2n_cutoff = float(lsd_config['hsd_s2n_cutoff'])
+    options.lsd_tti_size = mops_config['tracklet']['minobs']
+
+
+    # Setup a simple logger to stdout.
+    mops_logger = logging.getLogger()
+#    streamHandler = logging.StreamHandler(sys.stdout)
+#    streamHandler.setFormatter(logging.Formatter('%(asctime)s %(message)s', '%Y/%m/%d %H:%M:%S'))
+#    mops_logger.addHandler(streamHandler)
+    mops_logger.setLevel(logging.INFO)
+
+    # Dump our invocation string for debuggage.
+    mops_logger.info(' '.join(sys.argv))
+
+    # Get our derived objects (actually just their names and orbits -- no detections yet).
+    if options.mode == 'precov':
+        # Precov mode: Only retrieve objects that do not have "stable" orbits
+        # (in the MOPS sense).  This means that their orbit's uncertainty has
+        # not collapsed to the point that we no longer need to precover it.
+        dobj_list = filter(
+            lambda x: x.stablePass == 'N', 
+            [DerivedObject.fetch(mops_dbh, do_id, fetchTracklets=False) for do_id in do_id_list]
+        )
+    else:
+        # Attrib mode: always process all objects.
+        dobj_list = [DerivedObject.fetch(mops_dbh, do_id, fetchTracklets=False) for do_id in do_id_list]
+    # <- if options.mode
+
+    # Everything is fine, set the ball rolling!
+    master_results_list = []
+
+    for nn in nn_list:
+        process_night(
+            master_results_list,
+            mops_instance,
+            mops_dbh,
+            mops_logger,
+            nn,
+            dobj_list,
+            options,            # manufactured options block
+        )
+    # <- for
+
+    # If we're in precov mode, compute orbit stability information for all our orbits.
+    ttt = timer(mops_logger)
+    if options.mode == 'precov':
+        stability_data = compute_orbit_stability(mops_dbh, dobj_list, min(nn_list), max(nn_list), options.obscode,
+            options.min_time_range_days, options.min_arclength_days, options.max_uncertainty_arcsec)
+    else:
+        stability_data = []
+    ttt.mark('STABILITY')
+
+    # Now write our results for all processed nights.
+    everything = {
+        'ASSIGNMENTS': master_results_list,
+        'STABLE' : stability_data,              # eventually fill with stable object IDs
+    }
+    pickle.dump(everything, file(output_filename, 'wb'), protocol=2)
+
+#    exit(0)                 # bye!
+
+# <-- if __name__

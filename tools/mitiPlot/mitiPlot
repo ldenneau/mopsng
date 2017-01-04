@@ -1,0 +1,249 @@
+#!/usr/bin/env perl
+# $Id: mitiPlot 2258 2008-01-16 03:39:51Z denneau $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Params::Validate;
+use File::Temp qw(tempfile);
+
+use PS::MOPS::MITI;
+
+
+my $LINESTYLES = <<"LINESTYLES";
+set style line 1 lt 1
+set style line 2 lt 2
+set style line 3 lt 3
+set style line 4 lt 4
+set style line 5 lt 5
+set style line 6 lt 6
+set style line 7 lt 7
+LINESTYLES
+
+
+
+my $nodelete;
+my $title;
+my $xu = '';     # x units
+my $yu = '';     # y units
+my ($xmin, $xmax, $ymin, $ymax);
+
+my $bynight;        # aggregate by night (integer epoch)
+my $seghack;
+my $indiv_object_labels;
+my $autoscale;
+my $terminal;
+my $postscript;
+my $postscriptc;
+my $eps;
+my $epsc;
+my $png;
+my $nokey;
+my $spots;
+my $help;
+
+GetOptions(
+    'title=s' => \$title,
+    'xu=s' => \$xu,
+    'yu=s' => \$yu,
+    'xmin=f' => \$xmin,
+    'xmax=f' => \$xmax,
+    'ymin=f' => \$ymin,
+    'ymax=f' => \$ymax,
+
+    bynight => \$bynight,   
+    indiv_object_labels => \$indiv_object_labels,   
+    seghack => \$seghack,           # hack to segregate based on last column
+    autoscale => \$autoscale,
+    'terminal=s' => \$terminal,
+    postscriptc => \$postscriptc,
+    postscript => \$postscript,
+    eps => \$eps,
+    epsc => \$epsc,
+    png => \$png,
+    nokey => \$nokey,
+    nodelete => \$nodelete,
+    spots => \$spots,               # plot using sized spots instead of Xs
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+
+
+# Scrub opts.
+$terminal = 'postscript solid' if $postscript or $eps;
+$terminal = 'postscript enhanced color solid' if $postscriptc or $epsc;
+$terminal = 'png' if $png;
+
+my $plotcmd = $spots ? 'splot' : 'plot';
+
+
+# gnuplot linetype pointtype vars
+my $lt = 1;
+my $pt = 1;
+sub _plot {
+    # Use gnuplot to plot detection or observation data.  A descriptor
+    # for the data to be plotted is passed in as data => [], which should
+    # be an arrayref of arrayrefs.  Each array is concatenated into a single
+    # inline plot for gnuplot using "plot '-'".
+    my %args = validate(@_, {
+        data => 1,      # array ref of array refs
+        xrange => 0,
+        yrange => 0,
+        cols => 0,
+        title => 0,
+        keylist => 0,
+    });
+    my $xrange = defined($args{xrange}) ? "set xrange $args{xrange} reverse" : 'set xrange [] reverse';
+    my $yrange = defined($args{yrange}) ? "set yrange $args{yrange}" : '';
+    my $cols = $args{cols};
+    my $title_str = ($title or $args{title} or "Untitled");
+
+    # Write data to tmp file; call gnuplot in bg; rm tmp file.
+    my ($fh, $filename) = tempfile('/tmp/mitiPlotXXXXX', SUFFIX => '.txt');
+    print $fh "set terminal $terminal\n" if $terminal;
+    print $fh "set nokey\n" if $nokey;
+    print $fh "set title '$title_str'\n";
+
+    printf $fh <<"GNUPLOT";
+$xrange
+$yrange
+set xlabel 'RA ($xu)'
+set ylabel 'DEC ($yu)'
+set view map
+$plotcmd \\
+GNUPLOT
+
+    my $got_data;   # flag if we have any data to plot
+    my $last;       # indicates last iter through data list
+    my $keyindex = 0;   # index into keys list, for per-object type titles in GNUPlot key
+    my $keytitle;
+
+    foreach my $d (@{$args{data}}) {
+        $last = ($d == $args{data}->[-1]);
+        $got_data = 1 if @{$d};     # test we actually have some data
+
+        $keytitle = $args{keylist} ? $args{keylist}->[$keyindex] : $title;
+
+        if ($spots) {
+            printf $fh <<"GNUPLOT", ($last ? '' : ',\\');
+"-" using $cols with points lt palette pt 7 ps var title '$keytitle'%s
+GNUPLOT
+        }
+        else {
+            printf $fh <<"GNUPLOT", ($last ? '' : ',\\');
+"-" using $cols title '$keytitle' lt $lt pt $pt ps var%s
+GNUPLOT
+        }
+
+        $lt = $lt % 16 + 1;
+        $pt = $pt % 16 + 1;
+        $keyindex++;
+    }
+
+    foreach my $d (@{$args{data}}) {
+        print $fh @{$d};
+        print $fh "e\n";    # end of data
+    }
+
+    close $fh;
+
+    if ($got_data) {
+        if ($terminal) {
+            system "gnuplot $filename";
+        }
+        else {
+            system "gnuplot -persist $filename";
+        }
+        (unlink $filename or warn "can't unlink $filename") unless $nodelete;
+    }
+}
+
+
+# Read MITI data from STDIN:
+# ID EPOCH_MJD RA_DEG DEC_DEG MAG OBSCODE OBJECT_NAME
+my $line;
+my %datadata;
+
+my ($id, $epoch_mjd, $ra_deg, $dec_deg, $mag, $obscode, $object);
+my $prefix;
+my $sz;         # plot point size, based on mag
+
+while (defined($line = <>)) {
+    next if $line =~ /^#/;  # skip comments
+    ($id, $epoch_mjd, $ra_deg, $dec_deg, $mag, $obscode, $object) = split /\s+/, $line;
+
+    if ($bynight) {
+        $prefix = int($epoch_mjd);
+    }
+    elsif ($seghack and $object) {
+        $prefix = substr($object, 0, 2);
+        $prefix = 'XX' unless $prefix =~ m/^(S0|S\d|ST|St|SC|Sc|SS)/;
+    }
+    elsif ($indiv_object_labels) {
+        $prefix = $object;
+    }
+    else {
+        $prefix = '';        # dummy to aggregate all data in one list
+    }
+    $sz = $mag > 20 ? 1 : (21 - $mag);
+    push @{$datadata{$prefix}}, "$ra_deg, $dec_deg, $sz, $sz\n";
+}
+
+if (%datadata) { 
+    # Plot wants ARRAYREF of ARRAYREFs.
+    my @args = (
+#        data => [\@data],
+        data => [ map { $datadata{$_} } sort keys %datadata],
+        keylist => [ sort keys %datadata ],
+        cols => $spots ? '1:2:3:4' : '1:2', 
+        title => ($title or 'Data'),
+    );
+    if (defined($xmin)) {
+        push @args, (xrange => "[$xmin:$xmax]", yrange => "[$ymin:$ymax]");
+    }
+    else {
+        push @args, (xrange => '[0:360]', yrange => '[-90:90]') unless $autoscale; 
+    }
+    _plot(@args);
+}
+
+=head1 NAME
+
+mitiPlot - Program to plot MITI data using GNUPlot
+
+=head1 SYNOPSIS
+
+mitiPlot [--title "TITLE"] [--autoscale]
+    [--terminal DEVICE] [--postscript|postscriptc|eps|epsc] [--png] [--nokey]
+    [--nodelete]
+    [--help]
+
+    --title "TITLE" : use TITLE as plot title
+    --xu XUNITS : specify X units string
+    --yu UUNITS : specify Y units string
+    --autoscale : always autoscale RA and DEC (--mjd by default scales to full sky)
+    --terminal DEVICE : set gnuplot terminal to DEVICE; write output to stdout
+    --postscript|eps : abbreviation for "--terminal postscript"
+    --postscriptc|epsc : abbreviation for "--terminal 'postscript enhanced color'"
+    --png : abbreviation for "--terminal png"
+    --nokey : 'set nokey' in GNUPlot; hides key/legend
+    --nodelete : don't delete temporary GNUPlot files (for debugging)
+    --help : show usage and examples in manpage format
+
+=head1 DESCRIPTION
+
+Reads MITI data in STDIN and plots using GNUPlot.  Each line of data should be
+in the format
+
+ID EPOCH_MJD RA_DEG DEC_DEG MAG OBSCODE OBJECT_ID
+
+only RA_DEG and DEC_DEG really matter though.
+
+=head1 SEE ALSO
+
+PS::MOPS::MITI
+
+=cut
+

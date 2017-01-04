@@ -1,0 +1,5 @@
+#!/bin/sh
+
+swig -perl5 -I${MOPS_HOME}/include Utilities.i
+g++ -c Utilities_wrap.c -I/usr/lib/perl5/5.8.0/i386-linux-thread-multi/CORE -I${MOPS_HOME}/include
+g++ -shared Utilities_wrap.o -lmodc -locci -lclntsh -L/usr/lib/oracle/10.1.0.2/client/lib -L${MOPS_HOME}/lib -o Utilities.so

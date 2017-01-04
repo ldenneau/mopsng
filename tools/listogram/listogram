@@ -1,0 +1,179 @@
+#!/usr/bin/perl
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::Lib qw(:all);
+
+# Start program here.
+my $binsize;
+my $bins = 10;
+my $normalize;                          # divide y-axis by number of values, then * 100
+my $log;                                # compute log10() of Y values
+my $column = 0;
+my $cumul;
+my $title = '';
+my $xtitle = '';
+my $ytitle = 'Frequency';
+my $terminal = '';
+my $xsize = 1024;
+my $ysize = 768;
+my $help;
+GetOptions(
+    normalize => \$normalize,
+    'column=i' => \$column,
+    'binsize=f' => \$binsize,
+    'bins=f' => \$bins,
+    'log' => \$log,
+    help => \$help,
+    cumul => \$cumul,
+    'terminal=s' => \$terminal,
+    'title=s' => \$title,
+    'xtitle=s' => \$xtitle,
+    'ytitle=s' => \$ytitle,
+    'xsize=s' => \$xsize,
+    'ysize=s' => \$ysize,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $LOG10 = log(10);
+
+
+my @vals;
+while (<>) {
+    next if /^#/;
+    @F = split /\s+/;
+    push @vals, $F[$column];
+}
+
+# If $bins is specified, calculate the min/max of the input data and
+# compute a binsize from that.
+my $hist;
+if ($binsize) {
+    $hist = mopslib_histogram(
+        data => \@vals,
+        binsize => $binsize,
+    );
+}
+else {
+    $hist = mopslib_histogram(
+        data => \@vals,
+        bins => $bins,
+    );
+}
+
+# If --log is set, take log of the bin counts.
+my @data = @{$hist->{hist}};
+if ($log) {
+    @data = map { $_ <= 0 ? 0 : log($_) / $LOG10 } @data; 
+    $ytitle = "log10($ytitle)";
+}
+
+my @lines;
+$x0 = $hist->{min};
+$n = 0;
+foreach my $x (@data) {
+    if ($normalize) {
+        push @lines, sprintf "%f %f\n", $x0 + $n * $hist->{binsize},  100 * ($x / @vals); # normalize to pct
+    }
+    else {
+        push @lines, sprintf "%f %f\n", $x0 + $n * $hist->{binsize}, $x;
+    }
+    $n++;
+}
+
+
+
+# Histogram stuff.
+my $line;
+my $gnuplot = new FileHandle "|gnuplot -persist";
+my $size_str = '';
+if ($terminal eq 'png') {
+    $size_str = "size $xsize, $ysize font arial 8"
+}
+
+print $gnuplot <<"EOF" if $terminal;
+set fontpath "/usr/lib/X11/fonts/TTF"
+set terminal $terminal $size_str
+EOF
+
+
+
+if ($cumul) {
+    print $gnuplot <<"EOF";
+set title '$title'
+set xlabel '$xtitle'
+set ylabel '$ytitle'
+plot \\
+"-" using 1:2 title '$xtitle' with boxes fs solid,\\
+"-" using 1:3 title '$ytitle' with lines
+EOF
+
+    my $line;
+    my @vals;
+    foreach $line (@lines) {
+        print $gnuplot $line;
+    }
+    print $gnuplot <<"EOF";
+e
+EOF
+
+}
+else {
+    if ($title) {
+        print $gnuplot <<"EOF";
+set title '$title'
+EOF
+    }
+    else {
+        print $gnuplot <<"EOF";
+set notitle
+EOF
+    }
+
+    print $gnuplot <<"EOF";
+set xlabel '$xtitle'
+set ylabel '$ytitle'
+plot \\
+"-" using 1:2 title '$xtitle' with boxes fs solid
+EOF
+
+    my $line;
+    my @vals;
+    foreach $line (@lines) {
+        print $gnuplot $line;
+    }
+
+    print $gnuplot <<"EOF";
+e
+EOF
+}
+
+
+=head1 NAME
+
+listogram - Generate a GNUPlot histogram of a list of data.
+
+=head1 SYNOPSIS
+
+listogram [options] < data
+
+  --bins N : partition data into N bins, default 10
+  --binsize B : use B as binsize for data
+  --normalize : normalize Y values to 0-1
+  --column : column number to use from table, default 0
+  --cumul : plot cumulative column as well
+  --title TITLE : specify plot title
+  --xtitle STR : specify X axis title
+  --ytitle STR : specify Y axis title
+  --terminal=FOO : specify GNUPlot terminal type, png/gif/eps/epsc
+
+=head1 DESCRIPTION
+
+Extracts specified column and computes the histogram.  If --bins is specified, it
+overrides --binsize.
+
+=cut
+

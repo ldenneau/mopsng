@@ -1,0 +1,89 @@
+#!/usr/bin/env perl
+
+# Given an list of postfit residuals of the form
+#
+#   TRACK_ID EPOCH_UT_MJD RA_RESID_ARCSEC DEC_RESID_ARCSEC
+#
+# where TRACK_ID consists of concatenated tracklet IDs, produce
+# a file of format
+#
+#   TRACK_ID TRACKLET_ID DET_ID RA_RESID_ARCSEC DEC_RESID_ARCSEC
+#
+# that can be used to perform residual trend analyses against the
+# tracklets.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Slurp;
+
+use PS::MOPS::DC::Instance;
+
+
+my $inst;
+my $instance_name;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(3) unless $reffile;
+
+my ($infile, $outfile) = @ARGV;
+die "can't find $infile" unless -e $infile;
+die "can't find $outfile" unless -e $outfile;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+
+
+my $dbh = $inst->dbh;
+my $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select ta.det_id det_id, ta.tracklet_id tracklet_id, d.epoch_mjd epoch_mjd
+from detetions d join tracklet_attrib ta using (tracklet_id)
+where ta.tracklet_id=?
+order by d.epoch_mjd
+SQL
+
+# Read input file.
+my $line;
+my ($track_id, $epoch_ut_mjd, $ra_resid_arcsec, $dec_resid_arcsec);
+my (@tracklet_ids);
+my $tid;
+my @ary;
+
+my $infh = new FileHandle $infile or die "can't open $infile";
+while ($line = <$infh>) {
+    next if /^(#|!)/;       # comment, skip
+    ($track_id, $epoch_ut_mjd, $ra_resid_arcsec, $dec_resid_arcsec) = split /\s+/
+    @tracklet_ids = split /=/, $track_id;
+    foreach $tid (@tracklet_ids) {
+        $sth->execute($tid) or die $sth->errstr;
+        while (@ary = $sth->fetchrow_array()) {
+        }
+    }
+}
+$infh->close();
+
+=head1 NAME
+
+patchPostfitResiduals - Convert JPL SSD postfit residuals to a useful format that contains tracklet
+and detection IDs
+
+=head1 SYNOPSIS
+
+patchPostfitResiduals INPUT OUTPUT
+
+    INPUT : input file from mopsdiffcor
+    OUTPUT : patched file
+
+=head1 DESCRIPTION
+
+=head1 SEE ALSO
+
+mopsdiffcor
+
+=cut

@@ -1,0 +1,297 @@
+#! /usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Carp;
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Copy;
+use File::Basename;
+use File::Temp qw(tempfile tempdir);
+
+use PS::MOPS::FITS::IPP;
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+
+use subs qw(
+    dump_file
+    submit_to_datastore
+);
+
+
+my $instance_name;
+my $inst;
+my $gmt_offset_hours;
+
+my $stationrad_thresh_deg = 0.00026;      # default, about 1.0 arcsec
+my $out_filename;
+my $suffix = 'REMOVED';
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'stationrad_thresh_deg=f' => \$stationrad_thresh_deg,
+    'suffix=s' => \$suffix,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+my ($file1, $file2) = @ARGV;
+pod2usage(-msg => 'FILE1.fits and FILE2.fits must be specified') unless $file1 and $file2;
+
+
+my $f1_href = {};               # table of field metadata
+my $d1_href = {};
+my $f2_href = {};               # table of field metadata
+my $d2_href = {};
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+$gmt_offset_hours = $inst->getConfig()->{site}->{gmt_offset_hours};
+die "can't get gmt_offset_hours" unless defined($gmt_offset_hours);
+my $mops_logger = $inst->getLogger();
+
+my $src1_fits = grab_file($f1_href, $d1_href, $file1);
+my $src2_fits = grab_file($f2_href, $d2_href, $file2);
+
+do_stationary($d1_href, $d2_href);
+
+my ($tmp_fh, $tmp_filename);
+
+$tmp_filename = "$file1.$suffix";
+#$tmp_filename =~ s/fits$/REMOVE.fits/;
+$tmp_fh = new FileHandle ">$tmp_filename" or $mops_logger->logdie("can't create $tmp_filename");
+write_fits($src1_fits, $tmp_filename, $f1_href, $d1_href);
+
+$tmp_filename = "$file2.$suffix";
+#$tmp_filename =~ s/fits$/REMOVE.fits/;
+$tmp_fh = new FileHandle ">$tmp_filename" or $mops_logger->logdie("can't create $tmp_filename");
+write_fits($src2_fits, $tmp_filename, $f2_href, $d2_href);
+
+exit;
+
+
+sub grab_file {
+    my ($field_href, $stuff, $filename) = @_;
+    my $table = new PS::MOPS::FITS::IPP;
+    $table->openfile($filename);
+
+    my ($epoch_mjd, $obscode, $filter);
+    $epoch_mjd = $table->keyval('MJD-OBS');
+    $obscode = $table->keyval('OBSCODE');
+    $filter = substr($table->keyval('FILTER'), 0, 1);
+
+    print STDERR "Reading $filename.\n";
+    do_fits($stuff, $table);
+    %{$field_href} = %{$table->{_keys}};
+    $table->closefile();
+
+    return $table;
+}
+
+
+sub do_fits {
+    # Read the FITS skycell table and accumulate in $stuff.
+    my ($stuff, $skycell_table) = @_;
+    my @data;
+    my $rownum = 0;
+    while (@data = $skycell_table->readrecord()) {
+        my ($ra_deg, $ra_sigma_deg, $dec_deg, $dec_sigma_deg, $mag, $mag_sigma, $starpsf,
+            $ang_deg, $ang_sig_deg, $len_deg, $len_sig_deg, $flags, $proc_id) = @data;
+        my $det_id = sprintf("%09d", $rownum);
+        $stuff->{$det_id} = [@data];
+        $rownum++;
+    }
+}
+
+
+sub do_stationary {
+    # Process the current set of detections in $stuff, send it to the cleaners, and
+    # remove anything that was scrubbed by astroclean.
+    my ($d1_stuff, $d2_stuff) = @_;
+    my $det_id;
+    my $dir = tempdir(CLEANUP => 1, DIR => '/tmp');
+    my ($ac_infh, $ac_infilename) = tempfile(DIR => $dir);
+    my ($ra_deg, $dec_deg, $ra_sigma_deg, $dec_sigma_deg, $flux, $flux_sigma);
+    my $mag;
+    my %d1_keep_stuff;
+    my %d2_keep_stuff;
+
+    # Write out the detections from both files to a single file, using a common
+    # epoch_mjd so that they appear to astroClean to be in the same field.  Rewrite the ID
+    # so that we can back out which file the detections came from.
+    my $fake_epoch_mjd = '0.0000';
+    my $fake_obscode = 'PS1';
+
+    foreach $det_id (keys %{$d1_stuff}) {
+        ($ra_deg, $dec_deg, $ra_sigma_deg, $dec_sigma_deg, $flux, $flux_sigma) = @{$d1_stuff->{$det_id}};
+        $mag = $flux;
+        print $ac_infh join(' ', 'A'.$det_id, $fake_epoch_mjd, $ra_deg, $dec_deg, $mag, $fake_obscode), "\n";
+    }
+
+    foreach $det_id (keys %{$d2_stuff}) {
+        ($ra_deg, $dec_deg, $ra_sigma_deg, $dec_sigma_deg, $flux, $flux_sigma) = @{$d2_stuff->{$det_id}};
+        $mag = $flux;
+        print $ac_infh join(' ', 'B'.$det_id, $fake_epoch_mjd, $ra_deg, $dec_deg, $mag, $fake_obscode), "\n";
+    }
+    $ac_infh->close();
+
+    # Set up some astroclean options.  We always want to remove overlaps from skycells.  But we
+    my $stationrad_str = "stationrad $stationrad_thresh_deg";
+
+    my ($ac_outfh, $ac_outfilename) = tempfile(DIR => $dir);
+    $ac_outfh->close();                         # just need filename, not fh
+    #astroclean file $ac_infilename outtype 1 density 1000 Dradius .0010 proxrad $proxrad_thresh_deg clean_file $ac_outfilename
+    my $cmd = <<"EOF";
+astroclean file $ac_infilename outtype 1 $stationrad_str clean_file $ac_outfilename
+EOF
+    system($cmd) == 0 or die "command failed: $? : $cmd";
+
+    # Read output file into table, return table.
+    $ac_outfh = new FileHandle $ac_outfilename;
+    my $line;
+    my $remainder;
+    my ($epoch_mjd, $obscode);
+    my $prefix;
+    while (defined($line = <$ac_outfh>)) {
+        next if $line =~ /^(!|#)/;   # comment, skip
+        chomp $line;
+        ($det_id, $remainder) = split /\s+/, $line, 2;
+        $prefix = substr($det_id, 0, 1);
+        if ($prefix eq 'A') {
+            $d1_keep_stuff{substr($det_id, 1)} = 1;     # strip leading character to get field 1 det ID
+        }
+        elsif ($prefix eq 'B') {
+            $d2_keep_stuff{substr($det_id, 1)} = 1;     # strip leading character to get field 1 det ID
+        }
+        else {
+            die "bogus det prefix: $prefix";
+        }
+    }
+    $ac_outfh->close();
+
+    unlink $ac_infilename;
+    unlink $ac_outfilename;
+    rmdir $dir or die "can't remove dir $dir";
+
+    # Now walk through our table of stuff and throw out anything that's not in the keep table.
+    my $num_removed;
+
+    foreach my $key (keys %{$d1_stuff}) {
+        delete ${$d1_stuff}{$key} unless exists($d1_keep_stuff{$key});
+    }
+    foreach my $key (keys %{$d2_stuff}) {
+        delete ${$d2_stuff}{$key} unless exists($d2_keep_stuff{$key});
+    }
+}
+
+
+sub write_fits {
+    # Should really go in PS::MOPS::FITS::IPP.
+    my ($src_fits, $filename, $field_href, $dets_href) = @_;
+    my $t = new PS::MOPS::FITS::IPP;
+
+    my $force = 1;      # force file overwrite
+    my $filter = substr($field_href->{FILTER}, 0, 1);
+
+    $t->createfile($filename, $force, %{$src_fits->{_keys}});
+
+    my ($det_id, $det);
+    while (($det_id, $det) = each %{$dets_href}) {
+        # Our flux and flux_sigma are really mag and mag_sigma.  So convert them 
+        # back.
+        $t->writerecord(@{$det});
+    }
+}
+
+
+sub submit_to_datastore {
+    my ($src_file, $inst) = @_;
+    my ($destdir) = '/usr/local/MOPS_DEV/ds/dsroot/det';
+    my $dbname = $inst->dbname();
+
+    my $fh = new FileHandle;
+
+    my ($sec,$min,$hour,$mday,$mon,$year) = gmtime(time);
+    $mon++;
+    $year += 1900;
+
+    my $state = "N";
+    my $default_ds_type = 'DETECTION';
+
+    # See if the directory exists.  If not, create it and initialize
+    # the count file and index.
+    my $dbdir = $destdir . "/" . $dbname;
+    my $index = $destdir . "/index";
+    my @dbstat = stat($dbdir);
+
+    unless (@dbstat) {
+        print STDERR "Initializing datastore.\n";
+
+        # Create the per-instance directory.
+        mkdir($dbdir, 0777);
+        chmod(0777, $dbdir);
+
+        open($fh, ">$dbdir" . "/count");
+        flock($fh, 2);
+        chmod(0666, $dbdir . "/count");
+        print $fh "0\n";
+        close $fh;
+
+        open($fh, ">$dbdir" . "/index");
+        flock($fh, 2);
+        chmod(0666, $dbdir . "/index");
+        close $fh;
+
+        # Create an entry in the root index.
+        open($fh, ">>$index");
+        flock($fh, 2);
+        chmod(0666, $index);
+        printf($fh "%s|%04d-%02d-%02dT%02d:%02d:%02d|%s\n",
+            $dbname,
+            $year, $mon, $mday, $hour, $min, $sec, 'INSTANCE');
+        close $fh;
+    }
+
+    # If $src_file was specified, copy it to the DataStore.  This gives us a cheap
+    # way of initializing the sim's datastore area by passing $src_file=undef.
+    if ($src_file) {
+        # Read and increment the count number.
+        my $count;
+
+        open($fh, "+<$dbdir/count");
+        flock($fh, 2);
+        chmod(0666, "$dbdir/count");
+        $count = <$fh>;
+        chomp($count);
+        seek($fh, 0, 0);
+        print $fh $count + 1 . "\n";
+        close $fh;
+
+        # Send the file.
+        my $output_file = sprintf("%s/%.05d", $dbdir, $count);
+        copy($src_file, $output_file);
+
+        open($fh, ">>$dbdir/index");
+        flock($fh, 2);
+        printf($fh "%.05d|%04d-%02d-%02dT%02d:%02d:%02d|%s|%s\n",
+            $count,
+            $year, $mon, $mday, $hour, $min, $sec,
+            $default_ds_type, $state);
+        close($fh);
+    }
+}
+
+
+
+
+=head1 SYNOPSIS
+
+removeStationaries [options] FILE1.fits FILE2.fits
+
+=head1 DESCRIPTION
+
+Given two FITS files contain warp catalogs (presumably), remove
+detections that lie within some specified distance from each other.
+Write both TTI exposures to the datastore.
+
+=cut

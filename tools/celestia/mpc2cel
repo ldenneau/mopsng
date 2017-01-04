@@ -1,0 +1,72 @@
+#!/usr/bin/env perl
+#
+use strict;
+use warnings;
+
+use Astro::Time;
+
+sub cvt {
+    my ($line) = @_;
+#
+#Designation (and name)     Prov. Des.     q       Q     EMoid     H     Epoch      M    Peri. Node   Incl.  e      a      Opps.     Ref.      Designation (and name)                  Discovery date, site and discoverer(s)
+#                           2011 GN44    0.898   2.997  0.04298   18.3   20110208  258.9  326.0  15.9  49.2 0.539   1.948  (  3d)   E2011-G51                             2011 GN44     2011 04 03  F51  Pan-STARRS 1
+#
+# prov desig      q       Q     EMoid     H     Epoch      M    Peri. Node   Incl.  e      a      Opps.     Ref.      Designation (and name)                  Discovery date, site and discoverer(s)
+# 0    1       2       3      4         5      6         7      8      9     10   11      12    
+# 2011 GN44    0.898   2.997  0.04298   18.3   20110208  258.9  326.0  15.9  49.2 0.539   1.948  (  3d)   E2011-G51                             2011 GN44     2011 04 03  F51  Pan-STARRS 1
+
+    $line = substr($line, 27);
+    my @toks = split /\s+/, $line;
+
+    my $id = "$toks[0] $toks[1]";
+    my ($q_AU, $e, $i_deg, $node_deg, $arg_peri_deg, $M, $epoch_date, $H) = @toks[2, 11, 10, 9, 8, 7, 6, 5];
+    my $a_AU = $q_AU / (1 - $e);
+    my $epoch_jd = date2mjd($epoch_date) + 2_400_000.5;
+    my $radius_km = (1329 * 10 ** (-0.25 * $H)) / .316 / 2 * 1000;
+    my $period_y = sprintf("%.6f", ($a_AU ** 1.5));
+
+    my $foo = <<"TEMPLATE";
+# $id
+# "name of object"  "name of primary"
+  "$id"       "Sol"
+{
+        Class   "astroid"
+        Texture "asteroid.jpg"
+        Mesh    "asteroid.cms"
+        Radius         $radius_km
+        RotationPeriod 11.34  # arbitrary
+
+        EllipticalOrbit
+         {
+                 Period                $period_y
+                 PericenterDistance    $q_AU
+                 Eccentricity          $e
+                 Inclination           $i_deg
+                 AscendingNode         $node_deg
+                 ArgOfPericenter       $arg_peri_deg
+                 MeanAnomaly           $M
+                 Epoch                 $epoch_jd
+         }
+
+}
+TEMPLATE
+
+    return $foo;
+}
+
+
+my $line;
+while (defined($line = <>)) {
+    next if $line =~ /^(#|!)/;
+    next if $line =~ /^Designation/;
+    chomp $line;
+    print cvt($line);
+}
+exit;
+
+sub date2mjd {
+    my ($date) = @_;
+    my ($y, $m, $d) = ($date =~ /^(\d\d\d\d)(\d\d)(\d\d)$/);
+    die "bogus date $date" unless ($y and $m and $d);
+    return cal2mjd($d, $m, $y, 0);
+}

@@ -1,0 +1,271 @@
+#!/usr/bin/env perl
+#
+=head1 NAME
+
+findttis - Locate TTI footprints in observation data
+
+=head1 SYNOPSIS
+
+findttis [options] < INPUT
+
+  --datastore : specifies that data is in PS1 GPC datastore format
+  --first : only emit first boresight from a TTI
+  --comments : append field comments
+
+=head1 DESCRIPTION
+
+This program searches a list of historic telescope pointings and produces
+a list of TTI footprints in the data; that is, locations and observation
+IDs corresponding to a set of fields satisfying discovery requirements
+for an asteroid in MOPS.
+
+=head1 FORMAT
+
+Unless --datastore is specified, fields should have the format
+
+EXP_ID EXTRA FILTER RA_DEG DEC_DEG EPOCH_MJD
+
+=head1 DATASTORE FORMAT
+
+The datastore format is a text format as follows:
+
+# Fields are ID|TIME_STR|TYPE|DESC|EXP_TIME_SEC|FILT|AIRMASS|COMMENTS
+
+where 
+
+  ID : camera observation ID
+  TIME_STR : time of observation in YYYY-MM-DDTHH:MM:SSZ format
+  DESC : general description, ignored
+  EXP_TIME_SEC : exposure time in seconds
+  FILTER : g/r/i/z/y/w filter designation
+  AIRMASS : airmass of observation
+  COMMENTS : comments
+
+=cut
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use List::Util qw(min max);
+
+use Astro::Time;
+use Astro::SLA;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+
+# Given a whole pile of ID/EPOCH_MJD/RA/DEC, group them by pointing, then
+# figure out which pointings satisfy some cadence requirement.
+
+my $gmt_offset_hours = -10; # Haleakala
+my $min_tti_span_min = 10;
+my $max_tti_span_min = 45;
+my $min_tuples = 3;
+my $ecl_limit_deg = 90;     # only emit TTIS with dec < ecl_limit_deg
+my $first;
+my $datastore;
+my $comments;
+my $help;
+GetOptions(
+    'min_tuples=i' => \$min_tuples,
+    'ecl_limit_deg=f' => \$ecl_limit_deg,
+    first => \$first,
+    datastore => \$datastore,
+    comments => \$comments,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+
+my $num_footprints = 0;
+my %pointings;
+my @all_lines = <>;
+my $line;
+my $key;
+my ($id, $name, $filt, $ra, $dec, $epoch_mjd);
+my ($el, $eb);
+my $comment;
+
+foreach $line (@all_lines) {
+    chomp $line;
+    next if $line =~ /^\s*$/;   # empty line
+    next if $line =~ /^#/;      # comment
+
+    ($id, $name, $filt, $ra, $dec, $epoch_mjd, $comment) = get_line($line, $datastore);
+
+    slaEqecl($ra / $DEG_PER_RAD, $dec / $DEG_PER_RAD, $epoch_mjd, $el, $eb);
+    $eb *= $DEG_PER_RAD;
+    next if $eb >= $ecl_limit_deg;
+
+
+    # Create a key that we'll use to decide whether two pointings are the same.
+#    $key = sprintf("%.6f", $ra) . ':' . sprintf("%.6f", $dec); 
+#    $key = sprintf("%.3f", int($ra * 1000) / 1000) . ':' . sprintf("%.3f", int($dec * 1000) / 1000); 
+    $key = sprintf("%.1f", int($ra * 10 + 0.5) / 10) . ':' . sprintf("%.1f", int($dec * 10 + 0.5) / 10); 
+
+    # Convert RA/DEC to degrees (if necessary).
+    my $ra_deg = $ra;
+    my $dec_deg = $dec;
+
+    push @{$pointings{$key}->{ALL}}, {
+        ID => $id, 
+        NAME => $name, 
+        EPOCH => $epoch_mjd, 
+        RA => $ra_deg, 
+        DEC => $dec_deg, 
+        FILT => $filt, 
+        COMMENTS => ($comment || ''),
+    };
+}
+
+# Now analyze each pointing for TTI pairs and night separation.
+foreach $key (sort keys %pointings) {
+    analyze_exposures($pointings{$key});
+    emit_exposures($pointings{$key});
+}
+
+exit;
+
+
+sub get_line {
+    my ($line, $datastore) = @_;       # processing flags
+    my @stuff;
+
+    if ($datastore) {
+        # Fields are ID|TIME_STR|TYPE|DESC|EXP_TIME_SEC|FILT|AIRMASS|COMMENTS
+        return undef if $line =~ /^#/;
+
+        my $time_str;
+        my $desc;
+        my $filt;
+        @stuff = split /\|/, $line;
+        ($time_str, $desc, $filt) = @stuff[1, 3, 5];
+        die "funny time string: $time_str" unless $time_str =~ /^(\d\d\d\d)-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)Z$/;
+        my $epoch_mjd = cal2mjd($3, $2, $1, ($4 * 3600 + $5 * 60 + $6) / 86400);
+        my ($ra_deg, $dec_deg);
+        die "funny RA/DEC in desc: $desc" unless $desc =~ /^\s*(\S+)\s+(\S+)/;
+        ($ra_deg, $dec_deg) = (sprintf ("%.2f", int($1 * 100 + 0.5) / 100 ), sprintf("%.2f", int($2 * 100 + 0.5) / 100));
+        return $stuff[0], $stuff[0], $filt, $ra_deg, $dec_deg, $epoch_mjd, $stuff[-1];
+    }
+    else {
+        return split /\s+/, $line;
+    }
+}
+
+
+sub analyze_exposures {
+    my ($pdata) = @_;
+    my $last;
+    my $nn;
+    my $nnlast;
+    my $mjdlast;
+    my $min_tti_mjd = $min_tti_span_min * 60 / 86400;
+    my $max_tti_mjd = $max_tti_span_min * 60 / 86400;
+
+    my @sorted = sort { $a->{EPOCH} <=> $b->{EPOCH} } @{$pdata->{ALL}};
+    foreach my $e (@sorted) {
+        if (!$last) {
+            $last = $e;
+            $nnlast = mopslib_mjd2nn($e->{EPOCH}, $gmt_offset_hours);   # get night number
+            next;
+        }
+
+        $nn = mopslib_mjd2nn($e->{EPOCH}, $gmt_offset_hours);   # get night number
+        if ($nn == $nnlast 
+            and ($e->{EPOCH} - $last->{EPOCH} > $min_tti_mjd) 
+            and ($e->{EPOCH} - $last->{EPOCH} < $max_tti_mjd) 
+            and ($e->{FILT} eq $last->{FILT})) {
+
+            $pdata->{TUPLES}->{$nn} = [ $last, $e ];            # save TTI pair
+            $last = undef;
+        }
+        else {
+            $last = $e;
+        }
+    }
+}
+
+
+sub emit_exposures {
+    my ($pdata) = @_;
+    my $exposure;
+    my $local_time_str;
+    my $epoch_str;
+    my $el;
+    my $eb; # ecliptic lat
+    my $gl;
+    my $gb; # galactic lat
+
+    my @nns = keys %{$pdata->{TUPLES}};
+    my $num_tuples = scalar @nns;
+    if ($num_tuples >= $min_tuples) {
+        if ($num_tuples == 3 and (max(@nns) - min(@nns)) > 30) {
+            return;
+        }
+
+        $num_footprints++;
+        print "#TTIF$num_footprints\n";
+
+        if ($comments) {
+            print "#EXP_ID EXTRA FILTER RA_DEG DEC_DEG EPOCH_MJD LOCAL_TIME ELAT GLAT COMMENT\n";
+        }
+        else {
+            print "#EXP_ID EXTRA FILTER RA_DEG DEC_DEG EPOCH_MJD LOCAL_TIME ELAT GLAT\n";
+        }
+        foreach my $nn (sort { $a <=> $b } keys %{$pdata->{TUPLES}}) {
+            $exposure = ${$pdata->{TUPLES}->{$nn}}[0];
+            $local_time_str = mopslib_mjd2localtimestr($exposure->{EPOCH}, $gmt_offset_hours) . "HST";
+            $epoch_str = sprintf("%.6f", $exposure->{EPOCH});
+
+            # Ecliptic latitude.
+            slaEqecl($exposure->{RA} / $DEG_PER_RAD, $exposure->{DEC} / $DEG_PER_RAD, $exposure->{EPOCH}, $el, $eb);
+            $eb *= $DEG_PER_RAD;
+            $eb = sprintf "%.2f", $eb;
+
+            # Galactic latitude.
+            slaEqgal($exposure->{RA} / $DEG_PER_RAD, $exposure->{DEC} / $DEG_PER_RAD, $gl, $gb);
+            $gb *= $DEG_PER_RAD;
+            $gb = sprintf "%.2f", $gb;
+
+            if ($comments) {
+                print join(' ', @{$exposure}{qw(ID NAME FILT RA DEC)}, $epoch_str, $local_time_str, $eb, $gb, $exposure->{COMMENTS}), "\n";
+            }
+            else {
+                print join(' ', @{$exposure}{qw(ID NAME FILT RA DEC)}, $epoch_str, $local_time_str, $eb, $gb), "\n";
+            }
+            last if $first;
+
+            $exposure = ${$pdata->{TUPLES}->{$nn}}[1];
+            $local_time_str = mopslib_mjd2localtimestr($exposure->{EPOCH}, $gmt_offset_hours) . "HST";
+            $epoch_str = sprintf("%.6f", $exposure->{EPOCH});
+
+            # Ecliptic latitude.
+            slaEqecl($exposure->{RA} / $DEG_PER_RAD, $exposure->{DEC} / $DEG_PER_RAD, $exposure->{EPOCH}, $el, $eb);
+            $eb *= $DEG_PER_RAD;
+            $eb = sprintf "%.2f", $eb;
+
+            # Galactic latitude.
+            slaEqgal($exposure->{RA} / $DEG_PER_RAD, $exposure->{DEC} / $DEG_PER_RAD, $gl, $gb);
+            $gb *= $DEG_PER_RAD;
+            $gb = sprintf "%.2f", $gb;
+
+            if ($comments) {
+                print join(' ', @{$exposure}{qw(ID NAME FILT RA DEC)}, $epoch_str, $local_time_str, $eb, $gb, $exposure->{COMMENTS}), "\n";
+            }
+            else {
+                print join(' ', @{$exposure}{qw(ID NAME FILT RA DEC)}, $epoch_str, $local_time_str, $eb, $gb), "\n";
+            }
+        }
+        print "\n" unless $first;
+    }
+}
+
+
+sub make_epoch {
+    # Given a floating-point epoch, normalize it by formatting it into 6 decimal places.
+    return float(sprintf("%.6f", shift));
+}

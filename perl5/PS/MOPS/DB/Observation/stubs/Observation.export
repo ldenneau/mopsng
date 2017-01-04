@@ -1,0 +1,39 @@
+%EXPORT_TAGS = ( 'all' => [ qw(
+    modcm_toStruct
+    modcm_toStructArray
+    modcm_getCount
+    modcm_getDetectionCount
+    modcm_getDetections
+    modcm_create
+    modcm_retrieve
+    modcm_retrieveByValue
+    modcm_insert
+    modcm_insertByValue
+    modcm_addDetections
+    modcm_delete
+    modcm_free
+    modcm_freeArray
+    modcm_freeStruct
+    modcm_freeArrayStruct
+    modcm_getId
+    modcm_getRa
+    modcm_getDec
+    modcm_getEpoch
+    modcm_getSurveyMode
+    modcm_getTimeStop
+    modcm_getTimeStart
+    modcm_getFilter
+    modcm_getLimitingMag
+    modcm_getRaSigma
+    modcm_getDecSigma
+    modcm_getObservatory
+    modcm_getEfficiencies
+    modcm_next
+    modcm_prev
+    modcm_nextDetection
+    modcm_prevDetection
+) ] );
+                                                                                                               
+@EXPORT_OK = ( @{ $EXPORT_TAGS{'all'} } );
+
+@EXPORT = qw( );

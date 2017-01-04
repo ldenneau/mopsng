@@ -1,0 +1,192 @@
+#!/usr/bin/env python
+"""
+Run coarseEphem and fieldProximity in sequence.
+
+Usage:
+    ephem_pipeline.py [options] ephem_input fields_file output_file
+    
+    options:
+        --obscode %(obscode)d
+        --delta_mjd %(delta_mjd).01f 
+        --limiting_mag %(limiting_mag).01f \
+        --epoch %(epoch)d 
+
+Once coarseEphem starts it reads a ~65 MB JPL file every time it starts. This 
+could be an issue with NFS mounted disks.
+"""
+import os
+import atexit
+import socket
+import sys
+import tempfile
+import time
+
+
+# Files we need to clean up at exit time.
+_CLEANUP_FILENAMES = []
+
+
+# Constants
+#N_RETRIES = 3       # Number of times we try to restart a process after failure.
+#RETRY_SLEEP = 5     # How many (fractions of a) seconds to wait before retrying.
+N_RETRIES = 1       # Number of times we try to restart a process after failure.
+RETRY_SLEEP = 0     # How many (fractions of a) seconds to wait before retrying.
+
+
+def cleanup():
+    for f in _CLEANUP_FILENAMES:
+        os.unlink(f)
+
+
+def main(obscode, 
+         deltaMJD, 
+         limitingMag, 
+         epoch, 
+         ephemInputFileName, 
+         fieldProximityInputFileName,
+         outputFileName,
+         gen_synth):
+
+    # Register cleanup handler.
+    atexit.register(cleanup)
+
+    # Create a temporary file.
+    (tempFile, tempFileName) = tempfile.mkstemp(prefix='ephemp', dir='/tmp')
+    os.close(tempFile)
+    _CLEANUP_FILENAMES.append(tempFileName)
+    
+    n = 0
+    err = 1
+    while(err != 0 and n < N_RETRIES):
+        # Compose the commands are feed them to a system() call.
+        # TODO: Use pipes for better execution control.
+#        cmd = "coarseEphem --obscode %(obscode)d --delta_mjd %(delta_mjd).01f \
+#               --limiting_mag %(limiting_mag).01f %(epoch)d %(outputFileName)s \
+#               < %(inputFileName)s 2>/dev/null >/dev/null"
+        sys.stderr.write('tick 1\n')
+        cmd = "coarseEphem --obscode %(obscode)d --delta_mjd %(delta_mjd).01f \
+               --limiting_mag %(limiting_mag).01f %(epoch)d %(outputFileName)s \
+               < %(inputFileName)s"
+        full_cmd = cmd %{'obscode': obscode,
+                              'delta_mjd': deltaMJD,
+                              'limiting_mag': limitingMag,
+                              'epoch': epoch,
+                              'outputFileName': tempFileName,
+                              'inputFileName': ephemInputFileName}
+        sys.stderr.write(full_cmd + "\n")
+        err = os.system(full_cmd)
+        # Update the counter n (i.e. the number of re-tries) and wait a sec.
+        time.sleep(RETRY_SLEEP)
+        n += 1
+    # <-- end hile
+
+    # If we get here and err != 0 it measn that we tries to run the process 
+    # N_RETRIES times and still failed. Bail out.
+    if(err != 0):
+        # TODO: Raise an exception.
+        sys.stderr.write('ERROR: coarseEphem failed and exited with code \
+                          %(err)d\n' %{'err': err})
+        sys.stderr.write('ERROR: Traceback (after %d tries on host %s\n' \
+                         %(N_RETRIES, socket.gethostname()))
+        sys.stderr.write(cmd %{'obscode': obscode,
+                          'delta_mjd': deltaMJD,
+                          'limiting_mag': limitingMag,
+                          'epoch': epoch,
+                          'outputFileName': tempFileName,
+                          'inputFileName': ephemInputFileName})
+        sys.stderr.write('\n')
+        return(err)
+
+
+    # FieldProximity. Same strategy as for coarseEphem.
+    n = 0
+    err = 1
+    while(err != 0 and n < N_RETRIES):
+        sys.stderr.write('tick 2\n')
+#        cmd = "fieldProximity fieldsfile %(fieldsFileName)s \
+#                 tracksfile %(tracksFileName)s method 1 \
+#                 outfile %(outputFileName)s 2>/dev/null >/dev/null"
+        cmd = "fieldProximity fieldsfile %(fieldsFileName)s \
+                 tracksfile %(tracksFileName)s method 1 \
+                 outfile %(outputFileName)s"
+        full_cmd = cmd % {'fieldsFileName': fieldProximityInputFileName,
+                               'tracksFileName': tempFileName,
+                               'outputFileName': outputFileName}
+        sys.stderr.write(full_cmd + "\n")
+        err = os.system(full_cmd)
+        # Update the counter n (i.e. the number of re-tries) and wait a sec.
+        time.sleep(RETRY_SLEEP)
+        n += 1
+    # <-- end hile
+
+    # If we get here and err != 0 it measn that we tries to run the process 
+    # N_RETRIES times and still failed. Bail out.
+    if(err != 0):
+        # TODO: Raise an exception.
+        sys.stderr.write('ERROR: fieldProximity failed and exited with code \
+                          %(err)d\n' %{'err': err})
+        sys.stderr.write('ERROR: Traceback (after %d tries on host %s\n' \
+                         %(N_RETRIES, socket.gethostname()))
+        sys.stderr.write('\n')
+        return(err)
+
+    return(0)
+
+
+
+
+if(__name__ == '__main__'):
+    import optparse
+
+    
+    # Constants
+    USAGE = """ephem_pipeline.py [options] ephem_input fields_file output_file
+       options:
+         --obscode obscode
+         --delta_mjd delta_mjd
+         --limiting_mag limiting_mag
+         --epoch epoch"""
+    
+    # Get user input (tracks file) and make sure that it exists.
+    parser = optparse.OptionParser(USAGE)
+    parser.add_option('--obscode',
+                      dest='obscode',
+                      type='int',
+                      help="MPC observatory code, required")
+    parser.add_option('--delta_mjd',
+                      dest='delta_mjd',
+                      type='float',
+                      default=1.,
+                      help="+/- time deltas for ephemers. def 1.0")
+    parser.add_option('--limiting_mag',
+                      dest='limiting_mag',
+                      type='float',
+                      default=25.,
+                      help="limiting mag for filtering observations. def 25.0")
+    parser.add_option('--epoch',
+                      dest='epoch',
+                      type='float',
+                      help="EPOCH of ephemeris calculation")
+    parser.add_option('--gen_synth',
+                      dest='gen_synth',
+                      action='store_true',
+                      default=False,
+                      help="generate synthetic detections from FieldProximity output")
+    
+    # Ger the command line options and also whatever is passed on STDIN.
+    (options, args) = parser.parse_args()
+    
+    if(len(args) != 3):
+        parser.error('Incorrect number of arguments.')
+    if(not options.epoch):
+        parser.error('Epoch needs to be specified.')
+    if(not options.obscode):
+        parser.error('Obscode needs to be specified.')
+    sys.exit(main(obscode=options.obscode,
+                  deltaMJD=options.delta_mjd,
+                  limitingMag=options.limiting_mag,
+                  epoch=options.epoch,
+                  ephemInputFileName=args[0],
+                  fieldProximityInputFileName=args[1],
+                  outputFileName=args[2],
+                  gen_synth=options.gen_synth))

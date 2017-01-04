@@ -1,0 +1,124 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+show_tuples - Show field tuple information for specified night
+
+=head1 SYNOPSIS
+
+show_tuples --nn NIGHT
+
+  --nn NIGHT : MOPS night number
+
+=head1 DESCRIPTION
+
+
+=cut
+
+use strict;
+use warnings;
+use FileHandle;
+use Getopt::Long;
+use Astro::Time;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+
+use subs qw(
+    do_field
+    _fmt
+    _ffmt
+);
+
+
+# Start program here.
+my $instance_name;
+my $nn;
+my $min_tuple_size = 2;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'n=i' => \$min_tuple_size,
+    'nn=i' => \$nn,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => '--nn NIGHTNUM not specified') unless $nn;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $gmt_offset_hours = defined($mc->{site}->{gmt_offset_hours}) ? $mc->{site}->{gmt_offset_hours} : die "can't get gmt_offset_hours";
+
+my $dbh = $inst->dbh();
+my $sql;
+my $href;
+
+my @fields;
+my $field_i;
+my $field;
+my $tuple;
+
+$field_i = modcf_retrieve($inst, nn => $nn);
+while ($field = $field_i->next()) {
+    push @fields, $field;
+}
+
+# Got all our fields, now sort em into tuples.
+my %tuples;
+my %fieldsById;
+my $parentId;
+foreach $field (@fields) {
+    $parentId = $field->parentId || $field->fieldId; 
+    push @{$tuples{$parentId}}, $field;
+    $fieldsById{$field->fieldId} = $field;
+}
+
+# Sort each tuple.
+foreach $parentId (keys %tuples) {
+    $tuples{$parentId} = [ sort { $a->epoch <=> $b->epoch } @{$tuples{$parentId}} ];
+}
+
+# Now by tuple parent epoch, and within each tuple.
+foreach $parentId (sort { $fieldsById{$a}->epoch <=> $fieldsById{$b}->epoch} keys %tuples) {
+    my $first = 1;
+    my $t0;
+    next unless @{$tuples{$parentId}} >= $min_tuple_size;
+
+    # Print header.
+    print <<"EOF";
+FPA_ID FIELD_ID FILTER EPOCH_MJD RA_DEG DEC_DEG PA_DEG EXP_TIME_SEC SURVEY_MODE DATE_UTC EB_DEG GB_DEG 
+EOF
+
+    foreach $field (@{$tuples{$parentId}}) {
+        my $exp_time_str = sprintf "%.1fs", ($field->timeStop - $field->timeStart) * 86400;
+        my $time_str;
+
+        if ($first) {
+            $time_str = mopslib_mjd2utctimestr($field->epoch, 'T');
+            $t0 = $field->epoch;
+            $first = 0;
+        }
+        else {
+            $time_str = sprintf "+%.2fmin", ($field->epoch - $t0) * 1440;
+        }
+
+        print join(' ', 
+            $field->fpaId,
+            $field->fieldId,
+            $field->filter,
+            sprintf("%.5f", $field->epoch),
+            sprintf("%.4f", $field->ra),
+            sprintf("%.4f", $field->dec),
+            sprintf("%.2f", $field->pa_deg),
+            $exp_time_str,
+            $field->surveyMode,
+            $time_str,
+            sprintf("%.2f", $field->eb_deg),
+            sprintf("%.2f", $field->gb_deg),
+        ), "\n";
+    }
+    print "\n";
+}

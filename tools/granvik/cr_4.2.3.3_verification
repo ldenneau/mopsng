@@ -1,0 +1,78 @@
+#!/bin/bash
+ 
+# Verification test for CR 4.2.3.3 (derivation efficiency)
+# Mikael Granvik  07/24/2008
+
+USERNAME="granvik"
+STUB="cr_4233_verification"
+INSTANCE_NAME="psmops_${USERNAME}_cr_test_sim"
+
+if [[ $1 == "pho" ]]
+    then
+    pops="s.moid_1 < 0.05 and s.h_v < 22.0"
+    crit="95000"
+elif [[ $1 == "mbo" ]]
+    then
+    pops="s.q > 1.666 and s.q/(1-s.e) >= 1.8 and s.q/(1-s.e) <= 4.1"
+    crit="98000"
+elif [[ $1 == "tno" ]]
+    then
+    pops="s.q/(1-s.e) >= 29.0"
+    crit="99000"
+else
+    echo "Population [pho|mbo|tno] must be specified..."
+    exit
+fi
+
+
+echo "1..1"
+
+# Query deriv efficiency:
+deriveff=`echo \
+"
+select
+  truncate(clean/avail,5) deriv_efficiency
+from (
+  select 
+#    count(distinct h.ssm_id) avail
+    count(h.ssm_id) avail
+  from 
+    history h, ssm s
+  where
+    h.event_type='D'
+    and h.ssm_id=s.ssm_id
+    and $pops
+) table_avail, (
+  select 
+#    count(distinct h.ssm_id) clean
+    count(h.ssm_id) clean
+  from 
+    history h, ssm s
+  where
+    h.event_type='D'
+    and h.classification='C'
+    and h.ssm_id=s.ssm_id
+    and $pops
+) table_clean
+" | \
+mysql -umops -pmops -hschmopc01 $INSTANCE_NAME`
+
+if [[ $2 == "--result" ]]
+    then
+    echo $deriveff
+fi
+
+# Remove header from result and convert to integer so that poor Bash
+# understands what we want:
+deriveff=${deriveff#deriv_efficiency}
+deriveff=`echo "$deriveff * 100000" | bc`
+deriveff=${deriveff/.*/}
+
+# Check whether the [95|98|99]% criterion is met:
+if (( $deriveff > $crit )) ; then
+    echo "ok 1 - ${STUB}_$1"
+else
+    echo "not ok 1 - ${STUB}_$1"
+fi
+
+exit

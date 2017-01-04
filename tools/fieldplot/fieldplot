@@ -1,0 +1,150 @@
+#!/usr/bin/env python
+
+"""
+Uses Python's matplotlib and kapteyn modules to do very nice celestial
+plots with graticules.  We use these tools to do tangent-plane plots
+of PS1 detection catalogs for individual fields.  Some annotations are
+added for various detection types.
+"""
+
+import sys, math, os
+del(os.environ['TERM'])     # matplotlib corrupts PNGs if TERM set to xterm
+
+# Ugh, astropy (deep in matplotlib) needs this under Apache.
+os.environ['HOME']='/home/mops'
+
+import matplotlib
+matplotlib.use('Agg')
+from kapteyn import maputils
+from matplotlib import pylab as plt
+import numpy
+import slalib
+import MOPS.Instance
+
+
+dbname = sys.argv[1]
+field_id = int(sys.argv[2])
+
+# matplotlib wants this
+#if not os.environ['MPLCONFIGDIR']:
+#    os.environ['MPLCONFIGDIR'] = '/home/mops/MOPS_DEVEL/apache/mplconfigdir';
+
+# setup
+# color map for varous det types:
+cmap = {
+        'F': 'k',      # found (normal)
+        '1': 'r',       # synthetic
+#        'L': '.6',      # low S/N
+        'D': '#e08080',
+        'K': '#e08080',
+        '2': 'r',
+        'I': 'y',
+        'B': '#e08080',
+}
+mmap = {
+        'F': 'o',      # found (normal)
+        '1': 'o',
+#        'L': '+',      # low S/N
+        'D': 'o',
+        'K': 'o',
+        '2': 'o',
+        'I': 'o',
+        'B': 'o',
+}
+cdescs = {
+    'F': 'Nonsynthetic',
+    '1': 'Synthetic',
+    'D': 'Dipole',
+    'K': 'In Spike',
+    '2': 'Duplicate',
+    'I': 'Cleaned',
+    'B': 'Near bright Star',
+    'S': 'Silly',
+    'L': 'Low S/N',
+}
+
+# DB info.
+mops_instance = MOPS.Instance.Instance(dbname=dbname)
+mops_config = mops_instance.getConfig()
+dbh = mops_instance.get_dbh()
+cursor = dbh.cursor()
+
+# plot size, spacing
+fs_deg2 = mops_config['site'].get('field_size_deg2', 3.1)
+fshape = mops_config['site'].get('field_shape', 'circle')
+
+if fshape == 'square':
+    fov = math.sqrt(fs_deg2) * 1.2
+else:
+    fov = math.sqrt(fs_deg2) * 1.2
+sz = 800.0
+h = (sz + 1) / 2
+pxsp = fov / sz # FOV of plot, deg/pix
+
+
+# Field info.
+sql = """
+select field_id, ra_deg, dec_deg from fields where field_id=%d
+""" % (field_id,)
+n = cursor.execute(sql)
+field_id, fra_deg, fdec_deg = cursor.fetchone()
+field_id = int(field_id)
+fra_deg = float(fra_deg)
+fdec_deg = float(fdec_deg)
+
+
+# Convert RA/DEC of detections to tangent-plane coords.
+sql = """
+select ra_deg, dec_deg, if(is_synthetic='1','1',status) from detections d where field_id=%d order by if(status='F','Z',status)
+""" % (field_id,)
+n = cursor.execute(sql)
+fra_rad = math.radians(fra_deg)
+fdec_rad = math.radians(fdec_deg)
+
+allxdata = {}
+allydata = {}
+
+if n:
+    for row in cursor.fetchall():
+        tpxrad, tpyrad, dummy = slalib.sla_ds2tp(math.radians(float(row[0])), math.radians(float(row[1])), fra_rad, fdec_rad)
+
+        allxdata.setdefault(row[2], []).append(h - math.degrees(tpxrad) / pxsp)
+        allydata.setdefault(row[2], []).append(h + math.degrees(tpyrad) / pxsp)
+
+header = {'NAXIS' : 2, 'NAXIS1': sz, 'NAXIS2': sz,
+          'CTYPE1' : 'RA---TAN',
+          'CRVAL1' : fra_deg, 'CRPIX1' : h, 'CUNIT1' : 'deg', 'CDELT1' : -pxsp,
+          'CTYPE2' : 'DEC--TAN',
+          'CRVAL2' : fdec_deg, 'CRPIX2' : h, 'CUNIT2' : 'deg', 'CDELT2' : pxsp
+         }
+
+# Overrule the header value for pixel size in y direction
+#header['CDELT2'] = 0.3*abs(header['CDELT1'])
+fitsobj = maputils.FITSimage(externalheader=header)
+figsize = fitsobj.get_figsize(ysize=20, cm=True)
+
+#fig = plt.figure(figsize=figsize)
+fig = plt.figure(figsize=(30,30))
+frame = fig.add_subplot(1,1,1)
+annim = fitsobj.Annotatedimage(frame)
+
+# PS1 FOV.
+if fshape == 'circle':
+    annim.Skypolygon("ellipse", cpos="%.3f %.3f" % (h, h), major=3.1, minor=3.1, pa=0, units='deg', fc='0.95')
+
+# Graticules/axes.
+gr = annim.Graticule()
+gr.setp_tick(wcsaxis=0, fmt="Dms")
+gr.setp_tick(wcsaxis=1, fmt="Dms")
+
+# Various detection types:
+leg = []
+for dtype in cmap.keys():
+    if dtype in allxdata and dtype in allydata:
+        annim.Marker(x=numpy.array(allxdata[dtype]), y=numpy.array(allydata[dtype]), mode='pixels', markersize=3, markeredgewidth=0, marker=mmap[dtype], color=cmap[dtype])
+        leg.append(cdescs[dtype]+" ("+str(len(allxdata[dtype]))+")")
+annim.plot()
+matplotlib.pyplot.legend(leg, numpoints=1, prop={'size': 'small'})
+#plt.show()
+#plt.savefig(fpa_id + '.png')
+plt.savefig(sys.stdout, format='png')

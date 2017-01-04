@@ -1,0 +1,415 @@
+#!/usr/bin/env perl
+
+# Quick script (for now) to wrap invocations of iod and
+# ps_od.  Output will be orbital elements.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Basename;
+use File::Slurp;
+use File::Temp qw(tempdir);
+
+use Astro::SLA;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::MITI;
+
+# OD thresholds.
+my $IOD_RESIDUAL_THRESH = 100;  # who knows
+my $DIFF_RESIDUAL_THRESH = .05; # "good" orbit
+
+my $inst;
+my $instance_name;
+my $panstarrs_mode; # use 'Pan-STARRS rules' for determining orbit (see DESCRIPTION)
+my $min_nights = 3;
+#my $small_track_rate = 0.02;    # deg/day
+my $small_track_rate = 0;    # deg/day
+my $small_track_iod_cmd = '0';    # deg/day
+my $iod;            # perform IOD only
+my $iod_ok;         # if IOD is good use it; don't invoke diff corrector
+my $iod_cmd = '0';  # find_orb command
+my $outfile;        # output file, otherwise STDOUT
+my $verbose;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'iod_thresh=f' => \$IOD_RESIDUAL_THRESH,
+    'diff_thresh=f' => \$DIFF_RESIDUAL_THRESH,
+    'psmode' => \$panstarrs_mode,
+    'min_nights=i' => \$min_nights,
+    'small_track_rate=f' => \$small_track_rate,
+    'small_track_iod_cmd=s' => \$small_track_iod_cmd,
+    'iod' => \$iod,
+    'iod_cmd=s' => \$iod_cmd,
+    'iod_ok' => \$iod_ok,
+    'out=s' => \$outfile,
+    verbose => \$verbose,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_logger = $inst->getLogger;
+
+if ($panstarrs_mode) {
+    $small_track_iod_cmd = 'gf';
+    $small_track_rate ||= 0.02;
+    $min_nights = 3;
+}
+
+
+
+# Subroutines.
+sub bad_orbit {
+    # Sanity check on returned elements.  Return undef if it looks reasonable.
+    # q e i node argPeri timePeri epoch mag id rms
+    my $orb = shift;
+    return 'BADQ' if ($orb->{q} < 0);
+    return 'BADE' if ($orb->{e} < 0 or $orb->{e} > 1);
+    return 'BADI' if ($orb->{i} < 0 or $orb->{i} > 90);
+
+    return undef;
+}
+
+
+sub get_track_stuff {
+    my ($track) = shift;    # ARRAYREF
+    
+    # Each element is a line of text from the input file.
+    my ($id, $epoch, $ra, $dec, @stuff);
+    my %days;   # tabulates different days of observations
+    my ($first, $last);     # first/last epoch
+    my ($first_ra, $first_dec);   # first/last RA
+    my ($last_ra, $last_dec);     # first/last DEC
+
+    foreach my $line (@{$track}) {
+        ($id, $epoch, $ra, $dec, @stuff) = split /\s+/, $line;
+        $days{int($epoch)} = 1;     # note this integral MJD
+
+        if (!defined($first) or $epoch < $first) {
+            $first = $epoch;
+            $first_ra = $ra;
+            $first_dec = $dec;
+        }
+
+        if (!defined($last) or $epoch > $last) {
+            $last = $epoch;
+            $last_ra = $ra;
+            $last_dec = $dec;
+        }
+    }
+
+    my $track_rate;
+    if (defined($first) and defined($last) and ($last - $first) > 0) {
+        $track_rate = slaDsep(
+            $first_ra / $DEG_PER_RAD,
+            $last_ra / $DEG_PER_RAD,
+            $first_dec / $DEG_PER_RAD,
+            $last_dec / $DEG_PER_RAD,
+        ) / ($last - $first);
+    }
+    else {
+        $track_rate = 0;    # bogus
+    }
+
+    return (scalar keys %days, $track_rate);    # return num nights, motion/day
+}
+
+
+# Error codes.  See POD documentation below.
+my $EINSUFFN = 'EINSUFFN';
+my $EIODFAIL = 'EIODFAIL';
+my $EIODLARGERESIDUAL = 'EIODLARGERESIDUAL';
+my $EDIFFFAIL1 = 'EDIFFFAIL1';
+my $EDIFFFAIL2 = 'EDIFFFAIL2';
+my $EDIFFLARGERESIDUAL = 'EDIFFLARGERESIDUAL';
+my $EDIFFTIMEOUT = 'EDIFFTIMEOUT';
+
+
+# Round up executables.
+my $IOD = "$ENV{MOPS_HOME}/bin/iod.x";
+-x $IOD or $mops_logger->logdie("can't find $IOD");
+
+my $DIFFORB = "$ENV{MOPS_HOME}/bin/genOrbit";
+-x $DIFFORB or $mops_logger->logdie("can't find $DIFFORB");
+
+my $MPC2OBS = "$ENV{MOPS_HOME}/bin/mpc2obs";
+-x $MPC2OBS or $mops_logger->logdie("can't find $MPC2OBS");
+
+my $MITI2MPC = "$ENV{MOPS_HOME}/bin/miti2mpc";
+-x $MITI2MPC or $mops_logger->logdie("can't find $MITI2MPC");
+
+my $miti_file = shift;
+my $TMP = tempdir('/tmp/mopsiodXXXXXX', CLEANUP => (defined($ENV{MOPS_NO_CLEANUP}) ? 0 : 1));
+
+# Flow
+# *  Convert LinkTracklets MITI output for iod: TRACKS.MITI -> TRACKS.MPC
+# *  Run IOD, output in TRACKS.INP format for JPL SSD2.
+# *  Convert .MPC file to JPL .OBS file
+# *  ps_od -> eleoms
+
+
+# First convert input file to MPC format for find_orb/iod.
+my @miti_data;
+my ($base, $path, $ext);
+
+if ($miti_file) {
+    # Input file specified, so read it.
+    ($base, $path, $ext) = fileparse($miti_file, qr/\.miti/i);      # get interesting part of filename
+    @miti_data = grep { !/^#/ } read_file($miti_file); # slurp file, chuck comments
+}
+else {
+    @miti_data = grep { !/^#/ } <STDIN>;   # slurp all STDIN, chuck comments
+    ($base, $path, $ext) = qw(test miti);   # dummy vals
+}
+
+# Split the input file into multiple tracks.  Scan the list of input
+# lines and group lines with same ID.
+my @tracks;
+my $last = "";
+my $cmd;
+
+foreach my $line (@miti_data) {
+    if ($line =~ /^(\w+)/) {                # line starts with ID
+        push @tracks, [$1] if $1 ne $last;  # new ID, so start new list with ID
+        push @{$tracks[-1]}, $line;         # add this line to current list
+        $last = $1;
+    }
+}
+
+# Now process each track.
+my $results;        # holds IOD/diff result
+my $curr_id;        # ID of current track
+my $flags;          # short synopsis of what happened to this orbit
+
+# Flags:
+#   S : short track
+#   I : IOD performed
+#   E : IOD was constrained with e=0
+#   U : IOD RMS was good, IOD was used
+#   D : Differential correction performed
+
+foreach my $track (@tracks) {
+    $curr_id = shift @{$track}; # get first item in list; rm from list
+    $flags = '';
+
+    # Count number of nights; if insufficient, bail on this track.
+    my ($nn, $track_rate) = get_track_stuff($track);
+    if ($nn < $min_nights) {
+        $results = "$EINSUFFN $curr_id\n";        
+        next;
+    }
+
+    # Write MPC file for orbit determination progs.
+    my $mpcfile = "$TMP/$base.mpc";     # MPC filename
+    open my $fh, "|$MITI2MPC > $mpcfile" or $mops_logger->logdie("miti2mpc failed");
+    print $fh @{$track};    # dump all remaining track data ($track is an ARRAYREF)
+    close $fh;
+
+    # Generate an IOD.
+    my $iod_data;
+    $cmd = $iod_cmd;         # actual IOD cmd used after messing with small_track_rate rules
+
+    # Compute track length.  Calculate motion/day, and if it's less than small_track_rate
+    # use '0' as the IOD command.  '0' is a null command that simply uses the initial
+    # guesstimate by find_orb.
+    my $short_track = 0;         # do diff_corr unless somebody says otherwise.
+    my $iod_constraints = '';
+    if ($track_rate < $small_track_rate) {
+        $cmd = ($small_track_iod_cmd or 'gf');
+        $short_track = 1;
+        $iod_constraints = "--constraints e=0";
+
+        $flags .= 'SC';     # short track, constrained
+    }
+
+
+    # Execute IOD.
+    $cmd = "$IOD --method $cmd $iod_constraints $mpcfile";
+    $mops_logger->info($cmd) if $verbose;
+    open my $iod_fh, "$cmd|" or $mops_logger->logdie("$IOD failed");
+    $iod_data = <$iod_fh>;
+    close $iod_fh;
+
+    $flags .= 'I';          # iod performed
+
+    # Check for error, then parse IOD output.
+    my %iod;
+    $results = '';
+    if ($iod_data =~ /^E/) {    
+        $results = $iod_data;
+        next;                   # jump to end of block (continue)
+    }
+
+    # Get orbital parameters.
+    @iod{qw( q e i node argPeri timePeri epoch mag id rms )} = split /\s+/, $iod_data;
+
+    # Check IOD decent.
+    if ($iod{rms} > ($short_track ? 1.0 : $IOD_RESIDUAL_THRESH)) {    # if $short_track require small RMS
+        $results = "$EIODLARGERESIDUAL $curr_id $iod{rms}\n";    # IOD resid too large
+        next;
+    }
+    elsif ($iod # command-line option to use IOD no matter what.
+        or (($iod_ok or $short_track) and $iod{rms} < $DIFF_RESIDUAL_THRESH)) {
+        # Found a good one with low residual; use it.
+        $flags .= 'U';
+        $results = $iod_data;
+        next;
+    }
+
+
+    # OK generate inputs for JPL OD.
+    my $jplobs = "$TMP/test.obs";       # JPL format obs
+    my $jplinp = "$TMP/test.iod";       # MOPS format inp
+    my $jplout = "$TMP/test.out";
+    $cmd = "$MPC2OBS -o $jplobs $mpcfile > /dev/null";
+    $mops_logger->info($cmd) if $verbose;
+    system($cmd) == 0     # create JPL format OBS file
+        or $mops_logger->logdie("$MPC2OBS failed");
+
+    # Create IOD text file.
+    open my $jplinp_fh, ">$jplinp" 
+        or $mops_logger->logdie("can't create $jplinp");
+    print $jplinp_fh $iod_data;         # copy IOD data
+    close $jplinp_fh;
+
+    # Execute differential corrector.
+    eval {
+        $cmd = "$DIFFORB $jplinp $jplobs $jplout > /dev/null 2>&1";
+        $mops_logger->info($cmd) if $verbose;
+        my $rc = system($cmd);    # call corrector
+        if ($rc == 0) {
+            # Finished OK (although orbit might still be bogus), get results.
+            open my $jplout_fh, $jplout or die "can't open $jplout";
+            $results = <$jplout_fh>;
+            close $jplout_fh;
+        }
+        else {
+            # Aborted, report error.
+            $results = sprintf "$EDIFFFAIL1 $curr_id %d\n", ($? >> 8);
+        }
+    };
+    $flags .= 'D';      # mark corrector used
+
+    # Clean up.
+    unlink($jplobs, $jplinp, $jplout);
+
+    if ($@) {   # exception occurred
+        $results = "$EDIFFFAIL2 $curr_id\n";
+    }
+    else {
+        my %orbit;
+        @orbit{qw( q e i node argPeri timePeri epoch mag id rms )} = split /\s+/, $results;
+        if (defined($orbit{rms})) {
+            if ($orbit{rms} > $DIFF_RESIDUAL_THRESH) {
+                $results = "$EDIFFLARGERESIDUAL $results";
+            }
+            my $chkbad = bad_orbit(\%orbit);
+            if ($chkbad) {
+                $results =~ s/^E\w+\s+//;  # remove current error code
+                $results = "E${chkbad} $results";   # new error code
+            }
+        }
+        # $results already contains error code when !defined $orbit{rms}
+#        else {
+#                $results = "$EDIFFNORESID $results";
+#        }
+    }
+}
+continue {
+    # Insert processing flags just before newline;
+    chomp $results;
+    $results .= " $flags\n";
+
+    # Slurp input file, route to output file or STDOUT.
+    if ($outfile) {
+        open my $out_fh, ">>$outfile" or die "can't open $outfile";
+        print $out_fh $results;
+        close $out_fh;
+    }
+    else {
+        print $results;
+    }
+
+}   # foreach
+
+=pod
+
+=head1 NAME
+
+mopsod - Compute orbital parameters from linked detections.
+
+=head1 SYNOPSIS
+
+mopsod [tracks.miti]
+
+  --iod : perform IOD only
+  --iod_ok : prefer good IOD over differential corrector
+  --iod_cmd XYZ : find_orb command sequence, default '0'
+  --min_nights N : require N nights of observations
+  --small_track_rate V : maximum sky velocity to be considered a small track, in deg/day
+  --small_track_iod_cmd XYZ : find_orb command sequence for small tracks
+  --psmode : 'Pan-STARRS' mode (see DESCRIPTION) [don't use this]
+  --iod_thresh T1 : use T1 as IOD residual threshold (in arcseconds)
+  --diff_thresh T2 : use T2 as differential residual threshold (in arcseconds)
+  --out OUTFILE : write output to OUTFILE instead of STDOUT
+  --help : show manpage
+  tracks.miti : input MITI file (otherwise STDIN)
+
+=head1 DESCRIPTION
+
+mopsdc performs an initial orbit determination then a differential orbit
+correction on a set of detections linked by LinkTracklets.
+
+The returned orbital parameters are printed on STDOUT, as follows:
+q (AU)
+e
+i (deg)
+node (deg)
+argPeri (deg)
+timePeri (MJD)
+epoch (MJD)
+residual
+
+Normally an IOD is performed using find_orb.  Then the output of IOD is
+submitted to the JPL differential corrector.  If an error occurs during
+the IOD phase, an error code is printed and the differential error is
+not called.
+
+If a fatal error occurs during the differential correction, an error
+code is printed followed by orbital parameters, if available.
+
+If --iod is specified, then only a find_orb IOD is performed, and the
+result is output.
+
+If --iod_ok is specified, then if the find_orb IOD residual is below
+the IOD treshold, it is returned; otherwise a differential correction
+is performed and that is used.
+
+If --psmode is specified, then the following occurs
+
+* MIN_NIGHTS is set to 3.  
+
+* If the track length for an orbit is less than SMALL_TRACK_RATE, then
+the IOD value only is used.  For tracks longer than this, the corrected
+orbit is used.
+
+=head1 ERROR CODES
+
+In the event of a failed orbit determination, the following errors codes are
+available:
+
+EINSUFFN - Count of nights in track < MIN_NIGHTS
+EIODFAIL - IOD failed for unknown reason
+EIODLARGERESIDUAL - computed residual too high (threshold TBD)
+EDIFFFAIL1 - Differential correction executable aborted
+EDIFFFAIL2 - Differential correction block exception occurred
+EDIFFLARGERESIDUAL - Differential correction had very large residual
+EDIFFTIMEOUT - The differential corrector was hung and was aborted
+
+The JPL corrector has "qualified" success codes available.  These will
+be supported in a later release of mopsod.
+
+=cut

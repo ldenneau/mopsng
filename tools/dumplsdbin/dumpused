@@ -1,0 +1,57 @@
+#! /usr/bin/env perl
+
+=head1 NAME
+
+dumpused - Dump contents of LSD used file
+
+=head1 SYNOPSIS
+
+dumpbin FILENAME
+
+=head1 DESCRIPTION
+
+This program dumps the contents of a packed binary file listing
+detection used by MOPS for a given night.
+
+=cut
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use PS::MOPS::LSD;
+
+my $help;
+GetOptions(
+    help => \$help,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+pod2usage(-msg => 'no file specified') unless @ARGV;
+
+
+foreach my $filename (@ARGV) {
+    my $fh = new FileHandle $filename;
+    my $buf;
+    my $num_read;
+    my $size;
+    my $template;
+    my @stuff;
+
+    if ($filename =~ /used$/) {
+        $size = PS::MOPS::LSD::USED_TEMPLATE_LENGTH;
+        $template = PS::MOPS::LSD::USED_PACK_TEMPLATE;
+    }
+    else {
+        warn "Unknown file extension: $filename\n";
+        next;
+    }
+    print join(' ', @PS::MOPS::LSD::USED_FIELD_DESCRIPTIONS), "\n";
+    while (($num_read = $fh->read($buf, $size)) > 0) {
+        die "partial data read from file $filename" if $num_read != $size;
+        @stuff = unpack $template, $buf;
+        print join(' ', @stuff), "\n";
+    }
+    $fh->close();
+}

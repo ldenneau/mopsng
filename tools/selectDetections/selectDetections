@@ -1,0 +1,182 @@
+#!/usr/bin/env perl
+
+# $Id: selectDetections 3386 2009-03-10 22:52:53Z denneau $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Temp qw(tmpnam);
+use FileHandle;
+use Astro::Time;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib;
+use PS::MOPS::MPC qw(:all);
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Instance;
+
+
+my $inst;
+my $instance_name;
+my $field_id;
+my $field_ids;
+my $s2n_cutoff;
+my $ra;
+my $dec;
+my $roi;
+my $mjd;
+my $mpc;
+my $miti;
+my $extended;
+my $add_from_file;
+
+# Diagnostic/testing.
+my $objPrefix;
+my $cheat = 1;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'field_id=s' => \$field_id,
+    field_ids => \$field_ids,
+    's2n_cutoff=f' => \$s2n_cutoff,
+    'ra=f' => \$ra,
+    'dec=f' => \$dec,
+    'roi=f' => \$roi,
+    'mjd=s' => \$mjd,
+    mpc => \$mpc,
+    miti => \$miti,
+    extended => \$extended,
+    'add_from_file=s' => \$add_from_file,
+    cheat => \$cheat,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+pod2usage(3) unless (!$roi or (defined($ra) and defined($dec)));    # NOTE: zero RA/DEC allowed
+pod2usage(3) unless ($mjd or $field_id);
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $minS2N = $s2n_cutoff || $mops_config->{site}->{s2n};
+
+
+sub _mapobjname {
+    # Return an object name suitable for MOPS processing.  If the
+    # object name is empty or 'FALSE', just return a space character.
+    my ($name) = @_;
+    $name = 'NS' if (!$name or ($name eq 'FALSE' or $name eq $MOPS_NONSYNTHETIC_OBJECT_NAME));
+    return $name ;      # return original name
+}
+
+
+sub _format_det_miti {
+    # Output detection in MITI format.
+    my ($det, $cheat) = @_;
+    my @stuff = ($det->detId, $det->epoch, $det->ra, $det->dec, $det->mag, $det->{obscode});
+    push @stuff, _mapobjname($det->objectName) if $cheat;
+    return join(" ", @stuff);
+}
+
+
+sub _format_det_miti_ext {
+    # Output detection in MITI extended format, which means length and angle at the
+    # end of each line.
+    my ($det, $cheat, $exposure_time) = @_;
+    my @stuff = ($det->detId, $det->epoch, $det->ra, $det->dec, $det->mag, $det->{obscode}); 
+    push @stuff, _mapobjname($det->objectName) if $cheat;
+    push @stuff, ($det->{length_deg} || 0), ($det->{orient_deg} || 0), $exposure_time;
+    return join(" ", @stuff);
+}
+
+
+my $det_i;
+my $det;
+my $exposure_time = 0;      # default for findtracklets; uses command-line
+
+if ($objPrefix) {
+    # Diagnostic/testing.
+    die "need to filter objprefix here";
+}
+elsif ($field_ids) {
+    $det_i = modcd_retrieve($inst, fieldIds => [@ARGV], minS2N => $minS2N);
+}
+elsif ($field_id) {
+    my $field = modcf_retrieve($inst, fieldId => $field_id);
+    die("can't fetch field ID $field_id") unless $field;
+    $exposure_time = ($field->timeStop - $field->timeStart) * $SECONDS_PER_DAY;
+    $det_i = modcd_retrieve($inst, fieldId => $field_id, minS2N => $minS2N);
+}
+else {
+    # Normal processing.
+    $det_i = modcd_retrieve($inst, mjd => $mjd, minS2N => $minS2N);
+}
+
+while ($det = $det_i->next) {
+    # Check that tracklet is in our ROI.
+
+    if (!$roi or mopslib_inField($ra, $dec, $roi, $det->ra, $det->dec)) {
+        if ($mpc) {
+            print join("\n", mpc_format_det($det, $cheat)), "\n";
+        }
+        else {
+            # MITI (MOPS interim text interchange)
+            if ($extended) {
+                print join("\n", _format_det_miti_ext($det, $cheat, $exposure_time)), "\n";
+            }
+            else {
+                print join("\n", _format_det_miti($det, $cheat)), "\n";
+            }
+        }
+    }
+}
+
+if ($add_from_file) {
+    my $fh = new FileHandle $add_from_file;
+    while ($det = modcd_deserialize($inst, scalar <$fh>)) {
+        if (!$roi or mopslib_inField($ra, $dec, $roi, $det->ra, $det->dec)) {
+            if ($mpc) {
+                print join("\n", mpc_format_det($det, $cheat)), "\n";
+            }
+            else {
+                # MITI (MOPS interim text interchange)
+                if ($extended) {
+                    print join("\n", _format_det_miti_ext($det, $cheat, $exposure_time)), "\n";
+                }
+                else {
+                    print join("\n", _format_det_miti($det, $cheat)), "\n";
+                }
+            }
+        }
+    }
+}
+
+=head1 NAME
+
+selectDetections - Select detections from PSMOPS and output in useable LinkTracklets format
+
+=head1 SYNOPSIS
+
+selectDetections [options] [FIELD_IDs]
+
+  --field_id=ID : select detections from field with specified ID
+  --field_ids : select from all FIELD_IDs listed
+  --mjd date_mjd : select all tracklets within (date_mjd, date_mjd+lunar_period)
+  --all : select all detections on specified days; disregard RA/DEC window
+  --ra ra_deg : RA of field center, in degrees
+  --dec dec_deg : DEC of field center, in degrees
+  --roi roi_deg : length of square ROI side, in degrees
+  --extended  : write out extended (detection angle/length) information
+  --mpc : write output in MPC format
+  --miti : write output in MITI format
+  --cheat : append objectName to detections
+  --help : show help
+
+=head1 DESCRIPTION
+
+Outputs detections into MITI or MPC format for further MOPS processing.
+Nothing fancy.
+
+=cut
+

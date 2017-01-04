@@ -1,0 +1,7 @@
+# This test creates a sample file of uniformly distributed detections at 1000/sq deg
+# and a patch of 10000/sq deg and astrocleans the high-density patch.
+
+./make_density 30 10 3 1000 > test.dets
+./make_density 30.5 10.5 .2 10000 >> test.dets
+astroclean file test.dets clean_file test.clean density 2000 Dradius .10 outtype 1
+mitiPlot --autoscale test.clean

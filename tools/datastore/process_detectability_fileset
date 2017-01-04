@@ -1,0 +1,199 @@
+#! /usr/bin/env perl
+
+=head1 NAME
+
+process_detectability_fileset - Fetch and process detectability query responses
+
+=head1 SYNOPSIS
+
+process_detectability_fileset NIGHTNUM FILE1 FILE2 ...
+
+  NIGHTNUM : night number of responses to fetch
+  FILE1 FILE2 ... : SYNTHEPH output files to process
+
+=head1 DESCRIPTION
+
+Read all detectability query responses from the configured datastore
+location and for each file in the fileset, locate a matching MIF-SYNTH
+file in the current directory and write out a .detect file containing
+the same MIF-SYNTH detections, except that appropriate detections are
+marked MOPS_EFF_UNFOUND ('X').
+
+Files will generally be named by Condor using the format
+
+  synth.out.1
+  synth.out.2
+  synth.out.3
+  ...
+
+Detectability query fileset will be created using numeric suffixes as
+"field IDs".  We have to map these to FPA_IDs for the query, so the
+first line of the MIF-SYNTH file is a comment indicating the field ID
+for the synthetic detections.
+
+=cut
+
+# $Id$
+
+use warnings;
+use strict;
+
+use Carp;
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use LWP;
+use Data::Dumper;
+
+use Astro::FITS::CFITSIO qw(:constants);
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Detectability;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Detection;
+
+use subs qw(
+    read_query_items
+    make_up_responses
+    write_response_items
+);
+
+my $instance_name;
+my $inst;
+my $help;
+
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+my $nn = shift or pod2usage(-msg => 'NIGHTNUM is required');
+my @files = @ARGV;
+
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+
+
+# Create a map of files that we expect to find query responses for.
+my %file_map;
+my $file_root;
+foreach my $file (@files) {
+    if ($file =~ /^(.*)\.(\d+)$/) {
+        if (exists($file_map{$2})) {
+            $mops_logger->logdie("file map entry $file already exists");
+        }
+        if ($file_root and $file_root ne $1) {
+            $mops_logger->logdie("found different file roots: $file_root and $1");
+        }
+        $file_root = $1;
+        $file_map{$2} = $file;      # save suffix mapping to file
+    }
+    else {
+        $mops_logger->logdie("strange filename $file");
+    }
+}
+
+
+my $ua = LWP::UserAgent->new();
+my $index_url = $mops_config->{detectability}->{index_url} 
+    or die "can't get index_url";
+my $product = 'mops-detectability-responses';
+my $fileset = $inst->dbname() . ".$nn";
+
+# Fetch a catalog of all the files in the fileset.
+my $ds_url = "$index_url/ds/$product/$fileset/index.txt";
+my $res = $ua->get($ds_url);
+if (!$res->is_success) {
+    $mops_logger->logdie("Fetch of index $ds_url failed: " . $res->status_line);
+}
+my @items = grep { !/^#/ } split /\n/, $res->content;        # extract file IDs in fileset
+
+my ($id, $sz, $md5, $type);
+my $url;
+my @dets;
+
+my $id_re = qr/^\Q$fileset\E\.(\d+)$/;
+
+foreach my $item (@items) {
+    my $invisimap;      # all invisible dets after det Q
+    ($id, $sz, $md5, $type) = split /\|/, $item;
+    my $file_num;
+
+    # Get the local Condor file num from the $id, which should look like
+    # $DBNAME.$NN.0000.
+    if ($id =~ $id_re) {
+        $file_num = $1;
+    }
+    else {
+        $mops_logger->logdie("unrecognized file ID: $id");
+    }
+
+    # Make sure the file num is in our file IDs table of what we're expecting.
+    if (!exists($file_map{int($file_num)})) {
+        $mops_logger->logdie("unexpected file $item");
+    }
+
+    # Read FITS file to local file.
+    $url = "http://localhost/ds/mops-detectability-responses/$fileset/$id";
+    $invisimap = PS::MOPS::Detectability::read_response($url, $ua);
+
+    # Now process the matching MIF-SYNTH file with the undetected list.
+    write_file($file_root, $file_num, $invisimap);
+
+    print STDERR '.';
+}
+print STDERR "\n";
+exit;
+
+
+sub write_file {
+    my ($file_root, $file_num, $invisible_map) = @_;
+
+    # Given the filename root, a file number from our detectability response
+    # fileset, and a list of invisible detections from the file, emit the list
+    # of detections from the input file, marking the appropriate detections as
+    # invisible (MOPS_EFF_UNFOUND).
+    #
+    $file_num = int($file_num);         # cvt "00042" => 42
+    my $inp_file = "$file_root.$file_num";
+    my $out_file = "$file_root.$file_num";
+    $out_file =~ s/\.out\./.visible./;   # change "synth.out" => "synth.visible"
+    if ($out_file eq $inp_file) {
+        # Catch bad out => visible substituion
+        $mops_logger->logdie("out $out_file same as input $inp_file");
+    }
+
+    $mops_logger->logdie("nonexistent: $inp_file") unless -e $inp_file;
+
+    my $in_fh = new FileHandle $inp_file or $mops_logger->logdie("can't open $inp_file");
+    my $out_fh = new FileHandle ">$out_file" or $mops_logger->logdie("can't open $out_file for writing");
+
+    my $line;
+    my @stuff;
+    my $detect_data;
+    while (defined($line = <$in_fh>)) {
+        next if $line =~ /^(#|!)/;      # skip comment
+        chomp $line;
+
+        @stuff = split /\s+/, $line;
+        $detect_data = $invisible_map->{$stuff[1]};     # stuff[1] => det num
+        $mops_logger->logdie("got unknown det num $stuff[1] ($file_root, $file_num)") 
+            unless $detect_data;
+
+        # $detect_data[0, 1, 2] = (detect_n, detect_f, target_flux)
+        if ($detect_data->[1] >= 0.5) {
+            # visible
+            print $out_fh $line, "\n";          # just re-emit line
+        }
+        else {
+            # invisible
+            $stuff[10] = $MOPS_EFF_UNFOUND;     # detection is invisible
+            print $out_fh join(' ', @stuff), "\n";
+        }
+    }
+
+    $in_fh->close();
+    $out_fh->close();
+}

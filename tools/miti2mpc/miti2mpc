@@ -1,0 +1,73 @@
+#!/usr/bin/env perl
+
+# $Id: miti2mpc 1443 2007-01-17 20:00:05Z denneau $
+# Convert MITI file to MPC format.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use PS::MOPS::MITI;
+use PS::MOPS::MPC qw(:all);
+
+
+my $mpcheck;
+my $original_designation;
+GetOptions(
+    mpcheck => \$mpcheck,
+    original_designation => \$original_designation,
+) or pod2usage(2);
+
+
+my $line;
+my %miti;
+
+# These are used only if MPCheck is on.
+my $root_name = "MOPS";
+my $mpcheck_index = 0;
+
+while (defined($line = <>)) {
+    if ($line !~ /^#/) {
+        chomp $line;
+        %miti = miti_parse($line);
+
+        if ($original_designation) {
+            # Replace ID with orig designation.
+            $miti{ID} = $miti{OBJECT_NAME} || $miti{ID} || 'NONE';
+        }
+        elsif ($mpcheck) {
+            $miti{ID} = $root_name . sprintf "%03d", $mpcheck_index++;
+        }
+
+        print mpc_format_miti(%miti), "\n";
+    }
+}
+
+=head1 NAME
+
+miti2mpc - Convert MITI file to MPC format via STDIN/STDOUT.
+
+=head1 SYNOPSIS
+
+miti2mpc [options] < input > output
+
+  --mpcheck : output detection IDs with unique IDs for MPC's MPCheck
+  --original_designation : report the detection ID using the original designation, if available
+
+=head1 DESCRIPTION
+
+Converts a MITI-formatted file to MPC.  The input file must contain
+whitespace-separated fields as follows:
+
+  ID
+  EPOCH_MJD
+  RA_DEG
+  DEC_DEG
+  MAG
+  OBSCODE
+  OBJECT_NAME (optional)
+
+Lines beginning with '#' are considered comments and are ignored.
+
+=cut

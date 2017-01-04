@@ -1,0 +1,64 @@
+Attendees: Bryce, Chastel, Denneau, Schunova, Veres, Wainscoat
+
+
+* Telescope Status
+
+No report
+
+
+* IPP Issues
+  - IPP Trail fitting
+
+
+  - Photometry
+
+  - Convolution
+
+No report
+
+
+* Data Processing
+
+  - MOPS Hardware
+
+SC: Ask Jessica Young where she bought hw for atlas. Assemble ourselves?
+RJW: Should be in place by the end of Feb
+  - Processing issues
+
+    * Jan 18-22. We reached 1b detections: Overflow in Known server. LD takes care of fixing.
+RJW: Start a new database?
+LD: Better by the end of February so that we don’t have 3PI anymore
+    * IPP References needed: reprocess the same set of exposures every day to see differences from one day to antoher.
+    * OSS: maxv limited to 5 at the moment
+    * BB: Should we make OSS Pairs and Quads?
+
+
+* NEO Status
+  - CFHT back
+  - Cooperation with Catalina for the even/odd RA stripes
+  - Feb 1: We start the new observation program (see MMM 2014-01-17)
+  - 37 candidates on CP. No comet there.
+
+
+* NEO Czaring
+  - BB: Create Known comets page for czar
+
+
+
+* Comets
+
+No report
+
+
+* ATLAS
+Almost entirely automated.  Looking at fields close to opposition.  Tracking NEOs brighter than 17.
+
+
+* AOB
+  - Stamps
+    -> SC wrote a script to fetch them directly from the IPP cluster
+    -> SC: Wire stamp script into the web page for 1k stamps
+    -> SC: Use getfits? WCS tools package
+    -> SC: Tell the IPP team about it
+  - RJW: Use findOrb?
+    -> LD: Provide specs and openOrb will likely do it

@@ -1,0 +1,164 @@
+#!/usr/bin/perl
+# $Id: create_psmops 5073 2012-08-11 03:26:55Z denneau $
+
+# Script to automate the creation of a OSS instance
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Temp qw(tempfile);
+use File::Slurp;
+use PS::MOPS::Config;
+
+
+my $grants;
+my $quiet;
+my $help;
+GetOptions(
+    grants => \$grants,
+    quiet => \$quiet,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+
+my $suffix;             # OSS suffix
+my $instance;           # full instance name (oss_XXXX)
+
+# Scrub the name of our instance.
+$suffix = shift || pod2usage(3);
+$suffix =~ s/^oss_//i;       # strip leading OSS_ if provided
+die "invalid instance name: $suffix" unless $suffix =~ /^\w+$/;
+$instance = 'oss_' . $suffix;
+
+my $oss_backend = PS::MOPS::Config->new('backend');
+my $oss_hostname = $oss_backend->{hostname} || die "no hostname configured";
+my $oss_port = $oss_backend->{port} || 3306;
+my $oss_rootuser = $oss_backend->{rootuser} || 'mopsroot';
+
+my $oss_username = 'mops';
+my $oss_password = 'mops';
+
+my $osspipe_username = $oss_backend->{username} || 'mopspipe';
+my $osspipe_password = $oss_backend->{password} || 'epip';
+
+
+# mysql root passwd.
+my $oss_rootpwfile;
+if ($ENV{USER} eq 'mguest') {
+    $oss_rootpwfile = "$ENV{MOPS_HOME}/schema/.oss_rootpw";
+    $suffix = 'mguest';
+    $instance = 'oss_mguest';
+}
+else {
+    $oss_rootpwfile = "$ENV{HOME}/.oss_rootpw";
+}
+my $oss_rootpw = (-f $oss_rootpwfile && -r $oss_rootpwfile) ? read_file($oss_rootpwfile) : "";
+chomp $oss_rootpw;
+
+my $root_cmd = "mysql -u$oss_rootuser -p$oss_rootpw -h $oss_hostname -P $oss_port";     # connect to mysql as root user; pwd from console
+my $oss_cmd = "mysql -u$oss_username -p$oss_password -h $oss_hostname -P $oss_port" ;   # connect as oss user
+
+
+if ($grants) {
+    # Grant privileges to an existing database.
+    print STDERR "Granting privileges on '$instance' on $oss_hostname.\n";
+    my ($grant_fh, $grant_filename) = tempfile('/tmp/grant_ossXXXXXX', UNLINK => 1);
+    print $grant_fh <<"EOF";
+grant select on $instance.* to '$oss_username'\@'%' identified by '$oss_password';
+grant select on $instance.* to '$oss_username'\@'localhost' identified by '$oss_password';
+grant select, insert, update, delete on $instance.* to '$osspipe_username'\@'%' identified by '$osspipe_password';
+grant select, insert, update, delete on $instance.* to '$osspipe_username'\@'localhost' identified by '$osspipe_password';
+flush privileges;
+EOF
+    close $grant_fh;
+    system("$root_cmd < $grant_filename") == 0 or die "failed to grant privileges on instance: $?\n";
+    exit;
+}
+else {
+    # Create the instance.
+    print STDERR "Creating database instance '$instance' on $oss_hostname.\n" unless $quiet;
+    my ($create_fh, $create_filename) = tempfile('/tmp/create_ossXXXXXX', UNLINK => 1);
+    print $create_fh <<"EOF";
+drop database if exists $instance;
+create database $instance;
+grant select on $instance.* to '$oss_username'\@'%' identified by '$oss_password';
+grant select on $instance.* to '$oss_username'\@'localhost' identified by '$oss_password';
+grant select, insert, update, delete, create temporary tables on $instance.* to '$osspipe_username'\@'%' identified by '$osspipe_password';
+grant select, insert, update, delete, create temporary tables on $instance.* to '$osspipe_username'\@'localhost' identified by '$osspipe_password';
+flush privileges;
+EOF
+    close $create_fh;
+    system("$root_cmd < $create_filename") == 0 or die "failed to create instance: $?\n";
+}
+
+
+# Create the schema.
+print STDERR "Building schema.\n" unless $quiet;
+my ($schema_fh, $schema_filename) = tempfile('/tmp/create_ossXXXXXX', UNLINK => 1);
+print $schema_fh <<"EOF";
+# Build all PSMOPS
+use $instance;
+source filter_info.sql;
+source ssm_desc.sql;
+source ssm.sql;
+source known.sql;
+source shapes.sql;
+source fields.sql;
+source detections.sql;
+source det_rawattr_v2.sql;
+source tracklets.sql;
+source tracklet_attrib.sql;
+source orbits.sql;
+source derivedobjects.sql;
+source residuals.sql;
+source derivedobject_attrib.sql;
+source history.sql;
+source history_identifications.sql;
+source history_attributions.sql;
+source history_derivations.sql;
+source history_precoveries.sql;
+source history_removals.sql;
+source ingest_status.sql;
+source eon_queue.sql;
+source moid_queue.sql;
+source config.sql;
+source runtime.sql;
+source deteff.sql;
+source locks.sql;
+source mpc-import-export.sql;
+source runs.sql;
+source detection_region.sql;
+source tracklet_oss.sql;
+EOF
+close $schema_fh;
+system("$root_cmd < $schema_filename") == 0 or die "failed to create schema: $?\n";
+
+printf STDERR "Done.\n" unless $quiet;
+
+
+=head1 NAME
+
+create_oss - Create a oss instance
+
+=head1 SYNOPSIS
+
+create_oss [options] SUFFIX
+
+  --grants : just grant privileges, don't modify DB (for maintenance)
+  --quiet : don't print anything to STDERR while we do stuff
+  --help : show manpage
+  SUFFIX : suffix for oss_SUFFIX name; e.g. "100a"
+
+=head1 DESCRIPTION
+
+Generates two mysql scripts to create a database and build its
+schema.  First script runs as mysql root user to create the
+database; second runs as mops user to generate the scheme.
+
+=head1 BUGS
+
+Don't use this script directly.  Use buildInstance instead.  Thanks.
+
+=cut

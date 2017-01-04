@@ -1,0 +1,140 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+digest_master - Use Condor to compute MPC NEO digests
+
+=head1 SYNOPSIS
+
+digest_master [options] --nn NIGHTNUM
+
+  --nn NIGHTNUM : submit requests for all tracklets in night
+  --digest2_bin FILE : override default binary of 'digest2'
+  --all : all tracklets on specified night, otherwise only those in 'T' fields
+  --data_dir DIR : override default data dir of $MOPS_HOME/data/digest2
+  --help : show this manpage
+
+=head1 DESCRIPTION
+
+Processes NEO digests in batch using the Google Code digest2 program from the MPC.
+
+=cut
+
+
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Temp qw(tempfile);
+
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::MPC qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Tracklet;
+
+
+# Start program here.
+my $instance_name;
+my $nn;
+my $digest2_bin = 'digest2';
+my $data_dir = "$ENV{MOPS_HOME}/data/digest2";
+my $rms_threshold;
+my $all;
+my $debug;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    'digest2_bin=s' => \$digest2_bin,
+    'data_dir=s' => \$data_dir,
+    all => \$all,
+    rms_threshold => \$rms_threshold,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+die("Night number not specified") unless $nn;
+
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => undef);
+my $ml = $inst->getLogger();
+my $mc = $inst->getConfig();
+$rms_threshold ||= $mc->{tracklet}->{fit_threshold_arcsec} || die "can't determine fit_threshold_arcsec";
+my $fstatus = $all ? '' : "f.status='T' and";
+
+
+my $dbh = $inst->dbh;
+my $sth = $dbh->prepare(<<"SQL") or $ml->logdie($dbh->errstr);
+select t.tracklet_id tracklet_id 
+from tracklet_attrib ta 
+    join tracklets t using(tracklet_id) 
+    join fields f using(field_id) 
+where $fstatus f.nn=? and t.classification='N' and t.v_tot > .001
+group by tracklet_id
+having count(*) > 2
+order by t.v_tot desc
+SQL
+$sth->execute($nn) or $ml->logdie($sth->errstr);
+printf STDERR "Processing %d tracklets.\n", $sth->rows;
+
+# Write out our input file.  This is a single file of MPC-formatted designations.
+# Since tracklet IDs can be large, map the integer tracklet ID into a packed designation
+# six digits long.
+my $href;
+my ($tmpfh, $tmpfname) = tempfile('neodigest.XXXXXX', DIR => '/tmp', UNLINK => 1);
+$ml->logdie("can't create temp file") unless $tmpfh;
+print STDERR "\nWriting $tmpfname.\n" if $debug;
+
+my %desig2trk;
+my $desig;
+my $trk;
+
+while ($href = $sth->fetchrow_hashref()) {
+    $trk = modct_retrieve($inst, trackletId => $href->{tracklet_id}) or $ml->logdie ("can't fetch tracklet ID " . $href->{tracklet_id});
+    $desig = mopslib_toB62($trk->trackletId, 'T000000');
+    $desig2trk{$desig} = $trk;      # save mapping from desig to tracklet
+    print $tmpfh det2mpc($_, $desig), "\n" foreach @{$trk->detections};
+}
+$tmpfh->close();
+
+
+# Now run the digests in batch, then snarf the results.
+print STDERR "Running digests.";
+chdir $data_dir or $ml->logdie("can't chdir to data directory $data_dir");
+my $digest2fh = new FileHandle "$digest2_bin $tmpfname|" or $ml->logdie("can't execute '$digest2_bin $tmpfname'");
+my $line;
+my ($rms, $int_score, $neo_score);
+my $digest;
+my $n = 0;
+while ($line = <$digest2fh>) {
+    # digest2 v 0.10 looks like this without digest2.config
+    # Desig.    RMS Int NEO N22 N18 Other Possibilities
+    # T196298  0.03  75  74  15   0 (MC 17) (MB1 <1) (MB2 4) (MB3 3) (Hil <1) (JFC 1)
+    #
+    # digest2 v 0.10 looks like this WITH digest2.config specifying NEOs only
+    # Desig.    RMS NEO
+    # T196298  0.03 75
+
+    next unless $line =~ /^T/;      # must look like digest output
+    ($desig, $rms, $neo_score) = split /\s+/, $line;
+    $trk = $desig2trk{$desig} || $ml->logdie("missing tracklet for $desig");
+
+    if ($rms < $rms_threshold * 2) {
+        $digest = $neo_score;
+    }
+    else {
+        $digest = 0;   # doesn't meet threshold, mark as unprobable
+    }
+
+    if ($debug) {
+        print STDERR $trk->trackletId . "/$desig => $digest\n";
+    }
+    else {
+        $trk->digest($digest);
+    }
+
+    print STDERR '.' if $n++ % 100 == 0;
+}
+print STDERR "\n";
+$ml->info("NEODIGEST: $n digests completed.");
+
+exit;

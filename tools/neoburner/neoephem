@@ -1,0 +1,9 @@
+#!/bin/sh
+
+OID=$1
+echo $OID
+
+mt --xd $OID > detections.des
+oorb --task=ranging --conf=oorb.conf.neo_probability --obs-in=detections.des --orb-out=orbits.orb
+#oorb --conf=oorb.conf.neo_probability --task=classification --orb-in=orbits.orb
+oorb --conf=oorb.conf.neo_probability --task=ephemeris ----orb-in=orbits.des

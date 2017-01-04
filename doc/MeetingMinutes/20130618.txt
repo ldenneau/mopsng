@@ -1,0 +1,105 @@
+ATTENDING (alphabetical):
+Bolin (BB), Chastel (SC/chair), Denneau (LD), Engelhardt (TE), Hsieh (HH), Jedicke (RJ/scribe), Kleyna (JK), Veres (PV), Wainscoat (RW/on phone)
+AGENDA:
+
+* PS1 status (Chastel)
+everything was fine till this morning
+autofocus problem last week was fixed
+LD was related to broken OTIS3 system
+last night's data delayed but otherwise IPP is in SOP
+
+* NEO status (Veres)
+in the last 3 weeks since the last MOPS meeting PS1 found 11 NEOs in just 5 nights of observing
+all but 3 found in OSS
+NEO total is close to 600
+RW in June CSS seems to leap over the galactic plane and beat PS1
+this gives them 'fresh' sky to find NEOs
+some discussion about new tiling/chunking in OTIS to enhance NEO detection
+LD thinks there needs to be an all-sky tiling
+* IPP Synthetics (Chastel)
+wants to inject synthetic detections into images and then pass thru entire IPP+MOPS
+injection occurs after detrending which includes e.g. burntool, bias, dark, flat, etc.
+so that the background is flat
+he is using the Veres trail model
+every single input detection is trailed
+thinks he will have something ready by the end of this week
+expects to be able to provide e.g. eff wrt mag, rate, location
+maybe more important to see how derived signal varies with input signal
+
+* Data Czaring (Chastel)
+this is SC's normal daily processing
+* NEO Czaring (Bolin)
+should digest<50 candidates be submitted?
+LD the MPC says to submit anything with digest>30 
+  but 30<digest<50 will probably not make it to the CP
+LD if they are submitted in batch then they are all submitted as NEO candidates
+RW is working with MM on followup of lower digest score objects
+  MM has a different technique using KNOBS
+  they think that there is some utility in followup
+RJ Veres did a study that shows NEO probability vs. NEO score
+  PV says that NEO probability is <10% for objects with digest<90
+
+* Comets (Hsieh and/or Kleyna)
+3 comet pages are known asteroids, submitted objects, unknown fuzzies
+most discovered comets have come from submitted objects
+all submitted objects are scored by comet probability
+does not work well with pairs and with increase in NEO time 
+  false detections have gone up dramatically
+he has found some known comets
+wants the experimental page to be elevated to operational status
+there is no formal policy about czaring the comet page
+there is no person assigned to the process
+BB checks the submitted page for comets but nobody is regularly looking at other pages
+BB willing to take on the burden of regular czaring
+RJ this could be a major workload increase
+HH might not be too bad with the new comet pages
+SC who is qualified to do this czaring?
+  many can do it
+RW have both formally unreported comets been reported?
+HH yes.  one is a NEO/comet, the other is a Hilda/comet
+  neither are individually interesting but may be paper-worthy as an ensemble
+  PS1 seems to be finding low activity comets
+  e.g. our MBC/'comet' ratio is high relative to other sites
+* Communication with external entities (MPC, CBAT...)
+we need a template for submission
+RJ suggests that template be explicitly sent out with subject: MPEC template
+HH volunteered to make the template
+agreed that submissions must first be approved by at least one of
+RW, LD and if they are not available then MM, HH
+* Galactic plane issues: plans for the future?
+considered above re deciding which chunks should be surveyed
+BB says the false detection rate is ind. of gal. lat.  (he should figs supporting the claim)
+LD (&RJ) don't understand this
+it is probably that these are the detections that make it thru to MOPS
+* MOPS and NEO clusters source code/binaries convergence (Chastel)
+goal is to have same software on both clusters
+SC plans on looking at it next week
+LD need to ensure that no simulations are running while merge takes place
+* AOB: Manual submission of detections (Veres)
+see his most recent email for details
+when PV submits new detections they are not always replaced at MPC
+MPC can not automatically handle all updates
+LD MOPS will not allow resubmission of 'identical' detections
+sometimes IDL trail fits do not work on MOPS site
+  LD how can this be flagged?
+  not clear but PV is thinking about using a visual comparison between fit & data
+  RJ thinks anything manual is untenable, should not lose sight of automation goal
+  SC has a similar idea but also manual
+LD MPC claims that they will eventually accept an entirely reprocessed PS1 dataset
+RJ does MPC allow observatories to provide detection IDs?
+  not even new format allows it
+* AOB: Detleff Koschny (ESO)
+DK is applying for VLT time for NEO followup
+requested # of lost PS1 NEO candidates to justify proposal
+LD why can't he go to MPC ONS DB?
+RJ not a well-phrased question because what defines a NEO candidate?
+  digest>90?  digest>50?
+  PV has already done a study showing large fraction of digest>90 objects 
+    are already followed up
+HH VLT doesn't have wide field imager, is essentially east coast time
+RJ probably not important at current NEO rates 
+  but could be very important when rate increases with PS1 & PS2
+seems clear that RW and Fitzsimmons are the people to confirm 
+  that this should be pursued
+
+

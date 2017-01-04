@@ -1,0 +1,127 @@
+#!/usr/bin/env perl
+# $Id: nsplit 5268 2013-03-13 01:28:19Z denneau $
+
+use strict;
+use warnings;
+
+use FileHandle;
+use File::Slurp;
+use Pod::Usage;
+use Getopt::Long;
+use File::Basename;
+
+use PS::MOPS::Config;
+
+
+my $basename;
+my $repeat_headers;
+my $num;
+my $prefix;
+my $help;
+GetOptions(
+    'basename=s' => \$basename,
+    repeat_headers => \$repeat_headers,
+    prefix => \$prefix,
+    'num=i' => \$num,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $in_filename = shift || '-';
+if ($in_filename eq '-') {
+    die "--basename=NAME must be specifieid when input is STDIN.\n" unless $basename;
+}
+else {
+    $basename = basename($in_filename) unless $basename;    # grab if not already specified
+}
+
+
+# Open input file.
+my @suffixes = map { sprintf "%d", $_ } 0..$num-1;
+my $fh = FileHandle->new($in_filename) or die "can't open $in_filename";
+
+# Start splittin' em.
+my $n;
+my $i;
+my $nf = @suffixes; # number of nodes
+my @fhs;            # file handles
+my $line;           # input line
+my @filenames;      # list of files we're writing
+
+# Create output filehandles.
+foreach $n (0..$nf - 1) {   # foreach numbered file
+    my $part;
+    if ($prefix) {
+        $part = $suffixes[$n] . ".$basename";   
+    }
+    else {
+        $part = "$basename." . $suffixes[$n];  
+    }
+    $fhs[$n] = new FileHandle(">$part") or die "can't open $part";
+    push @filenames, $part;
+}
+
+# Now read lines one at a time from input and route to appropriate output file.
+# If our first line is a header line, write headers lines to all files until
+# we encounter a non-header line.
+$i = 0;                    # line index
+my $tfh;
+
+# First process headers.
+unless ($repeat_headers) {
+    while (defined($line = <$fh>)) {
+        if ($line =~ /^#/) {
+            print $_ $line foreach @fhs;        # write header to all filehandles
+        }
+        else {
+            # Not a header line, so process "normally", then continue in next block.
+            $tfh = $fhs[$i % $nf];
+            print $tfh $line;
+            $i++;
+            last;
+        }
+    }
+}
+
+# Regular processing.
+while (defined($line = <$fh>)) {
+    $tfh = $fhs[$i % $nf];
+    print $tfh $line;
+    $i++;
+}
+
+close $fh;              # close input file
+close $_ foreach @fhs;  # close all output files
+
+# Print node names to STDOUT.
+print STDERR join(' ', @filenames), "\n";
+
+
+=head1 NAME
+
+nsplit - Split large file into smaller parts
+
+=head1 SYNOPSIS
+
+nsplit --num N [--help] inputfile
+
+  --basename=NAME : use NAME as base filename
+  --prefix : put file numbers before filename, not after
+  num N : split file into N pieces, collated
+
+=head1 DESCRIPTION
+
+nsplit takes a large file and splits it into smaller pieces for processing
+by nodes in a clustering environment.  if "-" is specified for inputfile,
+then STDIN is read, and --basename=NAME must be specified to name the
+output files.
+
+Note that nsplit interleaves its output so that successive lines go to
+different files.  This usually guarantees that the output files will
+have similar contents so that processing on them will usually take
+the same amount of time.
+
+If --repeat_headers is specified, the initial header/comment lines
+(beginning with '#') are repeated in each of the split files.
+
+=cut

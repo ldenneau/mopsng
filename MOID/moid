@@ -1,0 +1,222 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+moid - batch-compute MOIDs using MOPS MOID queue
+
+=head1 SYNOPSIS
+
+moid
+
+  --help : show this manual page
+
+=head1 DESCRIPTION
+
+moid computes the MOID of all derived objects in the MOID queue.
+The input and output orbit files are produced in DES format.  The actual
+program to execute is specified in the moid section of master.cf.
+
+=cut
+
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Temp qw(tempfile);
+use File::Slurp;
+use Params::Validate;
+use Data::Dumper;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Orbit;
+use PS::MOPS::DC::MOIDQueue;
+
+
+use subs qw(
+);
+
+our $MOID_Q_THRESHOLD_AU = 1.3;         # 1.3 AU is NEO cutoff
+my $t0 = time;
+
+
+my $inst;
+my $instance_name;
+my $nodb;
+my $file_prefix = '';
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    nodb => \$nodb,
+    'file_prefix=s' => \$file_prefix,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+
+# MOPS Configuration.
+my $moid_section = $mops_config->{eon};
+if ($moid_section) {
+    $mops_logger->warn("Please move your moid configuration from the 'eon' section to the 'moid' section");
+}
+else {
+#    $moid_section = $mops_config->{moid} || die "can't find moid section in configuration";
+    $moid_section = $mops_config->{moid} || $mops_logger->warn( "can't find moid section in configuration; will be disabled");
+    $moid_section = {} unless %{$moid_section};
+}
+
+my $compute_moid = $mops_config->{main}->{enable_moid};
+unless ($compute_moid) {
+    eval {
+        PS::MOPS::DC::MOIDQueue->flush($inst);       # ker-flush
+    };
+    $mops_logger->warn($@) if $@;
+    exit;
+}
+my $moid_program = $moid_section->{moid_program} || die "can't get moid_program from config";
+
+
+# Get all objects in the queue and build a hash table whose keys are
+# the orbit IDs.
+my $todo_list = PS::MOPS::DC::MOIDQueue->retrieve($inst);
+$mops_logger->info(sprintf "MOID: %d orbit(s) in queue.", scalar @{$todo_list});
+
+if (scalar @{$todo_list} == 0) {
+    exit 0;
+}
+
+
+# Do our stuff here.
+my $orbit;
+
+
+# Allow caller to specify prefix for MOID filenames in case we have multiple runs
+# in the same directory.
+my $in_filename;
+my $out_filename;
+if ($file_prefix) {
+    $in_filename = $file_prefix . '.MOID.IN.des';
+    $out_filename = $file_prefix . '.MOID.OUT.des';
+}
+else {
+    $in_filename = 'MOID.IN.des';
+    $out_filename = 'MOID.OUT.des';
+}
+
+my $fh;
+my $n;
+
+
+# Fetch all derived objects and write their orbits to the DATA file.
+my %orbitId2orb;
+$fh = new FileHandle ">$in_filename" or $mops_logger->logdie("can't open $in_filename");
+print $fh <<"HEADER";
+!!oid COM q(AU) e I(deg) Omega(deg) argperi(deg) t_peri(MJD) absmag epoch(MJD) index n_par moid ccode
+HEADER
+$n = 0;
+my $use;
+foreach $orbit (@{$todo_list}) {
+    # Compute q - dq for orbit.  If this value is greater than 1.3, we are not
+    # interested in the MOID (it's not an NEO).  Also note that dq is the 2nd
+    # diagonal element in the sqrt cov matrix; see mysql/orbits.sql, and that
+    # we're using the 3-sigma uncertainty.
+
+    $use = 0;
+    if ($orbit->covariance) {
+        # 2nd diagonal element is 3rd [base 0 index 2] item in upper-triangular matrix.
+        $use = 1 if (($orbit->q - 3 * ($orbit->covariance)->[2]) < $MOID_Q_THRESHOLD_AU);
+    }
+    else {
+        # We don't have 
+        $use = 1 if ($orbit->q > $MOID_Q_THRESHOLD_AU);
+    }
+
+    if ($use) {
+        print $fh orb2com($orbit), "\n";
+        $n++;
+        $orbitId2orb{$orbit->objectName} = $orbit;
+    }
+}
+
+close $fh;
+$mops_logger->info(sprintf "MOID: %d orbits are potential NEOs", $n);
+
+# Schwing them through MOID program.
+my $cmd = $moid_program;
+$cmd =~ s/\$INPUT\b/$in_filename/;
+$cmd =~ s/\$OUTPUT\b/$out_filename/;
+$cmd =~ s/\$MOPS_HOME\b/$ENV{MOPS_HOME}/;
+
+# Handle attrib re-runs in same directory.  Need to empty previous out file if present.
+$fh = new FileHandle ">$out_filename" or $mops_logger->logdie("can't truncate $out_filename");
+$fh->close();
+
+# Now execute MOID.
+system($cmd) == 0 or $mops_logger->logdie("$cmd failed");
+
+# Slurp results, put back in DB.  Need to map object names back to orbit IDs,
+# then write them to DB.
+$fh = new FileHandle "$out_filename" or $mops_logger->logdie("can't open $out_filename");
+my @stuff = grep { !/^!!/ and !/^#/ } <$fh>;
+chomp @stuff;
+close $fh;
+
+my @goo;
+my $moid;
+my $orb;
+my $dbh = $inst->dbh();
+
+$inst->atomic($dbh, sub {
+    foreach my $line (@stuff) {
+        @goo = split /\s+/, $line;
+        if (scalar @goo != 14) {
+            $mops_logger->logwarn("wrong number of tokens in line: $line\n");
+            next;
+        }
+        $moid = $goo[-2];       # MOID
+        $orb = $orbitId2orb{$goo[0]};        # get orbit
+        $orb->moid_1($moid);
+        PS::MOPS::DC::Orbit::_update($dbh, $orb);
+    }
+
+    PS::MOPS::DC::MOIDQueue->flush($inst) or die "can't flush MOID queue";
+});
+$mops_logger->info(
+    mopslib_formatTimingMsg(
+        subsystem => 'MOID',
+        time_sec => (time - $t0),
+        nn => 0,
+    )
+);
+
+# Clean up.
+File::Temp::cleanup();      # clean up temp dirs/files
+exit 0;
+
+
+sub orb2com {
+    # Convert an orbit object to a DES cometary orbit string.
+    my ($orb) = @_;
+    return join " ", 
+        $orb->objectName,
+        'COM',
+        $orb->q, 
+        $orb->e,
+        $orb->i,
+        $orb->node,
+        $orb->argPeri,
+        $orb->timePeri,
+        $orb->hV, 
+        $orb->epoch, 
+        1,          # index
+        6,          # npar
+        -1,         # MOID
+        'MOPS',      # 'orbit computer'
+}   

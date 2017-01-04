@@ -1,0 +1,127 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Pod::Usage;
+use Getopt::Long;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::LSD;
+
+
+# Start program here.
+my $inst;
+my $instance_name;
+my $terminal;
+my $xrange;
+my $xsize = 1024;
+my $ysize = 768;
+my $field_id;
+my $filename;
+my $hc;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'terminal=s' => \$terminal,
+    'xrange=f' => \$xrange,
+    'xsize=s' => \$xsize,
+    'ysize=s' => \$ysize,
+    'field_id=i' => \$field_id,
+    hc => \$hc,
+    help => \$help,
+) or pod2usage(2);
+$filename = shift;
+
+# Either --field_id ID or filename must be specified.
+if (!$filename and !$field_id) {
+    pod2usage(-msg => 'Either FILENAME or --field_id must be specified');
+}
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $hc_thresh = $mops_config->{site}->{limiting_s2n};
+
+my @hc_dets;
+my @lc_dets;
+if ($field_id) {
+    my $field = modcf_retrieve($inst, fieldId => $field_id);
+    my $dir = $inst->makeNNDir(NN => $field->nn, SUBSYS => 'lsdingest');
+    $filename = "$dir/$field_id.nsd.src.bin";   # hope it's still there
+}
+
+my $stuff;
+my $sz = -s $filename;
+open FH, $filename or die "can't open $filename";
+my $num_read = read FH, $stuff, $sz;
+die "short read" unless $num_read == $sz;
+close FH;
+
+my $num_dets = (length $stuff) / PS::MOPS::LSD::NSD_TEMPLATE_LENGTH;
+my $buf;
+for my $i (1..$num_dets) {
+    $buf = substr($stuff, ($i - 1) * PS::MOPS::LSD::NSD_TEMPLATE_LENGTH, PS::MOPS::LSD::NSD_TEMPLATE_LENGTH);
+    my ($field_id, $det_num, $epoch_mjd, $ra_deg, $dec_deg, $mag, $s2n, @other) = 
+        unpack PS::MOPS::LSD::NSD_PACK_TEMPLATE, $buf;
+    if ($s2n > $hc_thresh) {
+        push @hc_dets, [ $ra_deg, $dec_deg, $s2n ];
+    }
+    else {
+        push @lc_dets, [ $ra_deg, $dec_deg, $s2n ];
+    }
+}
+
+# Scrub opts.
+my $terminal_str = '';
+if ($terminal) {
+    $terminal = 'postscript solid' if ($terminal eq 'postsscript' or $terminal eq 'eps');
+    $terminal = 'postscript enhanced color solid' if ($terminal eq 'postscriptc' or $terminal eq 'epsc');
+
+    my $size_str = '';
+    if ($terminal eq 'png') {
+        $size_str = "size $xsize, $ysize font arial 12"
+    }
+
+    $terminal_str = "set terminal $terminal $size_str";
+}
+
+print <<"EOF";
+set fontpath "/usr/lib/X11/fonts/TTF"
+$terminal_str
+set xrange [] reverse
+set xlabel 'RA (deg)'
+set ylabel 'Declination (deg)'
+
+plot \\
+"-" using 1:2 title 'HC' lt 1 pt 1,\\
+"-" using 1:2 title 'LC' lt 3 pt 1
+EOF
+
+# Now emit the detection data.
+print "@{$_}\n" foreach @hc_dets;
+print "e\n";
+print "@{$_}\n" foreach @lc_dets;
+print "e\n";
+
+exit 0;
+
+=head1 NAME
+
+lsdplot - Plot RA/DEC of packed LSDs in GNUPLOT
+
+=head1 SYNOPSIS
+
+lsdplot [options] --field_id ID
+lsplot [options] FILENAME
+
+  --field_id ID : field ID to plot
+  FILENAME : filename from which to extract LSDs
+
+  --hc : only plot high-confidence detections
+
+=head1 DESCRIPTION
+
+lsdplot generates a GNUPLOT command file that plots detections from packed LSD files.
+
+=cut

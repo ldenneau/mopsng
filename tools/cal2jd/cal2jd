@@ -1,0 +1,165 @@
+#!/usr/bin/env perl
+
+# $Id: cal2jd 4088 2010-09-07 14:54:05Z denneau $
+# Convert calendar dates to MJD or JD
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Astro::Time;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib;
+
+
+my %MONTHS = (
+    jan => 1,
+    feb => 2,
+    mar => 3,
+    apr => 4,
+    may => 5,
+    jun => 6,
+    jul => 7,
+    aug => 8,
+    sep => 9,
+    'oct' => 10,
+    nov => 11,
+    dec => 12,
+);
+
+my $today;
+my $mjd;
+my $tjd;
+my $ocnum,
+my $help;
+GetOptions(
+    today => \$today,
+    mjd => \$mjd,
+    tjd => \$tjd,
+    ocnum => \$ocnum,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+pod2usage(3) unless (@ARGV or $today);
+
+my $s;
+my ($year, $month, $day);
+my ($a, $b, $c);
+
+if ($today) {
+    my @schmoo = gmtime;
+    $year = $schmoo[5] + 1900;
+    $month = $schmoo[4] + 1;
+    $day = $schmoo[3] + ($schmoo[2] * 24 + $schmoo[1] * 60 + $schmoo[0]) / 86400;
+}
+else {
+    $s = join " ", @ARGV;
+
+    if ($s =~ /^(\d\d\d\d)-(\d\d)-(\d\d)T(\d\d):(\d\d).*Z$/) {
+        $year = $1;
+        $month = $2;
+        $day = $3;
+        $day += ($4 * 3600 + $5 * 60) / 86400;
+    }
+    else {
+        ($a, $b, $c) = split /[-\s\/]+/, $s, 3;
+        if ($a =~ /\./) {
+            # day first (contains decimal point, must be fractional)
+            $year = $c;
+            $day = $a;
+        }
+        elsif ($a =~ /^\d\d\d\d$/ or (length($a) > length($c))) {
+            # year first
+            $year = $a;
+            $day = $c;
+        }
+        else {
+            # year last
+            $year = $c;
+            $day = $a;
+        }
+
+        $b = lc($b);
+        if (exists($MONTHS{$b})) {
+            $month = $MONTHS{$b};
+        }
+        else {
+            $month = $b;
+        }
+
+        pod2usage(-verbose => 2) unless ($a and $b and $c);
+        die "weird year: $year\n" unless length($year) == 4;
+    }
+}
+
+
+# Look for M/D/YYYY format (you shouldn't use this)
+if ($month > 12 && $month <= 31) {
+    ($month, $day) = ($day, $month);    # swap
+}
+die "bogus month\n" unless $month >= 1 and $month <= 12;
+
+my $frac;
+($day, $frac) = (int($day), $day - int($day));
+
+my $d = cal2mjd($day, $month, $year, $frac);
+my $ocstr = '';
+if ($ocnum) {
+    $ocstr = PS::MOPS::Lib::mopslib_mjd2ocnum($d) . ' ';
+}
+
+if ($mjd) {
+    print $ocstr, $d, "\n";
+}
+elsif ($tjd) {
+    print $ocstr, int($d % 10000), "\n";
+}
+else {
+    print $ocstr, $d + $MJD2JD_OFFSET, "\n";
+}
+
+
+=head1 NAME
+
+cal2jd - Convert calendar dates to JD or MJD
+ 
+=head1 SYNOPSIS
+
+cal2jd [--mjd] date
+
+  --mjd : return MJD (JD - 2400000.5) instead of JD
+  --tjd : return TJD (local night number, usually MJD - 50000)
+  --ocnum : show OC number as well
+  --help : show usage
+  date : string representation of date.  Allowed formats:
+    2005-01-18, 2005 1 18, 1-18-2005, 18-JAN-2005, 2005-JAN-18
+ 
+=head1 DESCRIPTION
+
+cal2jd converts calendar dates to numeric JD or MJD.  Nominally you
+should use the "YEAR MONTH DAY" or "DAY MONTH YEAR", but cal2jd will
+accept all of the following formats:
+
+=over 1
+
+cal2jd 2005-01-18
+
+cal2jd 2005 0 18
+
+cal2jd "2005 0 18"
+
+cal2jd 1-18-2005
+
+cal2jd 18-JAN-2005
+
+cal2jd 2005-JAN-18
+
+=back
+
+cal2jd will do the Right Thing if the day and month are transposed and
+date is greater than 12 and less than 32.
+
+=cut
+

@@ -1,0 +1,96 @@
+#!/usr/bin/env perl
+
+# catobservations
+# write out MOPSDC observations in FieldProximity input format.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Params::Validate;
+use File::Temp qw(tmpnam);
+use Astro::Time;
+use PS::MOPS::DC::Observation;
+
+
+sub elems2str {
+    my ($obs, $radius) = @_;
+    if (!$obs) {
+        warn "bogus obs";
+        return;
+    }
+    if (defined($radius)) {
+        return (join " ", 
+            $obs->observationId, 
+            $obs->epoch, 
+            $obs->ra, 
+            $obs->dec, 
+            $radius) . "\n";
+    }
+    else {
+        return (join " ", 
+            $obs->observationId, 
+            $obs->epoch, 
+            $obs->ra, 
+            $obs->dec) . "\n";
+    }
+}
+
+
+my %OPTS;
+#getopts('hd:i:r:', \%OPTS);
+GetOptions(\%OPTS, qw(
+    radius=f
+    date=f
+    observationId=s
+    help
+)) or pod2usage(2);
+pod2usage(-verbose => 2) if $OPTS{help};
+
+my $radius = ($OPTS{radius} or undef);
+my $obs_i;  # DC result iterator
+my $obs;
+
+if ($OPTS{date}) {
+    $obs_i = modcm_retrieve(date => $OPTS{date});  # fetch iterator object
+    #$obs_i = modcm_retrieve(all => $OPTS{date});  # fetch iterator object
+    while (defined($obs = $obs_i->next)) {
+        print elems2str($obs, $radius);
+    }
+}
+elsif ($OPTS{observationId}) {
+    $obs = modcm_retrieve(observationId => $OPTS{observationId});
+    print elems2str($obs, $radius);
+}
+else {
+    $obs_i = modcm_retrieve(all => 1);
+    while (defined($obs = $obs_i->next)) {
+        print elems2str($obs, $radius);
+    }
+}
+
+=head1 NAME
+ 
+catObservations - Query observations in MOPSDC and write out information
+ 
+=head1 SYNOPSIS
+ 
+catObservations [--date DATE_MJD] [--observationId ID] [--radius R_deg]
+    [--help]
+
+  --date DATE_MJD : date of observations to output, MJD
+  --observationId ID : fetch single observation with specified ID
+  --radius R_deg : radius value to append on each line, degrees
+  --help : show usage
+
+=head1 DESCRIPTION
+
+Output all observations in MOPSDC that occur between MJD date and MJD
+date + 1.  If radius is specified, append this value to each line for
+use by FieldProximity.
+
+=head1 NOTES
+
+=cut
+

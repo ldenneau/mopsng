@@ -1,0 +1,247 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Data::Dumper;
+use Pod::Usage;
+use FileHandle;
+use Astro::SLA;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::SSM;
+
+
+# Options.
+my $inst;
+my $instance_name;
+my $mjd;
+my $fields_from;
+my $debug;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'mjd=i' => \$mjd,
+    'fields_from=s' => \$fields_from,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+pod2usage(3) if @ARGV != 2;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_logger = $inst->getLogger;
+my $mops_config = $inst->getConfig;
+
+
+# Field status management.
+my $START_FIELD_STATUS = $FIELD_STATUS_SYNTH;
+my $END_FIELD_STATUS = $FIELD_STATUS_TRACKLETS_DONE;
+
+# Global findable tracklet table.
+my %findable_name2cnt;
+my $tracklet_min_obs = $mops_config->{findtracklets}->{minobs};     # min obs required for tracklet
+
+# min tracklet velocity threshold
+my $minv_degperday = $mops_config->{findtracklets}->{minv_degperday} || 0;     # min sky vel required for tracklet
+
+
+sub miti_slurp {
+    # Read in MITI file of detections.  For each line in the detections
+    # file, create a list of its elements.
+    my $filename = shift;
+    my $line;
+    my @detections;
+
+    open my $fh, $filename or $mops_logger->logdie("can't open MITI file $filename");
+    my $items;
+    my $name;
+    while (defined($line = <$fh>) and $line !~ /^#/) {
+        $items = [split /\s+/, $line];
+        push @detections, $items;
+        $name = $items->[6];
+        if ($name and $name =~ /^S/) {
+            # SSM object, so count.
+            push @{$findable_name2cnt{$name}}, $items;
+        }
+    }
+    close $fh;
+
+    # Remove efficiency objects that have only one detection.  We're
+    # not concerned with creating tracklets for them.
+    foreach my $key (keys %findable_name2cnt) {
+        if (@{$findable_name2cnt{$key}} < $tracklet_min_obs) {
+            delete $findable_name2cnt{$key};
+        }
+    }
+    $mops_logger->info(sprintf "Efficiency: checking %d tracklets", scalar keys %findable_name2cnt);
+
+    return \@detections;
+}
+
+
+sub pair_slurp {
+    # Read in an entire pair file.  Result is an ARRAYREF
+    # containing ARRAYREFs.  Each value in the result table
+    # corresponds to a line number in the MITI detections file, from
+    # which we'll fetch detection IDs.
+    my $filename = shift;
+    my $line;
+    my @tracklets;
+
+    open my $fh, $filename or $mops_logger->logdie("can't open $filename");
+    while (defined($line = <$fh>)) {
+        push @tracklets, [split /\s+/, $line];
+    }
+    close $fh;
+    return \@tracklets;
+}
+
+
+my ($mitifile, $pairfile) = @ARGV;	# copy list of filenames
+
+my $miti_stuff = miti_slurp($mitifile);
+$mops_logger->info(sprintf "Found %d detections.", scalar @$miti_stuff);
+
+my $pair_stuff = pair_slurp($pairfile);
+$mops_logger->info(sprintf "Found %d tracklets.", scalar @$pair_stuff);
+
+$inst->pushAutocommit(0); # disable DC autocommit
+
+
+eval {
+    my $pair_list;
+    my $tracklet;
+    my $rownum;
+    my $n = 0;
+    my $rejected = 0;           # count of rejected tracklets due to minv_degperday
+    my @dets;
+    my $det;
+    my $detId;
+
+    foreach $pair_list (@{$pair_stuff}) {
+        # Fetch detections for this "pair".
+        @dets = ();
+        foreach $rownum (@{$pair_list}) {
+            $detId = $miti_stuff->[$rownum]->[0];
+            $det = modcd_retrieve($inst, detId => $detId);
+            push @dets, $det;
+        }
+
+        my ($classification, $objectName) = modcd_classifyDetections($inst, @dets);
+        my $ssmId;
+
+        # If the tracklet was clean, remove it from the global table of findable
+        # tracklets.
+        if ($classification eq $MOPS_EFF_CLEAN) {
+            delete $findable_name2cnt{$det->objectName};        # use last det for object name
+            $ssmId = modcs_objectName2ssmId($inst, $objectName);
+        }
+
+        $tracklet = PS::MOPS::DC::Tracklet->new(
+            $inst,
+            detections => \@dets,
+            classification => $classification,
+            ssmId => $ssmId,
+        ) or $mops_logger->logdie("can't create tracklet using detections " . join(' ', @dets));
+
+        if (!$minv_degperday or $tracklet->vTot > $minv_degperday) {
+            $tracklet->insert;
+            $n++;
+            print STDERR $n, "\n" if $n % 1000 == 0;
+        }
+        else {
+            $rejected++;
+        }
+
+    }
+    $mops_logger->info(sprintf "Inserted %d tracklets.", $n);
+    $mops_logger->info(sprintf "Rejected %d tracklets.", $rejected) if $rejected > 0;
+
+
+    # Now handle missing tracklets.  At this point %findable_name2cnt
+    # contains only detection lists for objects that have not had
+    # clean tracklets created for them.
+    foreach $miti_stuff (keys %findable_name2cnt) {
+        @dets = ();
+        push @dets, modcd_retrieve($inst, detId => $_->[0]) foreach @{$findable_name2cnt{$miti_stuff}};
+        $tracklet = PS::MOPS::DC::Tracklet->new(
+            $inst,
+            detections => \@dets,
+            classification => $MOPS_EFF_UNFOUND,
+            ssmId => modcs_objectName2ssmId($inst, $miti_stuff),
+        ) or $mops_logger->logdie("can't create tracklet using detections " . join(' ', @dets));
+        $tracklet->insert;
+    }
+
+
+    # Clean up.  Mark field as processed.
+    if ($mjd) {
+        $mops_logger->info("Marking fields.");
+        my $field_i = modcf_retrieve($inst, date_mjd => $mjd);
+        my $f;
+        while (defined ($f = $field_i->next)) {
+            $f->status($END_FIELD_STATUS);   # mark it!
+        }
+    }
+    elsif ($fields_from) {
+        my $fh = new FileHandle $fields_from or $mops_logger->logdie("can't create FileHandle for $fields_from");
+        my @field_ids = <$fh>;
+        chomp @field_ids;
+        close $fh;
+
+        $mops_logger->info("Marking field IDs: " . join(' ', @field_ids));
+        foreach my $id (@field_ids) {
+            my $f = modcf_retrieve($inst, fieldId => $id) or $mops_logger->logdie("can't retrieve field ID $id");
+            $f->status($END_FIELD_STATUS);   # mark it!
+        }
+    }
+    else {
+        $mops_logger->info("No MJD or fields file specified, not marking fields");
+    }
+};      # eval
+
+if ($@) {
+    $mops_logger->warn('ROLLBACK');
+    $inst->dbh->rollback;
+    die $@; }
+else {
+    $inst->dbh->commit;
+}
+exit;
+
+
+
+=head1 NAME
+
+insertTracklets - Program to insert MOPS tracklets from FindTracklets output
+
+=head1 SYNOPSIS
+
+insertTracklets [options] detectionsfile pairsfile
+    --mjd DATE : data acquired on this MJD, mark all fields in this MJD as processed
+    --fields_from FILENAME : instead of operating on MJD, just operate on field IDs in FILENAME
+    --debug : enable esoteric debugging flags
+    --help : show this man page
+    detectionsfile : MITI input file to FindTracklets
+    pairsfile : 'pairs file' from FindTracklets
+
+=head1 DESCRIPTION
+
+insertTracklets takes output from the FindTracklets program in the format
+
+rownum rownum rownum rownum
+rownum rownum rownum rownum
+rownum rownum rownum rownum
+etc.
+
+where each row in the input file specifieds a complete tracklet and lists
+row numbers (and thus detection IDs) in the input file of detections.
+insertTracklets obtains detection objects for each detection and inserts
+a tracklet object into MOPSDC.
+
+=cut

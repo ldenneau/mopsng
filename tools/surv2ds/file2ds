@@ -1,0 +1,163 @@
+#! /usr/bin/env perl
+
+=head1 NAME
+
+file2ds - Copy FITS files to current instance's datastore
+
+=head1 SYNOPSIS
+
+file2ds [options] [FILENAMES]
+
+  --instance=INSTANE_NAME : specify simulation to use
+
+=head1 DESCRIPTION
+
+Copies specified files to the current MOPS instance's datastore.
+
+=cut
+
+print STDERR <<"EOF";
+Please use register_fileset now. Thanks.
+EOF
+exit;
+
+
+
+
+# $Id$
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Copy;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::Constants qw(:all);
+
+use PS::MOPS::FITS::IPP;
+
+use subs qw(
+    submit_to_datastore
+);
+
+my @default_de = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+my $default_ds_type = 'DETECTION';         # DS file type
+
+# Job exit codes:
+#  0 - successfully processed some data
+#  1 - no data to process
+#  2 - other MOPS failure 
+#  3 - exit via stop request
+#  99 - internal error in job
+my $EXIT_SUCCESS_PROCESSED = 0;
+my $EXIT_SUCCESS_NODATA = 1;
+my $EXIT_MOPS_FAIL = 2;
+my $EXIT_STOP = 3;
+my $EXIT_FAIL = 99;
+
+
+my $instance_name;
+my $inst;
+my $help;
+
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+my $gmt_offset_hours = $mops_config->{site}->{gmt_offset_hours};
+
+# Now check some args.
+pod2usage(-msg => 'No filenames specified.') unless @ARGV;
+
+foreach my $filename (@ARGV) {
+    die "can't read filename" unless -r $filename;
+    submit_to_datastore($filename);
+}
+
+exit;
+
+
+sub submit_to_datastore {
+	my ($src_file) = @_;
+	my ($destdir) = '/usr/local/MOPS_DEV/ds/dsroot/det';
+    my $dbname = $inst->dbname();
+
+	my $fh = new FileHandle;
+
+	my ($sec,$min,$hour,$mday,$mon,$year) = gmtime(time);
+	$mon++;
+	$year += 1900;
+
+    my $state = "N";
+
+    # See if the directory exists.  If not, create it and initialize
+    # the count file and index.
+    my $dbdir = $destdir . "/" . $dbname;
+    my $index = $destdir . "/index";
+    my @dbstat = stat($dbdir);
+
+    unless (@dbstat) {
+        $mops_logger->info("Initializing datastore.");
+
+        # Create the per-instance directory.
+        mkdir($dbdir, 0777);
+        chmod(0777, $dbdir);
+
+        open($fh, ">$dbdir" . "/count");
+        flock($fh, 2);
+        chmod(0666, $dbdir . "/count");
+        print $fh "0\n";
+        close $fh;
+
+        open($fh, ">$dbdir" . "/index");
+        flock($fh, 2);
+        chmod(0666, $dbdir . "/index");
+        close $fh;
+
+        # Create an entry in the root index.
+        open($fh, ">>$index");
+        flock($fh, 2);
+        chmod(0666, $index);
+        printf($fh "%s|%04d-%02d-%02dT%02d:%02d:%02d|%s\n",
+            $dbname,
+            $year, $mon, $mday, $hour, $min, $sec, 'INSTANCE');
+        close $fh;
+    }
+
+    # If $src_file was specified, copy it to the DataStore.  This gives us a cheap
+    # way of initializing the sim's datastore area by passing $src_file=undef.
+    if ($src_file) {
+        # Read and increment the count number.
+        my $count;
+
+        open($fh, "+<$dbdir/count");
+        flock($fh, 2);
+        chmod(0666, "$dbdir/count");
+        $count = <$fh>;
+        chomp($count);
+        seek($fh, 0, 0);
+        print $fh $count + 1 . "\n";
+        close $fh;
+
+        # Send the file.
+        my $output_file = sprintf("%s/%.05d", $dbdir, $count);
+        copy($src_file, $output_file);
+
+        open($fh, ">>$dbdir/index");
+        flock($fh, 2);
+        printf($fh "%.05d|%04d-%02d-%02dT%02d:%02d:%02d|%s|%s\n",
+            $count,
+            $year, $mon, $mday, $hour, $min, $sec,
+            $default_ds_type, $state);
+        close($fh);
+    }
+}

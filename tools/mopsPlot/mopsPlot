@@ -1,0 +1,405 @@
+#!/usr/bin/env perl
+# $Id: mopsPlot 1197 2006-07-28 03:56:47Z fpierfed $
+# General version of mitiPlot that can plot arbitrary tabular data.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Params::Validate;
+use File::Temp qw(tempfile);
+use File::Slurp;
+use PS::MOPS::Lib;
+
+
+my $LINESTYLES = <<"LINESTYLES";
+set style line 1 lt 1
+set style line 2 lt 2
+set style line 3 lt 3
+set style line 4 lt 4
+set style line 5 lt 5
+set style line 6 lt 6
+set style line 7 lt 7
+LINESTYLES
+
+
+my $file;
+my $hist;
+my $histbins;
+my $histstyle;
+my $nodelete;
+my $title;
+my $xlabel = '';     # x axis label
+my $ylabel = '';
+
+my $radec;          # set all opts for RA/DEC plot
+my $reversex;       # reverse X for RA/DEC plots
+my $logx;           # activate log scale in X and Y
+my $logy;
+my ($xmin, $xmax, $ymin, $ymax);
+
+my $seghack;
+my $idcol;
+my $showonly;
+
+my $autoscale;
+my $terminal;
+my $postscript;
+my $postscriptc;
+my $eps;
+my $epsc;
+my $png;
+my $nokey;
+my $help;
+
+GetOptions(
+    'file=s' => \$file,
+    hist => \$hist,
+    'histbins=i' => \$histbins,
+    'histstyle=s' => \$histstyle,
+    'title=s' => \$title,
+    'xlabel=s' => \$xlabel,
+    'ylabel=s' => \$ylabel,
+
+    radec => \$radec,
+    reversex => \$reversex,
+    logx => \$logx,
+    logy => \$logy,
+
+    'xmin=f' => \$xmin,
+    'xmax=f' => \$xmax,
+    'ymin=f' => \$ymin,
+    'ymax=f' => \$ymax,
+
+    seghack => \$seghack,           # hack to segregate based on last column
+    idcol => \$idcol,               # column to use for ID (& seghack)
+    'showonly=s' => \$showonly,     # show only data with ID specified
+    autoscale => \$autoscale,
+    'terminal=s' => \$terminal,
+    postscriptc => \$postscriptc,
+    postscript => \$postscript,
+    eps => \$eps,
+    epsc => \$epsc,
+    png => \$png,
+    nokey => \$nokey,
+    nodelete => \$nodelete,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+
+
+# Scrub opts.
+$terminal = 'postscript solid' if $postscript or $eps;
+$terminal = 'postscript enhanced color solid' if $postscriptc or $epsc;
+$terminal = 'png' if $png;
+
+
+# gnuplot linetype pointtype vars
+my $lt = 1;
+my $pt = 1;
+sub _plot {
+    # Use gnuplot to plot detection or observation data.  A descriptor
+    # for the data to be plotted is passed in as data => [], which should
+    # be an arrayref of arrayrefs.  Each array is concatenated into a single
+    # inline plot for gnuplot using "plot '-'".
+    my %args = validate(@_, {
+        data => 1,      # array ref of array refs
+        xrange => 0,
+        yrange => 0,
+        cols => 0,
+        title => 0,
+        keylist => 0,
+        with => 0,
+        'reverse' => 0,
+    });
+    my $reverse = ($reversex || $args{'reverse'}) ? 'reverse' : '';    # empty string if undef
+
+    my $xrange = defined($args{xrange}) ? "set xrange $args{xrange} $reverse" : "set xrange [] $reverse";
+    my $yrange = defined($args{yrange}) ? "set yrange $args{yrange}" : '';
+    my $cols = $args{cols};
+    my $title_str = ($title or $args{title} or "Untitled");
+
+    # Write data to tmp file; call gnuplot in bg; rm tmp file.
+    my ($fh, $filename) = tempfile('/tmp/mopsPlotXXXXX', SUFFIX => '.txt');
+    print $fh "set terminal $terminal\n" if $terminal;
+    print $fh "set nokey\n" if $nokey;
+    print $fh "set logscale x\n" if $logx;
+    print $fh "set logscale y\n" if $logy;
+
+    printf $fh <<"GNUPLOT";
+$xrange
+$yrange
+set xlabel '$xlabel'
+set ylabel '$ylabel'
+set title '$title_str'
+plot \\
+GNUPLOT
+
+    my $got_data;   # flag if we have any data to plot
+    my $last;       # indicates last iter through data list
+    my $keyindex = 0;   # index into keys list, for per-object type titles in GNUPlot key
+    my $keytitle;
+    my $with = $args{with} ? "with $args{with}" : '';
+
+    foreach my $d (@{$args{data}}) {
+        $last = ($d == $args{data}->[-1]);
+        $got_data = 1 if @{$d};     # test we actually have some data
+
+        $keytitle = $args{keylist} ? $args{keylist}->[$keyindex] : $title;
+
+        # Construct the GNUPlot "plot" data specifier line.  We want something that
+        # looks like
+        #
+        # plot \
+        #   "-" using 3:4 with boxes title 'title' lt 3 pt 7
+        #
+        # If there are multiple arrays to be plotted, the line must
+        # end with a comma, hence the business with $last
+        #
+        # If we're in histogram mode, "pt" is nonsense and must be omitted.
+        my $pt_str = 
+            ($with =~ /boxes/) ?    # drawing boxes?
+            '' :                    # yes, so empty "pt" specification
+            "pt $pt";               # no, allow "pt"
+
+        my $trailer = 
+            $last ?                 # on last array?
+            '' :                    # yes, no trailing comma
+            ',\\';                  # not yet, trail with comma and backslash
+
+        printf $fh <<"GNUPLOT", $pt_str, $trailer;
+"-" using $cols $with title '$keytitle' lt $lt %s%s
+GNUPLOT
+
+        $lt = $lt % 16 + 1;
+        $pt = $pt % 16 + 1;
+        $keyindex++;
+    }
+
+    foreach my $d (@{$args{data}}) {
+        print $fh @{$d};
+        print $fh "e\n";    # end of data
+    }
+
+    close $fh;
+
+    if ($got_data) {
+        if ($terminal) {
+            system "gnuplot $filename";
+        }
+        else {
+            system "gnuplot -persist $filename";
+        }
+        (unlink $filename or warn "can't unlink $filename") unless $nodelete;
+    }
+}
+
+
+# Read columnar data from STDIN:
+my $line;           # last line read
+my @linedata;       # array of split values from line
+my %datadata;       # master data table
+my $prefix;         # prefix for object grouping by type
+my @inp;
+
+my $XDATA;          # X data column index (zero based)
+my $YDATA;          # Y data column index (zero based)
+my $HDATA;          # Hist data column (same as X)
+my $ID;             # id field index (zero based)
+
+($XDATA, $YDATA, $ID) = @ARGV;
+if ($file eq '-') {
+    @inp = <STDIN>;     # slurp all from STDIN
+}
+else {
+    @inp = read_file($file);
+}
+
+$XDATA--;   # cvt to zero-based
+$YDATA-- if defined $YDATA;
+if ($idcol) {
+    $ID = $idcol;
+}
+$ID-- if defined $ID;
+$HDATA = $XDATA;    # alias
+
+if ($radec) {
+    $xmin = 0;
+    $xmax = 360;
+    $ymin = -90;
+    $ymax = 90;
+    $reversex = 1;
+}
+
+
+if ($hist) {
+    # Read in data, group by ID prefix.
+    $ID = $YDATA;   # YDATA not used; order is XCOLUMN IDCOLUMN
+    foreach $line (@inp) {
+        @linedata = split /\s+/, $line;
+        if ($seghack and defined($ID) and $linedata[$ID]) {
+            $prefix = substr($linedata[$ID], 0, 2);
+            $prefix = 'XX' unless $prefix =~ m/^(S0|S\d|ST|St|SC|Sc|SS)/;
+        }
+        else {
+            # grouping; just put all in one list
+            $prefix = '';        # dummy to aggregate all data in one list
+        }
+        push @{$datadata{$prefix}}, $linedata[$HDATA];
+    }
+
+    # At this point each item in %datadata is an unordered list of values to be plotted
+    # in a histogram.  Calculate each histogram.
+    my %hists;
+    my $b;  # binsize
+    my $h;  # raw hist data
+    my $min;
+    my $nd;
+    foreach my $k (keys %datadata) {
+        $hists{$k} = mopslib_histogram(data => $datadata{$k}, bins => ($histbins || 250));
+        $b = $hists{$k}->{binsize};
+        $h = $hists{$k}->{hist};
+        $min = $hists{$k}->{min};
+        $nd = $hists{$k}->{numpts};
+        $datadata{$k} = [ 
+            map { 
+                sprintf("%f, %f\n", 
+                    $min + $_ * $b,     # hist X axis min + index * binsize
+                    $h->[$_] / $nd,     # normalized hist value
+                ) 
+            } 
+            0..(@{$h} - 1) 
+        ];
+    }
+
+    # Hist plot.
+    if (%datadata) { 
+        # Plot wants ARRAYREF of ARRAYREFs.
+        my @showkeys =                  # keys we'll actually display
+            grep { 
+                !$showonly          # use all keys if !$showonly
+                or $_ eq $showonly  # only keys matching $showonly
+            }
+            sort keys %datadata;
+
+        my @args = (
+            data => [ 
+                map { $datadata{$_} }   # get ARRAYREF of hist vals for key $_
+                @showkeys
+            ],
+            keylist => \@showkeys,
+            cols => '1:2', 
+            title => ($title or 'Data'),
+            with => ($histstyle || 'linespoints'),
+        );
+        if (defined($xmin)) {
+            push @args, (xrange => "[$xmin:$xmax]", yrange => "[$ymin:$ymax]");
+        }
+        _plot(@args);
+    }
+}
+else {
+    # Read in data, group by ID prefix.
+    foreach $line (@inp) {
+        @linedata = split /\s+/, $line;
+        if ($seghack and defined($ID) and $linedata[$ID]) {
+            $prefix = substr($linedata[$ID], 0, 2);
+            $prefix = 'XX' unless $prefix =~ m/^(S0|S\d|ST|St|SC|Sc|SS)/;
+        }
+        else {
+            # grouping; just put all in one list
+            $prefix = '';        # dummy to aggregate all data in one list
+        }
+        push @{$datadata{$prefix}}, "$linedata[$XDATA], $linedata[$YDATA]\n";
+    }
+
+    # Scatter plot.
+    if (%datadata) { 
+        my @showkeys =                  # keys we'll actually display
+            grep { 
+                !$showonly          # use all keys if !$showonly
+                or $_ eq $showonly  # only keys matching $showonly
+            }
+            sort keys %datadata;
+
+        # Plot wants ARRAYREF of ARRAYREFs.
+        my @args = (
+            data => [ 
+                map { $datadata{$_} } 
+                @showkeys
+            ],
+            keylist => \@showkeys,
+            cols => '1:2', 
+            title => ($title or 'Data'),
+        );
+        if (defined($xmin)) {
+            push @args, (xrange => "[$xmin:$xmax]", yrange => "[$ymin:$ymax]");
+        }
+#        else {
+#            push @args, (xrange => '[0:360]', yrange => '[-90:90]') unless $autoscale; 
+#            push @args, (xrange => '[0:360]', yrange => '[-90:90]') unless $autoscale; 
+#        }
+        _plot(@args);
+    }
+}
+
+=head1 NAME
+
+mopsPlot - Program to plot MITI data using GNUPlot
+
+=head1 SYNOPSIS
+
+mopsPlot [--title "TITLE"] [--autoscale]
+    [--terminal DEVICE] [--postscript|postscriptc|eps|epsc] [--png] [--nokey]
+    [--nodelete]
+    [--help]
+    [--file INPUTFILE]
+    [xcolumn ycolumn labelcolumn]
+    [--hist datacolumn labelcolumn]
+
+    column1, column2 : 1-based indices of data to plot
+    --file : name of file to read data from, "-" for STDIN
+    --hist : plot histogram(s) of single column
+    --histbins BINSIZE : number of histogram bins
+    --title "TITLE" : use TITLE as plot title
+    --xlabel LABEL
+    --ylabel LABEL
+    --radec : set all opts for RA/DEC plot (xrange 0-360, yrange -90-+90, reversex)
+    --reversex : reverse X axis direction, for RA/DEC
+    --logx : use log X scale
+    --logy : use log Y scale
+    --xmin XMIN : X axis limits
+    --xmax XMAX
+    --ymin YMIN : Y axis limits
+    --ymax YMAX
+    --hmin HMIN : histogram min/max
+    --hmax HMAX
+    --seghack : hack flag to enable segregation by first two chars of ID
+    --showonly PREFIX : when --seghack specified, only plot data with prefix (e.g. SS, Sc, S0)
+    --autoscale : always autoscale RA and DEC (--mjd by default scales to full sky)
+    --terminal DEVICE : set gnuplot terminal to DEVICE; write output to stdout
+    --postscript|eps : abbreviation for "--terminal postscript"
+    --postscriptc|epsc : abbreviation for "--terminal 'postscript enhanced color'"
+    --png : abbreviation for "--terminal png"
+    --nokey : 'set nokey' in GNUPlot; hides key/legend
+    --nodelete : don't delete temporary GNUPlot files (for debugging)
+    --help : show usage and examples in manpage format
+
+=head1 DESCRIPTION
+
+Reads whitespace-delimited columnar data and plots it.  By default mopsPlot
+expects two column specifications and will perform a scatter plot.
+
+mopsPlot can preprocess the data in the following ways:
+
+=over
+
+Sort by a specified column number
+
+Calcualte histograms
+
+=back
+
+=cut
+

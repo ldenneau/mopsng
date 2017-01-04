@@ -1,0 +1,109 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+restore_do - Attempts to undo the removal of the indicated derived objects.
+             Restoration of the derived object will fail if a tracklet making up
+             the object is used in another active derived object.
+
+=head1 SYNOPSIS
+
+restore_do [options] [DERIVEDOBJ_IDS]
+
+  DERIVEDOBJ_IDS : list of MOPS derived object IDs to restore
+  --inst : simulation to restore derived objects from
+
+  restore_do --instance psmops_ps1_mdrm137 72904 72906 72910
+
+=head1 DESCRIPTION
+
+Changes the status of indicated derived objects from DERIVEDOBJECT_STATUS_KILLED 
+to DERIVEDOBJECT_STATUS_NEW. In addition any entries in the history tables 
+recording the removal will be deleted.
+
+=cut
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Pod::Usage;
+
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::DerivedObject qw(:all);
+use PS::MOPS::DC::History::Removal qw(:all);
+use PS::MOPS::DC::History qw(:all);
+
+# Start program here.
+my $instance_name;
+my $debug;
+my $help;
+GetOptions(
+    'inst=s' => \$instance_name,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $logger = $inst->getLogger();
+my $dbh = $inst->dbh;
+
+my @dobj_ids = @ARGV;
+my @trks;
+my $dobj;
+my $event;
+my $event_ref;
+
+foreach my $id (@dobj_ids) {
+    # Retrieve the derived object.
+    $dobj = modcdo_retrieve($inst, derivedobjectId => $id);
+    if ($dobj->status ne $DERIVEDOBJECT_STATUS_KILLED) {
+        $logger->info(sprintf "RESTORE_DO: Derived object %d has already been restored", $id);
+        next;  #Skip restoration if DO has already been restored.
+    }
+    
+    # Retrieve the tracklets that make up the derived object.
+    @trks = $dobj->fetchTracklets();
+    
+    # Verify that none of the tracklets are used by an active derived object.
+    my $restorable = 1; #true
+    foreach my $trk (@trks) {
+        # Select DOs that use this tracklet which have not been removed
+        my @dobj_ids = $dbh->selectrow_array(<<"SQL", undef, $trk->trackletId, $DERIVEDOBJECT_STATUS_KILLED, $id);
+select derivedobject_id
+from derivedobjects do join derivedobject_attrib da using (derivedobject_id)
+where da.tracklet_id = ? and do.status != ? 
+and do.derivedobject_id != ?
+SQL
+        if (@dobj_ids > 0) {
+            # Tracklet is used by another DO, cannot restore this DO.
+            $logger->info(
+            sprintf "RESTORE_DO: Derived object %d cannot be restored as tracklet %d is being used by DO %d",
+            $id, $trk->trackletId, $dobj_ids[0]
+            );
+            $restorable = 0; #false
+            last;
+        }
+    }
+    
+    # Reset the status of the derived object to new
+    if ($restorable) {
+        $dobj->status($DERIVEDOBJECT_STATUS_NEW);
+        $logger->info(sprintf "RESTORE_DO: Set status of derived object %d to %s", 
+                    $id,
+                    $DERIVEDOBJECT_STATUS_NEW);
+            
+        # Set the status of the tracklets that make up the derived object to 
+        # attributed.
+        foreach my $trk (@trks) {
+            $trk->status($TRACKLET_STATUS_ATTRIBUTED);
+            $logger->debug(sprintf "RESTORE_DO: Set status of tracklet to %s", $TRACKLET_STATUS_ATTRIBUTED);
+        }
+        
+        # Delete the removal event from the history tables.
+        $dbh->do("delete from history where derivedobject_id = ? and event_type = ?", 
+                 undef, $id, $EVENT_TYPE_REMOVAL) or 
+                 $logger->error(sprintf "RESTORE_DO: %s", $dbh->errstr);   
+    }
+}

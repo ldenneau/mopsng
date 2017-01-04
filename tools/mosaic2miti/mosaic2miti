@@ -1,0 +1,106 @@
+#!/usr/bin/env perl
+
+# Grab Spacewatch data from mosaic catalog files.  Layout is
+# YYYY.MM.DD.FF/
+#   0_Time
+#   mosaic0_ccd0_catalog.dat
+#   mosaic1_ccd0_catalog.dat
+#   mosaic2_ccd0_catalog.dat
+#   mosaic3_ccd0_catalog.dat
+#   mosaic4_ccd0_catalog.dat
+#   mosaic5_ccd0_catalog.dat
+#   mosaic6_ccd0_catalog.dat
+#   mosaic7_ccd0_catalog.dat
+# 
+# where
+# YYYY.MM.DD.FF = year, month, day, field number of field
+# 0_Time = text file containing time field was acquired,
+#   format DD:MM:YYYY:hh:mm:ss.fr
+
+# We will generate two text files: one for the field,
+# containing ID EPOCH_MJD RA_DEG DEC_DEG OBSCODE
+# and a file containing detections in MITI format.
+# We have to scan the MITI file to get an RA/DEC
+# for the field metadata.
+
+# So plan is:
+#   get directory (field), gen field_id ID
+#   get time from 0_Time file
+#   call slurp_mosaic on each .dat file; output is min/max RA/DEC; pipe to $ID.miti
+#   calc "field center" RA/DEC; write metadata to $ID.field
+
+use strict;
+use warnings;
+
+use Astro::Time;
+use File::Slurp;
+
+
+use subs qw(
+    get_epoch_mjd
+);
+
+
+my @dirs = @ARGV;   # get all dir names
+foreach my $dir (@dirs) {
+    # Handle 0_Time file.
+    my $epoch_mjd;
+
+    $epoch_mjd = get_epoch_mjd($dir);
+    my $field_filename = sprintf "%.8f", $epoch_mjd;
+
+    # Read out the 0th field.  This will contain a comment line
+    # indicating the RA/DEC limits of the field, which we'll
+    # use to embed a field identifier.
+    my ($ra_center_deg, $dec_center_deg) = get_center($dir, 0);
+    die "can't get center for $dir" unless defined($ra_center_deg); # oops
+
+
+    # Slurp remaining detections.
+    my @all_results;
+    for my $ccd (0..7) {
+        push @all_results, do_file($dir, $ccd, $epoch_mjd);  # get detection data for each CCD
+    }
+
+    open my $dets_fh, ">$field_filename.miti" or die "can't open $epoch_mjd.miti";
+    print $dets_fh "FIELD $epoch_mjd $ra_center_deg $dec_center_deg 0.0 691\n"; # hack: new field identifier
+
+    if (@all_results) {
+        print $dets_fh @all_results;
+    }
+    close $dets_fh;
+}
+
+
+sub do_file {
+    my ($dir, $ccd, $mjd) = @_;
+    my @results = `extract_mosaic $dir/mosaic0_ccd${ccd}_catalog.dat $mjd`;
+    return @results;
+}
+
+
+sub get_center {
+    my ($dir, $ccd) = @_;
+    # 42 is dummy epoch here
+    my @results = grep /CENTER/, `extract_mosaic $dir/mosaic0_ccd${ccd}_catalog.dat 42`;
+    die "can't locate CENTER for $dir" unless @results;
+    my @stuff = split /\s+/, $results[0];
+    # Format is : # LIMITS RA_MIN_DEG RA_MAX_DEG DEC_MIN_DEG DEC_MAX_DEG
+    # Format is : # CENTER RA_CENTER_DEG DEC_CENTER_DEG
+    return ($stuff[2], $stuff[3]);  # RA_CENTER_DEG, DEC_CENTER_DEG
+}
+
+
+sub get_epoch_mjd {
+    my ($dir) = @_;
+    my $file = "$dir/0_Time";
+    my $str = read_file($file) or die "bogus $file";
+    chomp $str;
+
+    # Parse time string, convert to YYYYMMDDD.FFFFFFFF
+    my ($d, $m, $y, $hour, $min, $sec) = split /:/, $str;
+    my $ut = ($hour * 3600 + $min * 60 + $sec) / 86400;
+    my $epoch_mjd = cal2mjd($d, $m, $y, $ut);
+    return $epoch_mjd;
+}
+

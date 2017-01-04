@@ -1,0 +1,22 @@
+MOPS HOWTO for creating bindist via file copy.
+
+* Create empty user (usally 'mops')
+
+* Create manifest files.  Usually 'find .....' + concat into manifest file.
+
+  + MOPS_DEV.MANIFEST : bin, schema, lib, lib/perl5
+  + MOPS_DATA.MANIFEST : caet_data, ssm/orbits/1000, ssm/surveys/sss.v5-15m*, ssm/surveys/main symlink
+  + ROOT.MANIFEST : config, .bash_profile, .psmops_rootpw
+
+* Remove outdated stuff (PS::MOPS::Celestia, etc.) from manifests
+
+* sh doc/copy_mops.sh
+  + Check config files
+  + backend.cf => localhost
+  + cluster.cf => LOCAL
+  + master.cf => fake_iod, obscode
+
+TODO
+
+* Milani IOD
+* ephemd (necessary for attribution?)

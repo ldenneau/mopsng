@@ -1,0 +1,181 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+id1b - Stage 3 of LINK orbit identification
+
+=head1 SYNOPSIS
+
+id1b [options] orbits_file1.mif orbits_file2.mif > new_orbits_file
+
+  --detections : convert link IDs to detection lists to do detection-level mgt
+  --help : show this manual page
+
+=head1 DESCRIPTION
+
+id1b performs the third stage of orbit ID management following a
+LINKOD pass.  The first stage resolves conflicts when there are
+multiple "end tracklets" for a track, selecting that with the best
+residual.  The second stage performs a more general ID management
+involving all tracklets used in all new linkages.
+
+The third stage decomposes tracklets into their consitutent detection
+IDs and performs conflict resolution at the detection level.
+
+=cut 
+
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Temp qw(tempfile);
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib;
+use PS::MOPS::IDManager;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Orbit;
+use PS::MOPS::DC::Tracklet;
+
+
+use subs qw(
+    evaluate_group
+);
+
+
+# Globals.
+my $inst;
+my $instance_name;
+my $help;
+my $detections;
+my $debug;
+GetOptions(
+    'instance=s' => \$instance_name,
+    detections => \$detections,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+
+# MOPS Configuration.
+my $disable_id1 = $mops_config->{debug}->{disable_id1} || 0;
+if ($disable_id1 == 2) {
+    # Special code for don't process instead of passthrough
+    $mops_logger->info("ID1 disabled; skipping.");
+    exit;
+}
+elsif ($disable_id1) {
+    print while (<>);
+    exit;
+}
+
+my %saved_lines;
+my @unfound;                # "unfound" tracks that we need to append to output
+my @rejected;               # tracks/objects rejected by ID management
+
+#my ($dummy, $link_id, $classification, $object_name, $orbit_code, $orbit_els);
+my @link_ids;
+my @ids;
+my $line;
+my $stuff;
+my $orbit;
+
+
+my $idmgr = new PS::MOPS::IDManager;
+
+# Read our input data, just MIF-O lines.
+my ($dummy, $link_id, $classification, $ssm_id, $orbit_code, $mif_o);
+while ($line = <>) {
+    chomp $line;
+    next if $line =~ /^(#|!)/;  # skip comments
+    ($dummy, $link_id, $classification, $ssm_id, $orbit_code, $mif_o) = split(/\s+/, $line, 6);
+
+    if ($classification eq $MOPS_EFF_UNFOUND) {
+        push @unfound, $line;
+        next;
+    }
+
+    # Decompose the link_id into tracklet IDs, and populate a hashref for the manager object.
+    @ids = split /=/, $link_id;
+
+    # If detections, the convert the list of tracklet IDs to detection IDs.
+    if ($detections) {
+        @ids = map { modct_getDetIds($inst, $_) } @ids; # convert to detection list
+    }
+
+    $orbit = modco_deserialize($inst, $mif_o);      # create orbit object from serialized orbit so we can get residual
+    $stuff = {
+        ID => $link_id,
+        MEMBERS => [ @ids ],
+        FOM => 1 / ($orbit->residual || 100000)     # dummy value for resid == 0 (invalid) or resid not present
+    };
+    $idmgr->add($stuff);                            # add to ID mgr
+    $saved_lines{$link_id} = $line;                 # save for later
+    push @link_ids, $link_id;                       # save original ordered list of link IDs
+}
+
+$idmgr->analyze();
+
+# Now loop through our inputs (saved lines actually) again.  For all objects
+# that were originally eff-classified as $MOPS_EFF_CLEAN but were rejected by
+# ID management, change there eff classification to $MOPS_EFF_UNFOUND and set
+# the orbit code to MOPS_EFF_ORBIT_REJECTED.
+my %found_clean;
+my %rejected_clean;
+my $res;
+
+foreach $link_id (@link_ids) {
+    $line = $saved_lines{$link_id};
+    ($dummy, $link_id, $classification, $ssm_id, $orbit_code, $mif_o) = split(/\s+/, $line, 6);
+
+    if ($res = $idmgr->query_rejected($link_id)) {
+        # Rewrite the efficiency as follows:
+        # * If the classification is not MOPS_CLEAN, don't emit anything, next
+        # * Rewrite the classification as MOPS_EFF_UNFOUND, set orbit code to MOPS_EFF_ORBIT_REJECTED
+        # * Emit object MIF line
+#        print STDERR "$link_id was rejected by $res.\n";
+
+        next if ($classification ne $MOPS_EFF_CLEAN);           # not clean, so we don't care if it's rejected (it's good actually)
+        $line = join(' ',
+            $dummy,
+            $link_id,
+            $MOPS_EFF_UNFOUND,
+            $ssm_id,
+            $MOPS_EFF_ORBIT_REJECTED,
+            $mif_o
+        );
+        $rejected_clean{$ssm_id} = $link_id;    # save for later, will check if we need to emit
+        $saved_lines{$link_id} = $line;         # save re-written MIF-TRACK line
+    }
+    else {
+        # Object is not rejected, so emit the line.
+        print $saved_lines{$link_id}, "\n";
+        $found_clean{$ssm_id} = $link_id if ($ssm_id and $classification eq $MOPS_EFF_CLEAN);       # save clean object
+    }
+}
+
+
+# One last thing, for efficiency recording: if we rejected a formerly MOPS_CLEAN object
+# due to ID duplication, but there is still a MOPS_CLEAN object, then discard the rejected
+# one.  This ensures that we count things correctly, since we did actually find the object.
+# Note that even if objects are discarded, their tracklets will eventually be counted
+# in precovery.
+foreach my $ssm_id (keys %rejected_clean) {
+    print $saved_lines{$rejected_clean{$ssm_id}}, "\n" unless exists($found_clean{$ssm_id}); # didn't find it, so emit unfound obj so eff sees it
+}
+
+
+# Finarlly, emit our leftovers, the objects that were marked as unfound originally.
+foreach $line (@unfound) {
+    print $line, "\n";
+}
+
+exit;

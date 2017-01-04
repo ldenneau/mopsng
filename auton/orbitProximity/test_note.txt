@@ -1,0 +1,11 @@
+When run as:
+
+./orbitproximity data test_data.txt queries test_query.txt verbosity 2 i_thresh 0.01 w_thresh 0.01 O_thresh 0.01 t_thresh 0.01
+
+The code should return exactly 3 matches for each query:
+
+Found 3 matches for query 0:
+   = { 1 , 3 , 4 } 
+
+Found 3 matches for query 1:
+   = { 136 , 137 , 138 } 

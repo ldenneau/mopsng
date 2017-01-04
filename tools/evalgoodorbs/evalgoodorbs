@@ -1,0 +1,224 @@
+#!/usr/bin/env perl
+
+# $Id: evalgoodorbs 1197 2006-07-28 03:56:47Z fpierfed $
+# Given the output of mopsod (a list of orbital elements), and a
+# 'clean' file, calculate the error in position of computed orbits
+# vs SSM orbit for a specified MJD.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use File::Slurp;
+use File::Temp qw(tempfile);
+use Pod::Usage;
+use Astro::SLA;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib;
+
+
+my $reserrfile;     # option residual vs AREE file
+my $orbfile;
+my $cleanfile;
+my $mjd;
+my $stats;          # output stats only
+my $segregate;      # segregate results by object prefix
+my $deg;            # display delta RA/DEC in degrees, not arcsec
+my $help;
+GetOptions(
+    'reserrfile=s' => \$reserrfile,
+    'orbfile=s' => \$orbfile,
+    'cleanfile=s' => \$cleanfile,
+    'mjd=f' => \$mjd,
+    stats => \$stats,
+    segregate => \$segregate,
+    deg => \$deg,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+
+# The plan will be to generate two lists of orbits:  one from
+# mopsod, the other from catOrbits using the clean objects.
+# Calculate ephemerides for both lists, then collate.
+# Compute the delta RA and DECs, and print out a table (exact
+# format depends on options).
+
+my @cleanids;
+my %orb2clean;  # map orbit IDs to clean ID
+my $line;
+my @stuff;
+my $cmd;
+
+my @goo = read_file($cleanfile);
+my $id;
+my $orb;
+foreach $line (@goo) {
+    chomp $line;
+    ($id, $orb) = split /\s+/, $line;
+    push @cleanids, $id;
+    $orb2clean{$orb} = $id;
+}
+my ($fh, $tmpfile) = tempfile('/tmp/evalgoodorbsXXXXX', UNLINK => 1);
+print $fh join("\n", @cleanids), "\n";
+close $fh;
+
+my ($ID, $EPOCH, $RA, $DEC, $MAG) = 0..4;
+
+my %cleanephem;
+$cmd = "catOrbits --file $tmpfile | ephem --mjd $mjd |";
+open $fh, $cmd or die "can't open ephem: $cmd";
+while (defined($line = <$fh>)) {
+    if ($line !~ /^E/) {
+        chomp $line;
+        @stuff = split /\s+/, $line;
+        $cleanephem{$stuff[$ID]} = {
+            EPOCH => $stuff[$EPOCH],
+            RA => $stuff[$RA],
+            DEC => $stuff[$DEC],
+            MAG => $stuff[$MAG],
+        };
+    }
+    else {
+        print STDERR $line; # ephem failed, report it
+    }
+}
+close $fh;
+
+my %orbephem;
+$cmd = "egrep -v ^E $orbfile | ephem --mjd $mjd | ";
+open $fh, $cmd or die "can't open ephem: $cmd";
+while (defined($line = <$fh>)) {
+    if ($line !~ /^E/) {
+        chomp $line;
+        @stuff = split /\s+/, $line;
+        $orbephem{$stuff[$ID]} = {
+            EPOCH => $stuff[$EPOCH],
+            RA => $stuff[$RA],
+            DEC => $stuff[$DEC],
+            MAG => $stuff[$MAG],
+        };
+    }
+    else {
+        print STDERR $line; # ephem failed, report it
+    }
+}
+close $fh;
+
+# Collate the lists.  That is, make a master list of ephems of items
+# in both lists.  Then computer RA/DEC differences, and output
+# ID dEPOCH_MJD dRA_DEC dDEC_DEG dMAG
+my %results;
+my $cleanid;
+my $cf = $deg ? 1.0 : 3600;         # convert deg to arcsec unless $deg
+foreach my $id (keys %orbephem) {
+    $cleanid = $orb2clean{$id};
+    if ($cleanid) {
+        ${$results{$id}}{EPOCH} = $cleanephem{$cleanid}->{EPOCH} - $orbephem{$id}->{EPOCH};
+        ${$results{$id}}{RA} = mopslib_dang($cleanephem{$cleanid}->{RA}, $orbephem{$id}->{RA}) * $cf;
+        ${$results{$id}}{DEC} = mopslib_dang($cleanephem{$cleanid}->{DEC}, $orbephem{$id}->{DEC}) * $cf;
+        ${$results{$id}}{MAG} = $cleanephem{$cleanid}->{MAG} - $orbephem{$id}->{MAG};
+
+        ${$results{$id}}{ABS} = $cf * $DEG_PER_RAD * slaDsep(
+            $cleanephem{$cleanid}->{RA} / $DEG_PER_RAD, 
+            $cleanephem{$cleanid}->{DEC} / $DEG_PER_RAD, 
+            $orbephem{$id}->{RA} / $DEG_PER_RAD,
+            $orbephem{$id}->{DEC} / $DEG_PER_RAD,
+        );
+    }
+    else {
+        print STDERR "clean ID not found: $id\n";
+    }
+}
+
+# Compute statistics.
+if ($stats) {
+    my %stats;
+    my ($avg, $std);
+
+    # Print totals.
+    if ($segregate) {
+        my %segregated_results; # list of GT two-char ids
+        my $shkey;              # GT object name
+
+        # Group the results according to first two letters of ground-truth (GT) object
+        # name.
+        foreach my $key (keys %results) {
+            $shkey = $orb2clean{$key};
+            $shkey =~ s/^(\w\w).*$/$1/;   # truncate after first two chars
+            $shkey = 'XX' unless $shkey =~ /S[01tTScC]/;
+            push @{$segregated_results{$shkey}}, $results{$key};
+        }
+
+        # Now for each of the GT abbreviated object types, calc + print avg & stdev.
+        foreach my $key (sort keys %segregated_results) {
+            ($avg, $std) = mopslib_stdev(
+                map { $_->{ABS} } @{$segregated_results{$key}} # list of ABS for this key
+            );
+            $stats{$key} = defined($avg) ? { avg => $avg, std => $std } : { avg => 'undef', std => 'undef' };
+        }
+    }
+    else {
+        ($avg, $std) = mopslib_stdev(
+            map { $results{$_}->{ABS} } keys %results
+        );
+        $stats{TOTAL} = defined($avg) ? { avg => $avg, std => $std } : { avg => 'undef', std => 'undef' };
+    }
+
+ 
+    # Print out stuff.
+    foreach my $key (sort keys %stats) {
+        print join("\t", $key, $stats{$key}->{avg}, $stats{$key}->{std}), "\n";
+    }
+}
+else {
+    foreach my $id (keys %results) {
+        print join("\t", 
+                $orb2clean{$id}, @{$results{$id}}{qw(EPOCH RA DEC MAG ABS)}, $id,
+            ), 
+            "\n";
+    }
+}
+
+
+# Write out optional residual vs estimation errors.
+if ($reserrfile) {
+    my @all_orbits = read_file($orbfile) or die "can't open $orbfile";
+    my %resids;
+    foreach my $line (@all_orbits) {
+        chomp $line;
+        @stuff = split /\s+/, $line;
+        $resids{$stuff[-2]} = $stuff[-1];
+    }
+
+    open my $fh, ">$reserrfile" or die "can't open $reserrfile";
+    foreach my $id (keys %results) {
+        print $fh join("\t", 
+                $orb2clean{$id}, $resids{$id}, @{$results{$id}}{ABS}, $id,
+            ), 
+            "\n";
+    }
+    close $fh;
+}
+
+
+=head1 NAME
+
+evalgoodorbs - Evaluate orbits produced by mopsod
+
+=head1 SYNOPSIS
+
+evalgoodorbs --orbfile ORBFILE --cleanfile CLEANFILE --mjd DATE [--segregate] [--help] orbits
+
+  --orbfile ORBFILE : orbital elements, output of mopsod
+  --cleanfile CLEANFILE : "clean" file containing SSM objname/track ID pairs
+  --stats : output stats only
+  --mjd DATE : MJD to evaluate against
+  --segregate : group errors by object type (S0, S1, St, etc.)
+  --help : show manpage
+
+=head1 DESCRIPTION
+
+Coming.
+
+=cut

@@ -1,0 +1,34 @@
+<%args>
+$detection => undef
+</%args>
+
+<%init>
+use Data::Dumper;
+my $inst = $m->notes('INST');
+my $dbname = $inst->dbname;
+my @stuff;
+my $args;
+my $cmd;
+my $did;
+
+if (ref($detection)) {
+    $args = join(' ', @{$detection});
+}
+else {
+    $args = $detection;
+}
+    
+$cmd = "echo $args";
+@stuff = `$cmd`;
+$did = 1;
+
+if (!$did) {
+    @stuff = ("Nothing to submit -- did you forget to check some objects?");
+}
+
+$r->content_type('text/plain');
+$m->clear_buffer;
+#$m->print(Dumper($tracklet), $cmd, "\n", @stuff);
+$m->print($cmd, "\n", @stuff, "\n\n");
+$m->abort;
+</%init>

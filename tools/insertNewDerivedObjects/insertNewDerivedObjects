@@ -1,0 +1,218 @@
+#!/usr/bin/env perl
+# $Id: insertNewDerivedObjects 4036 2010-06-15 22:25:27Z denneau $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use FileHandle;
+use Pod::Usage;
+use File::Slurp;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(mopslib_classifyObject);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::Orbit;
+use PS::MOPS::DC::DerivedObject;
+use PS::MOPS::DC::Residuals;
+use PS::MOPS::DC::History::Derivation;
+use PS::MOPS::DC::EONQueue;
+use PS::MOPS::DC::MOIDQueue;
+
+
+# Options.
+my $inst;
+my $instance_name;
+my $track_file;           # file of orbital elements
+my $help = 0;
+my $debug = 0;
+
+# Start program here.
+GetOptions(
+    'instance=s' => \$instance_name,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+
+$track_file = shift @ARGV;
+pod2usage(2) unless $track_file;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+
+my $line;
+my $link_id;                # ID assigned to orbit by LinkTracklets
+my $classification;
+my $object_name;
+my $orbit_code;
+my $orbit_els;
+
+#my %sum_data;
+my ($tracklet_id, $dummy);
+
+## Orbital elements.
+#my ($q_au, $e, $i_deg, $node_deg, $arg_peri_deg, $time_peri_mjd, $h_v, $epoch_mjd, $track_id, $residual, $conv_cod);
+
+# Now read new orbits.
+my %track_data;
+my $track_fh;
+open $track_fh, $track_file or die "can't open orb file $track_file";
+while (defined($line = <$track_fh>)) {
+    next if $line =~ /^#/;      # strip comments
+    chomp $line;
+    my ($dummy, $link_id, $classification, $object_name, $orbit_code, $orbit_els) = split (/\s+/, $line, 6);
+
+    # Not all records will have orbits.  The ones that do not will be MOPS_EFF_UNFOUND
+    # objects for which we have partial data (linkage, IOD).
+    my $orb;
+    if ($orbit_els) {
+        $orb = modco_deserialize($inst, $orbit_els);
+    }
+    $track_data{$link_id} = {
+        CLASSIFICATION => $classification,
+        OBJECT_NAME => ($object_name eq 'NA' ? 'NA' : $object_name),
+        ORBIT_CODE => $orbit_code,
+        ORBIT => $orb,
+    };
+}
+close $track_fh;
+
+# OK, prepare for insert!  For each orbit:
+# 1. Insert the orbit into DB (creates B62 name)
+# 2. Get its tracklets
+# 3. Mark each tracklet as used
+# 4. Label all detections with the new object name for the orbit.
+# 5. Commit!
+
+$inst->pushAutocommit(0); # disable DC autocommit
+eval {
+    my %used_detections;            # table of detection IDs used
+    my %clean_derivedobjects;       # table of clean derived objects created
+    my $stuff;
+
+    while (($link_id, $stuff) = each %track_data) {
+        # Things we'll be inserting with each history event.
+        my $last_field_id;
+        my $orb;
+        my $trk;
+
+        # Fetch tracklets.
+        my @tracklets = map { modct_retrieve($inst, trackletId => $_) } split '=', $link_id;    # tracklet IDs in link name now
+        $last_field_id = modct_getLastFieldId($inst, @tracklets);
+
+        # Only create derived objects for tracks that have status other than $MOPS_EFF_UNFOUND.
+        if ($stuff->{CLASSIFICATION} ne $MOPS_EFF_UNFOUND) {
+            $orb = $stuff->{ORBIT};      # fetch orbit obj
+            $orb->insert()
+                or $mops_logger->logdie("Couldn't insert orbit for $link_id"); # insert orbit
+            
+            my $dobj = PS::MOPS::DC::DerivedObject->new(
+                $inst,
+                orbitId => $orb->orbitId,
+                objectName => $link_id,
+            );
+            $dobj->mopsClassification(mopslib_classifyObject($orb));        # XXX yech, should be in DO->new
+            $dobj->insert()
+                or $mops_logger->logdie("Couldn't insert derived object for $link_id"); # insert derived object
+            
+            foreach $trk (@tracklets) {
+                $trk->status($TRACKLET_STATUS_ATTRIBUTED);
+            }
+            $dobj->attributeTracklets(
+                TRACKLETS_AREF => \@tracklets
+            );
+
+            # Obtain the latest field ID in this object's tracklets.  This field
+            # ID will be the "field ID of record" for this derived object.
+
+            # Efficiency.
+            my $hist = PS::MOPS::DC::History::Derivation->new(
+                $inst,
+                derivedobjectId => $dobj->derivedobjectId,
+                fieldId => $last_field_id,
+                orbitId => $orb->orbitId,
+                orbitCode => $stuff->{ORBIT_CODE},
+                ssmId => $dobj->ssmId,
+                classification => $dobj->classification,
+                trackletIds => [
+                    map { $_->trackletId } @tracklets,
+                ],
+            );
+            $hist->record;
+
+            # Add the object to the EON queue.
+            modcq_submit($inst, $dobj->derivedobjectId, $hist->eventId);
+
+            # Add the orbit to the MOID queue, which will run immediately following.
+            PS::MOPS::DC::MOIDQueue->submit($inst, $orb->orbitId, $hist->eventId);
+
+            # Log a nice little message.
+            $mops_logger->info(sprintf "Inserted derived object %s (%s %s)", 
+                $dobj->objectName,
+                $stuff->{OBJECT_NAME},
+                $link_id,
+            );
+        }
+        else {
+            # This is an unfound object.  It might have an orbit (IOD) associated with it though.
+            $orb = $stuff->{ORBIT};      # fetch orbit obj
+            if ($orb) {
+                $orb->insert()
+                    or $mops_logger->logdie("Couldn't insert orbit for $link_id"); # insert orbit
+            }
+
+            # Efficiency.
+            my $hist = PS::MOPS::DC::History::Derivation->new(
+                $inst,
+                derivedobjectId => undef,
+                fieldId => $last_field_id,
+                orbitId => ($orb ? $orb->orbitId : undef),
+                orbitCode => $stuff->{ORBIT_CODE},
+                ssmId => modcs_objectName2ssmId($inst, $stuff->{OBJECT_NAME}),
+                classification => $stuff->{CLASSIFICATION},
+                trackletIds => [
+                    map { $_->trackletId } @tracklets,
+                ],
+            );
+            $hist->record;
+
+            # Log a nice little message.
+            $mops_logger->info(sprintf "Inserted event for lost object object %s (%s)", 
+                $stuff->{OBJECT_NAME},
+                $link_id,
+            );
+        }
+    }
+};
+
+if ($@) {
+    $inst->dbh->rollback;
+    $mops_logger->logdie("insert failed: $@");
+}
+else {
+    $inst->dbh->commit;
+}
+
+exit;
+
+
+=head1 NAME
+
+insertNewDerivedObjects - Program to insert derived objects generated from a LinkTracklets run.
+
+=head1 SYNOPSIS
+
+insertNewDerivedObjects MIF
+
+  MIF : file containing MIF-TRACK orbits
+
+=head1 DESCRIPTION
+
+Insert new derived objects from a LinkTracklets run into PSMOPS.  The tracklet IDs are
+obtained from the OID, which is a joined list of numeric tracklet IDs.
+
+=cut

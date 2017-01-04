@@ -1,0 +1,155 @@
+#! /usr/bin/env perl
+
+=head1 NAME
+
+decorateKnown - Assign labels from Milani's KNOWN_SERVER output to MOPS objects
+
+=head1 SYNOPSIS
+
+decorateKnown [options] IDENT_HEADER ORBITS
+
+  --instance=INSTANE_NAME : specify simulation to use
+  --status=MARK_STATUS : optionally mark tracklets by setting their status to MARK_STATUS
+
+  IDENT_HEADER : DES ident_header file containing tracklet assignments
+  ORBITS : DES orbits file for all known objects in IDENT_HEADER
+
+=head1 DESCRIPTION
+
+Reads the output of a KNOWN_SERVER .out.ident_header file and stores
+associations (or "decorations") of tracklets according to the contents
+of this file.  Each line of the ident_header file contains assignemnts
+of tracklets to a MOPS tracklet ID.  The first token of this line is a
+concatenation of MPC designations and MOPS tracklet IDs, with the MPC
+designation in parentheses.  Note that we are not guaranteed that the
+MPC designation is first in the list.
+
+(48634)=167780=267969=33675
+102002=(159405)=198254=275374
+
+decorateKnown nor MOPS makes any checks for integrity or consistency of
+this data.  The assignments are simply read from the file and applied
+to the listed tracklets.
+
+=head1 MARK_STATUS
+
+Under some modes of MOPS operation, it may be desirable to perform 
+known attribution before linking so that known objects may be omitted
+from linking and further processing. Essentially this puts MOPS in
+a mode of discovering only unknown objects.  To effect this, tracklet
+may invoke KNOWN_LOCAL with --mark_status=K, which is passed through
+as decoreateKnown --status=K
+
+=cut
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::Known;
+
+my $instance_name;
+my $status;
+my $inst;
+my $help;
+
+GetOptions(
+    'instance=s' => \$instance_name,
+    'status=s' => \$status,
+    help => \$help,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+
+# Now check some args.
+pod2usage(-msg => 'No filenames specified.') unless @ARGV == 2;
+
+
+# Just slurp the ident_header and process line by line.
+my ($ident_filename, $orbits_filename)  = @ARGV;
+
+# First slurp orbits.
+my %orbits;
+slurp_orbits($orbits_filename, \%orbits);
+
+# Next read the identifications.
+my $fh = new FileHandle $ident_filename;
+my $line;
+
+while (defined($line = <$fh>)) {
+    my @res = parse_line($line);
+    next unless $res[0];        # empty, comment or something, so skip
+        
+    my ($objname, @trk_ids) = @res;
+    my @orbit_elems;
+
+    if (!exists($orbits{$objname})) {
+        die "can't retrieve orbit for $objname";
+    }
+    my $objid = modck_add($inst, $objname, @{$orbits{$objname}});
+
+    my $trk;
+    foreach my $trk_id (@trk_ids) {
+        $trk = modct_retrieve($inst, trackletId => $trk_id);
+        if (!$trk) {
+            die "fetch of assigned tracklet ID $trk_id failed";
+            next;
+        }
+
+        $trk->knownId($objid);
+        $trk->status($status) if defined $status;
+        print STDERR "Assigned known object decorator $objname to tracklet $trk_id.\n";
+    }
+}
+
+$fh->close();
+exit;
+
+
+sub parse_line {
+    # Given a DES-formatted IDENT_HEADER line if known assignments, return undef
+    # if the line cannot be processed (comment, whatever), and a list containing
+    # the designation and tracklet IDs otherwise.
+    my $line = shift;
+
+    return undef if !$line or $line =~ /^!|^#/;       # comment, empty
+    return unless $line =~ /KNOWN_OBJ/;
+
+    # Format is
+    # OID NUM_TRK TRK1 TR2 TRK3 ...
+    # TRK1 == OID for KNOWN_OBJ
+    my ($desig, $num_trk, @ids) = split /\s+/, $line;
+
+    if ($desig and $num_trk) {
+        return ($desig, @ids[1..$num_trk-1]);
+    }
+    else {
+        return undef;
+    }
+}
+
+
+sub slurp_orbits {
+    my ($filename, $orbit_ref) = @_;
+
+    # Read the file, and store a hash to orbit records that we will refer to later.
+    my $fh = new FileHandle $filename or die "can't open orbits file $filename";
+    my $line;
+    my ($oid, $fmt, $q, $e, $i, $node, $argperi, $timeperi_mjd, $hv, $epoch_mjd);
+    while (defined($line = <$fh>)) {
+        next if $line =~ /^(#|!)/;      # skip comment
+        ($oid, $fmt, $q, $e, $i, $node, $argperi, $timeperi_mjd, $hv, $epoch_mjd) = split /\s+/, $line;
+        die "Unsupported orbit format $fmt" unless $fmt eq 'COM'; # cometary+mean anomaly only
+        $orbit_ref->{$oid} = [$q, $e, $i, $node, $argperi, $timeperi_mjd, $epoch_mjd, $hv];
+    }
+}

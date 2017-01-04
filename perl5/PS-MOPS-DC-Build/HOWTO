@@ -1,0 +1,4 @@
+perl Build.PL
+./Build build
+./Build test
+./Build install --install_path lib=$MOPS_HOME/lib/perl5 --prefix=$MOPS_HOME

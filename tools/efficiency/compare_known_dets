@@ -1,0 +1,177 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+compare_known_dets - MOPS tool to compare detections from current sim to a DB of read data
+
+=head1 SYNOPSIS
+
+compare_known_dets --nn NIGHTNUM [options] DBNAME
+
+  DBNAME : names of database to search
+  --nn NIGHTNUM : specify night number to search 
+
+  --instance INST : source database of synthetic detections [optional, use ENV otherwise]
+  --chunkmatch PATTERN : specify pattern for chunk matching
+  --out FILENAME : write output to FILENAME instead of STDOUT
+  --debug : enable debug mode
+  --help : show this manpage
+
+=head1 DESCRIPTION
+
+This program takes all synthetic detections from the MOPS database specified
+by current environment variables or --inst and searches DBNAME for real detections
+close to the positions in the source DB.
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+use Astro::SLA;
+use Math::Trig;
+
+use PS::MOPS::DC::Instance;
+
+
+
+my $instance_name;
+my $sim;
+my $nn;
+my $chunk_match;
+my $filter_match;
+my $dist_thresh_arcsec = 10;
+my $out;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    'dist_thresh_arcsec=f' => \$dist_thresh_arcsec,
+    'chunk_match=s' => \$chunk_match,
+    'filter_match=s' => \$filter_match,
+    'out=s' => \$out,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$sim = shift || pod2usage(-message => 'Must specify a DB to search.');
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbh = $inst->dbh;
+my $sth;
+my $outfh;
+if ($out) {
+    $outfh = new FileHandle ">$out" or die "can't create filehandle for $out";
+}
+else {
+    $outfh = *STDOUT;
+}
+
+my $chunk_match_str = "and f.survey_mode not like 'MD%'";
+if ($chunk_match) {
+    $chunk_match_str = "and f.survey_mode like '%$chunk_match%'";
+}
+else {
+    $chunk_match_str = "and f.survey_mode not like 'MD%'";
+}
+
+my $filter_match_str = '';
+if ($filter_match) {
+    $filter_match_str = "and f.filter_id='$filter_match'";
+}
+
+my @dets;
+$sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select 
+    d.object_name object_name, 
+    f.fpa_id fpa_id,
+    d.det_id det_id, 
+    d.epoch_mjd epoch_mjd, 
+    d.ra_deg ra_deg, 
+    d.dec_deg dec_deg, 
+    d.mag mag, 
+    d.filter_id filt,
+abs(     
+    3600 * degrees(         
+    acos(least(1.0,              
+    sin(radians(d.dec_deg)) * sin(radians(f.dec_deg))
+    + cos(radians(d.dec_deg)) * cos(radians(f.dec_deg)) * cos(radians(d.ra_deg - f.ra_deg))
+    ))     
+)) fc_dist_arcsec
+from 
+    $sim.detections d join $sim.fields f using (field_id)
+where f.nn=$nn
+$chunk_match_str
+$filter_match_str
+SQL
+$sth->execute() 
+    or die $sth->errstr;
+my $href;
+while ($href = $sth->fetchrow_hashref) {
+    push @dets, $href;
+}
+$sth->finish;
+printf STDERR "Found %d $filter_match synthetic detections for night $nn.\n", scalar @dets;
+
+
+# Now we have all detections.  Look up neighbors in original sim.
+my %checktbl;
+my $orig;
+my $sql = <<"SQL";
+select 
+    f.fpa_id fpa_id, d.det_id det_id, d.ra_deg ra_deg, d.dec_deg dec_deg, radians(d.ra_deg) ra_rad, radians(d.dec_deg) dec_rad, d.mag mag, d.filter_id filt, d.s2n s2n, d.proc_id proc_id
+from detections d join fields f using (field_id)
+where f.nn=$nn and 
+d.status='F' 
+SQL
+
+$sth = $dbh->prepare($sql) or die $sth->errstr;
+$sth->execute() or die $sth->errstr;
+while ($href = $sth->fetchrow_hashref) {
+    push @{$checktbl{$href->{fpa_id}}}, $href;
+}
+$sth->finish;
+
+
+sub dist_arcsec {
+    my ($ora_rad, $odec_rad, $hra_rad, $hdec_rad) = @_;
+    my $dist_rad = slaDsep($ora_rad, $odec_rad, $hra_rad, $hdec_rad);
+    return rad2deg($dist_rad) * 3600; 
+}
+
+
+print $outfh "#object_name det_id fpa_id epoch_mjd orig_ra_deg orig_dec_deg orig_mag orig_filt fc_dist_arcsec near_det_id near_ra_deg near_dec_deg near_mag near_filt near_s2n near_proc_id dist_arcsec\n";
+foreach $orig (@dets) {
+    my $nearest;
+    my $nearest_dist = 36000;
+    my $dist_arcsec;
+    my $ora_rad = deg2rad($orig->{ra_deg});
+    my $odec_rad = deg2rad($orig->{dec_deg});
+    foreach $href (@{$checktbl{$orig->{fpa_id}}}) {
+        $dist_arcsec = dist_arcsec($ora_rad, $odec_rad, $href->{ra_rad}, $href->{dec_rad});
+        if ($dist_arcsec < $dist_thresh_arcsec and $dist_arcsec < $nearest_dist) {
+            $nearest_dist = $dist_arcsec;
+            $nearest = $href;
+            last if $nearest_dist < 2;
+        }
+    }
+
+    if (defined($nearest)) {
+        $href = $nearest;
+        print $outfh join(' ', 
+            $orig->{object_name}, $orig->{det_id}, $orig->{fpa_id}, $orig->{epoch_mjd}, $orig->{ra_deg}, $orig->{dec_deg}, $orig->{mag}, $orig->{filt}, $orig->{fc_dist_arcsec},
+            $href->{det_id}, $href->{ra_deg}, $href->{dec_deg}, $href->{mag}, $href->{filt}, $href->{s2n}, ($href->{proc_id} || 'NULL'),
+            $nearest_dist,
+        ), "\n";
+    }
+    else {
+        print $outfh join(' ', 
+            $orig->{object_name}, $orig->{det_id}, $orig->{fpa_id}, $orig->{epoch_mjd}, $orig->{ra_deg}, $orig->{dec_deg}, $orig->{mag}, $orig->{filt}, $orig->{fc_dist_arcsec},
+            'NONE'
+        ), "\n";
+    }
+#    print STDERR '.';
+}
+#print STDERR "\n";

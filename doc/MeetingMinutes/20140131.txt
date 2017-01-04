@@ -1,0 +1,43 @@
+
+Attendees: Bolin, Chastel, Denneau, Schunova, Veres, Wainscoat
+
+* Telescope Status
+No report
+
+* IPP Issues
+  - IPP Trail fitting
+  - Photometry
+  - Convolution
+-> No report
+-> The IPP move should be finished. Concerns with a switch.
+-> SC: Organize meeting with IPP team about trail fitting
+
+* Data Processing
+  - MOPS Hardware: RfQ sent Friday 2014-01-31.
+SC: Send confiration received.
+  - No report
+  - 1b-detections and known server concerns fixed: LD sent the list of wrong detections to MPC; SC rerun known_server and submitted the known objets.
+
+* NEO Status
+  - Bad weather.
+
+* NEO Czaring
+  - Known Comets page
+
+* Comets
+  - No report
+
+* ATLAS
+  - Difference imaging going
+  - Almost complete telescope
+  - Hope to get everything working by the end of next week and submit first candidates to MPC and get an observatory code
+
+* AOB
+   - IPP Stamps 
+     -> Evaluate getfits vs ppstamp
+     -> Display 1k stamps in dedicated page. Blink them.
+   - RJW: Eric Christensen (Catalina PI) will visit us next week while on vacation
+   - RJW: Change in observation patterns: every 2 days toggle between even and odd RA chunks. Till 3/31: even nights for us; odd nights for PS1SC
+   - RJW: Need for small z bands quads
+   - LD: (After a request coming from outreach program). The smallest object we have detected and which has been mpec’d is 5m (2013-04-19): K13H25T
+   - No meeting 

@@ -1,0 +1,725 @@
+#! /usr/bin/env perl
+
+=head1 SYNOPSIS
+
+removeStationaries [options] FILESET1 FILESET2
+
+=head1 OPTIONS
+
+  --nsfile FILE : file containing IDs of nonstationary objects, found presumably using astroclean
+
+=head1 DESCRIPTION
+
+Given two FITS files contain warp catalogs (presumably), remove
+detections that lie within some specified distance from each other.
+Write both TTI exposures to the datastore.
+
+=cut
+
+
+use strict;
+use warnings;
+
+use Carp;
+use Getopt::Long;
+use Pod::Usage;
+use File::Slurp;
+use Cwd;
+
+use FileHandle;
+use Math::Trig;
+use LWP::Simple;
+
+
+use Astro::SLA;
+use Astro::FITS::CFITSIO qw(:longnames :shortnames :constants);
+
+#use PS::MOPS::FITS::SMF;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+
+
+use subs qw(
+    remove_stationaries
+    get_smf
+    open_fits
+    read_chips
+    grab_radecs
+    remove_stationaries
+    insert_smf
+    _chkfs
+    _stripquotes
+    _comment2surveymode
+    _m2tf
+    _make_sigmas
+);
+
+our $PS1_MAGSIG2SNR = 2.5 / log(10); 
+our $TINT32BIT = 41;    # FITS sucks
+
+our @CHIP_NUMS = qw(
+     67 57 47 37 27 17
+  76 66 56 46 36 26 16 06
+  75 65 55 45 35 25 15 05
+  74 64 54 44 34 24 14 04
+  73 63 53 43 33 23 13 03
+  72 62 52 42 32 22 12 02
+  71 61 51 41 31 21 11 01
+     60 50 40 30 20 10
+);
+
+my $instance_name;
+my $inst;
+my $debug;
+my $reject_flags = 0x3888;          # per IPP, see XXX HREF
+my $smf;
+my $nsfile;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nsfile=s' => \$nsfile,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+($smf) = @ARGV;
+pod2usage(-msg => 'FILE not specified') unless $smf;
+
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_logger = $inst->getLogger();
+my $mops_config = $inst->getConfig();
+
+# Some processing globals.
+my $stationrad_minv_dpd = $mops_config->{ingest}->{stationrad_minv_dpd};
+my $s2n_cut_sta = $mops_config->{ingest}->{s2n_cutoff_stationary} || 5.0;   # go this deep to find stationaries
+#my $s2n_cut_ing = $mops_config->{ingest}->{s2n_cutoff_ingest} || 6.0;       # ingest everything about this S/N
+#my $s2n_cut_ing = 4.5;
+my $s2n_cut_ing = 5.0;
+my $astro_floor_arcsec = $mops_config->{ingest}->{astrometry}->{floor_arcsec};
+my $astro_max_arcsec = $mops_config->{ingest}->{astrometry}->{max_arcsec};
+my $astro_force_arcsec = $mops_config->{ingest}->{astrometry}->{force_arcsec};
+
+
+my $nonstationary_tbl = {};
+if ($nsfile) {
+    my @foo = read_file($nsfile);
+    my @stuff;
+    for my $line (@foo) {
+        @stuff = split /\s+/, $line;
+        $nonstationary_tbl->{$stuff[0]} = 1;        # FPA_IDoXY.NNNNN ID of detection to keep
+    }
+}
+
+# Now we have our list of stationaries, so removem.
+my $dbh = $inst->dbh();
+my $field1;
+my $field2;
+$field1 = insert_smf($smf, $nonstationary_tbl);
+exit;
+
+
+sub get_smf {
+    my ($fileset) = @_;
+    my $url;
+    my $tmpdir;
+    my ($exp_name) = ($fileset =~ /^(o\w+)/);
+    $mops_logger->logdie("can't get exp_name from $fileset") unless $exp_name;
+
+    print STDERR "Fetching $fileset...";
+
+    $url = $mops_config->{ingest}->{index_url};
+    $url =~ s|/$||;             # strip trailing /
+    my $fileset_url = "$url/$fileset/index.txt";
+
+    # We have seen that sometimes IPP times out on requests or returns an empty result.
+    my $content;
+    my $retries = 0;
+    while (1) {
+        $content = get($fileset_url);
+        last if $content;       # got stuff, YAY
+        $mops_logger->logdie("timeout fetching $fileset_url") if $retries > 1;
+        $retries++;
+        sleep(30);
+    }
+
+    my @lines = split /\n/, get($fileset_url) or $mops_logger->logdie("got empty content for fileset $fileset_url");
+    my ($smf_entry) = grep /^$exp_name/, @lines;
+    my ($smf_file, @dummy) = split /\|/, $smf_entry;
+    die "strange smf_file: $smf_entry" unless $smf_file and $smf_file =~ /^$exp_name/;
+
+    # Given a datastore URL, download the fileset index, find the
+    # URL to the SMF file, then download the SMF file somewhere.
+    # Return a path to the SMF file.  The dir will be auto_cleaned 
+    # when the program exits.
+
+
+    if ($smf_file =~ /gz$/) {
+        system("wget --tries=3 -q -O - $url/$fileset/$smf_file | tar zxf -") == 0 or $mops_logger->logdie("wget failed for $url/$fileset/$smf_file");
+        my (@smfs) = grep /\.smf$/, `/bin/ls $exp_name.*`;      # XXX LAME
+        chomp @smfs;
+        $mops_logger->logdie("can't find an SMF file in $smf_file") unless @smfs > 0;
+        $mops_logger->logdie("found multiple SMF files in $smf_file") if @smfs > 1;
+        $smf_file = $smfs[0];
+    }
+    elsif ($smf_file =~ /smf$/) {
+        system("wget --tries=3 -q -O - $url/$fileset/$smf_file") == 0 or $mops_logger->logdie("wget failed for $url/$fileset/$smf_file");
+        my (@smfs) = grep /\.smf$/, `/bin/ls $exp_name.*`;      # XXX LAME
+        chomp @smfs;
+        $mops_logger->logdie("can't find an SMF file in $smf_file") unless @smfs > 0;
+        $mops_logger->logdie("found multiple SMF files in $smf_file") if @smfs > 1;
+        $smf_file = $smfs[0];
+    }
+
+    print STDERR "done.\n";
+    return $smf_file;
+}
+
+
+sub open_fits {
+    my ($filename) = @_;
+    my $fits_status = 0;
+    my $fh = Astro::FITS::CFITSIO::open_file($filename, READONLY(), $fits_status);
+    if ($fits_status) {
+        fits_report_error('STDERR', $fits_status);
+        die;
+    }
+    return $fh;
+}
+
+
+sub insert_smf {
+    my ($file, $nonstationary_tbl) = @_;
+
+    # Read FITS file, get
+    #   epoch_mjd
+    #   fpa_id (EXPNAME)
+    #   exp_id
+    #   boresight RA, DEC
+    #   exposure time
+    #   filter
+    #   posang
+    my $fits = open_fits($file);
+    my $fs = 0;     # FITS status
+    my $comment;
+    my $hdutype;
+    my $exttype;
+    my $extname;
+    my $extver;
+
+    my ($epoch_mjd, $ra_deg, $dec_deg, $posang_deg, $exptime_d, $filter_id, $survey_mode, $fpa_id);
+    my ($limiting_mag, $obscode);
+
+    # These keywords are in the Primary FITS extension.
+    $fits->read_keyword('MJD-OBS', $epoch_mjd, $comment, $fs); _chkfs($fs);
+    $fits->read_keyword('RA', $ra_deg, $comment, $fs); _chkfs($fs);
+    $fits->read_keyword('DEC', $dec_deg, $comment, $fs); _chkfs($fs);
+    $fits->read_keyword('POSANGLE', $posang_deg, $comment, $fs); _chkfs($fs);
+    $fits->read_keyword('EXPTIME', $exptime_d, $comment, $fs); _chkfs($fs);
+    $exptime_d /= 86400;      # convert seconds to days
+    $epoch_mjd += $exptime_d / 2;
+
+    # This time is a TAI MJD.  Need to convert to UTC.
+    $epoch_mjd -= slaDat($epoch_mjd) / 86400;
+
+    $fits->read_keyword('FILTERID', $filter_id, $comment, $fs); _chkfs($fs);
+    $filter_id =~ s/^\W(\w).*/$1/;           
+
+    # These keywords are a little harder to get, since there may be missing chip 
+    # tables.  So we have to go hunting for them.
+    foreach my $chip_num (@CHIP_NUMS) {
+        $extname = "XY$chip_num.hdr";
+        $extver = 0;
+        $hdutype = IMAGE_HDU();
+        $fs = 0;
+        $fits->movnam_hdu($hdutype, $extname, $extver, $fs);
+        next if $fs == BAD_HDU_NUM();   # not found
+        $fits->get_hdu_type($hdutype, $fs);
+        next if $hdutype != IMAGE_HDU();
+
+        $fits->read_keyword('CMMTOBS', $survey_mode, $comment, $fs);
+        $survey_mode = _stripquotes(_comment2surveymode($survey_mode)) if $survey_mode;
+
+        $fits->read_keyword('FILENAME', $fpa_id, $comment, $fs);
+        # We see some SMFs with 'UNKNOWN' in the filename fields.
+        # If so, sigh, try to get from filename.
+        if ($fpa_id =~ /UNKNOWN/) {
+            ($fpa_id) = ($file =~ /^(o\w+)/);
+            die "can't get an FPA_ID from $file" unless $fpa_id;
+        }
+        else {
+            $fpa_id = substr(_stripquotes($fpa_id), 0, -2) if $fpa_id;     # take all of filename except last trailing digits
+        }
+
+        last if $survey_mode and $fpa_id;
+    }
+
+    # If we have reached this point with undefined $survey_mode and $fpa_id,
+    # then there were no good chips in the entire FITS file.  So bail.
+    if (!$survey_mode and !$fpa_id) {
+        $mops_logger->logwarn("Could not get FILENAME from $file");
+        $fits->close_file($fs);
+        return;
+    }
+
+    $limiting_mag = $mops_config->{site}->{s2n_config}->{$filter_id}->{limiting_mag}
+        or die "can't get limiting mag in site config for $filter_id";
+    $obscode = $mops_config->{site}->{obscode};
+
+    my $DEFAULT_PIXEL_SCALE = 0.26;     # arcsec/pixel
+    my $field = PS::MOPS::DC::Field->new($inst,
+        epoch => $epoch_mjd,
+        ra => $ra_deg,
+        dec => $dec_deg,
+        pa_deg => $posang_deg,
+        surveyMode => $survey_mode,
+        timeStart => $epoch_mjd - $exptime_d / 2,
+        timeStop => $epoch_mjd + $exptime_d / 2,
+        status => $FIELD_STATUS_NEW,
+        filter => $filter_id,
+        limitingMag => $limiting_mag,
+        raSigma => 0.0,
+        decSigma => 0.0,
+        obscode => $obscode,                # XXX from CONFIG
+        de => [ 0, 0, 0, 0, 0, 0, 0, 0, 0, $DEFAULT_PIXEL_SCALE],
+        fpaId => $fpa_id,
+    );
+
+    my $found = modcf_retrieve($inst, fpaId => $fpa_id);
+
+    if (!$found) {
+        my $num_added;
+        my $dbh = $inst->dbh();
+        print STDERR "Reading $file.\n";
+        eval {
+            $dbh->begin_work();
+            $field->insert();
+
+
+            # Read detections here.
+            my $chip;
+            my $chipnum;
+            my @dets;
+
+            my $dets_seen;
+            my $dets_used;
+
+            foreach my $chipnum (@CHIP_NUMS) {
+                $extname = "XY$chipnum.psf";
+                $extver = 0;
+                $hdutype = BINARY_TBL();
+                $fs = 0;
+                $fits->movnam_hdu($hdutype, $extname, $extver, $fs);
+                next if $fs == BAD_HDU_NUM();
+                $chip = "XY$chipnum";
+
+                $fits->read_keyword('EXTTYPE', $exttype, $comment, $fs);
+                if ($exttype =~ /PS1_V3/) {
+                    $dets_seen = 0;
+                    $dets_used = 0;
+
+                    # Got a chip, read it in.
+                    my $rows;
+                    $fits->get_num_rows($rows, $fs); _chkfs($fs);
+
+#                    print STDERR '.' unless $debug;
+
+                    my $i;
+                    my $anynul;
+
+                    # FITS column indexes.  Later probably need to get these programmatically
+                    # so that we are more robust against FITS schema changes.
+
+                    my $IPP_IDET_COL = _get_colnum($fits, 'IPP_IDET');
+                    my $MAG_SIGMA_COL = _get_colnum($fits, 'PSF_INST_MAG_SIG');
+                    my $MAG_COL = _get_colnum($fits, 'CAL_PSF_MAG');
+                    my $RA_DEG_COL = _get_colnum($fits, 'RA_PSF');
+                    my $DEC_DEG_COL = _get_colnum($fits, 'DEC_PSF');
+                    my $POSANGLE_COL = _get_colnum($fits, 'POSANGLE');
+                    my $PLTSCALE_COL = _get_colnum($fits, 'PLTSCALE');
+                    my $PSF_X_SIG_COL = _get_colnum($fits, 'X_PSF_SIG');
+                    my $PSF_Y_SIG_COL = _get_colnum($fits, 'Y_PSF_SIG');
+
+                    my $PSF_CHISQ_COL = _get_colnum($fits, 'PSF_CHISQ');
+                    my $PSF_NDOF_COL = _get_colnum($fits, 'PSF_NDOF');
+                    my $CR_NSIGMA_COL = _get_colnum($fits, 'CR_NSIGMA');
+                    my $EXT_NSIGMA_COL = _get_colnum($fits, 'EXT_NSIGMA');
+                    my $PSF_MAJOR_COL = _get_colnum($fits, 'PSF_MAJOR');
+                    my $PSF_MINOR_COL = _get_colnum($fits, 'PSF_MINOR');
+                    my $PSF_THETA_COL = _get_colnum($fits, 'PSF_THETA');
+                    my $PSF_QF_COL = _get_colnum($fits, 'PSF_QF');
+                    my $PSF_NPIX_COL = _get_colnum($fits, 'PSF_NPIX');
+                    my $MOMENTS_XX_COL = _get_colnum($fits, 'MOMENTS_XX');
+                    my $MOMENTS_YY_COL = _get_colnum($fits, 'MOMENTS_YY');
+                    my $MOMENTS_XY_COL = _get_colnum($fits, 'MOMENTS_XY');
+                    my $FLAGS_COL = _get_colnum($fits, 'FLAGS');
+                    my $PSF_INST_FLUX_COL = _get_colnum($fits, 'PSF_INST_FLUX');
+                    my $PSF_INST_FLUX_SIG_COL = _get_colnum($fits, 'PSF_INST_FLUX_SIG');
+                    my $AP_MAG_COL = _get_colnum($fits, 'AP_MAG');
+                    my $AP_MAG_RAW_COL = _get_colnum($fits, 'AP_MAG_RAW');
+                    my $AP_MAG_RADIUS_COL = _get_colnum($fits, 'AP_MAG_RADIUS');
+                    my $PEAK_FLUX_AS_MAG_COL = _get_colnum($fits, 'PEAK_FLUX_AS_MAG');
+                    my $CAL_PSF_MAG_COL = _get_colnum($fits, 'CAL_PSF_MAG');
+                    my $CAL_PSF_MAG_SIG_COL = _get_colnum($fits, 'CAL_PSF_MAG_SIG');
+                    my $SKY_COL = _get_colnum($fits, 'SKY');
+                    my $SKY_SIGMA_COL = _get_colnum($fits, 'SKY_SIGMA');
+                    my $PSF_QF_PERFECT_COL = _get_colnum($fits, 'PSF_QF_PERFECT');
+                    my $MOMENTS_R1_COL = _get_colnum($fits, 'MOMENTS_R1');
+                    my $MOMENTS_RH_COL = _get_colnum($fits, 'MOMENTS_RH');
+                    my $KRON_FLUX_COL = _get_colnum($fits, 'KRON_FLUX');
+                    my $KRON_FLUX_ERR_COL = _get_colnum($fits, 'KRON_FLUX_ERR');
+                    my $KRON_FLUX_INNER_COL = _get_colnum($fits, 'KRON_FLUX_INNER');
+                    my $KRON_FLUX_OUTER_COL = _get_colnum($fits, 'KRON_FLUX_OUTER');
+                    my $FLAGS2_COL = _get_colnum($fits, 'FLAGS2');
+                    my $N_FRAMES_COL = _get_colnum($fits, 'N_FRAMES');
+
+                    # Need stub arrays for all our columns here.
+                    my @ipp_idet = ();
+                    my @ra_deg = ();
+                    my @ra_sigma_deg = ();
+                    my @dec_deg = ();
+                    my @dec_sigma_deg = ();
+                    my @mags = ();
+                    my @mag_sigma = ();
+                    my @posangle = ();
+                    my @pltscale = ();
+                    my @psf_x_sig = ();
+                    my @psf_y_sig = ();
+
+                    my @psf_chisq = ();
+                    my @psf_ndof = ();
+                    my @cr_nsigma = ();
+                    my @ext_nsigma = ();
+                    my @psf_major = ();
+                    my @psf_minor = ();
+                    my @psf_theta = ();
+                    my @psf_qf = ();
+                    my @psf_npix = ();
+                    my @moments_xx = ();
+                    my @moments_yy = ();
+                    my @moments_xy = ();
+                    my @flags = ();
+                    my @psf_inst_flux = ();
+                    my @psf_inst_flux_sig = ();
+                    my @ap_mag = ();
+                    my @ap_mag_raw = ();
+                    my @ap_mag_radius = ();
+                    my @peak_flux_as_mag = ();
+                    my @cal_psf_mag = ();
+                    my @cal_psf_mag_sig = ();
+                    my @sky = ();
+                    my @sky_sigma = ();
+                    my @psf_qf_perfect = ();
+                    my @moments_r1 = ();
+                    my @moments_rh = ();
+                    my @kron_flux = ();
+                    my @kron_flux_err = ();
+                    my @kron_flux_inner = ();
+                    my @kron_flux_outer = ();
+                    my @flags2 = ();
+                    my @n_frames = ();
+
+                    # XXX Hard-coded col indices are for losers; please fix.
+                    $fits->read_col($TINT32BIT, $IPP_IDET_COL, 1, 1, $rows, 0, \@ipp_idet, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $MAG_SIGMA_COL, 1, 1, $rows, 0, \@mag_sigma, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $MAG_COL, 1, 1, $rows, 0, \@mags, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $PSF_X_SIG_COL, 1, 1, $rows, 0, \@psf_x_sig, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $PSF_Y_SIG_COL, 1, 1, $rows, 0, \@psf_y_sig, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $POSANGLE_COL, 1, 1, $rows, 0, \@posangle, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $PLTSCALE_COL, 1, 1, $rows, 0, \@pltscale, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TDOUBLE, $RA_DEG_COL, 1, 1, $rows, 0, \@ra_deg, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TDOUBLE, $DEC_DEG_COL, 1, 1, $rows, 0, \@dec_deg, $anynul, $fs); _chkfs($fs);
+
+                    $fits->read_col(TFLOAT, $PSF_CHISQ_COL, 1, 1, $rows, 0, \@psf_chisq, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col($TINT32BIT, $PSF_NDOF_COL, 1, 1, $rows, 0, \@psf_ndof, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $CR_NSIGMA_COL, 1, 1, $rows, 0, \@cr_nsigma, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $EXT_NSIGMA_COL, 1, 1, $rows, 0, \@ext_nsigma, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $PSF_MAJOR_COL, 1, 1, $rows, 0, \@psf_major, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $PSF_MINOR_COL, 1, 1, $rows, 0, \@psf_minor, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $PSF_THETA_COL, 1, 1, $rows, 0, \@psf_theta, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $PSF_QF_COL, 1, 1, $rows, 0, \@psf_qf, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col($TINT32BIT, $PSF_NPIX_COL, 1, 1, $rows, 0, \@psf_npix, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $MOMENTS_XX_COL, 1, 1, $rows, 0, \@moments_xx, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $MOMENTS_YY_COL, 1, 1, $rows, 0, \@moments_yy, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $MOMENTS_XY_COL, 1, 1, $rows, 0, \@moments_xy, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col($TINT32BIT, $FLAGS_COL, 1, 1, $rows, 0, \@flags, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $PSF_INST_FLUX_COL, 1, 1, $rows, 0, \@psf_inst_flux, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $PSF_INST_FLUX_SIG_COL, 1, 1, $rows, 0, \@psf_inst_flux_sig, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $AP_MAG_COL, 1, 1, $rows, 0, \@ap_mag, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $AP_MAG_RAW_COL, 1, 1, $rows, 0, \@ap_mag_raw, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $AP_MAG_RADIUS_COL, 1, 1, $rows, 0, \@ap_mag_radius, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $PEAK_FLUX_AS_MAG_COL, 1, 1, $rows, 0, \@peak_flux_as_mag, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $CAL_PSF_MAG_COL, 1, 1, $rows, 0, \@cal_psf_mag, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $CAL_PSF_MAG_SIG_COL, 1, 1, $rows, 0, \@cal_psf_mag_sig, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $SKY_COL, 1, 1, $rows, 0, \@sky, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $SKY_SIGMA_COL, 1, 1, $rows, 0, \@sky_sigma, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $PSF_QF_PERFECT_COL, 1, 1, $rows, 0, \@psf_qf_perfect, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $MOMENTS_R1_COL, 1, 1, $rows, 0, \@moments_r1, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $MOMENTS_RH_COL, 1, 1, $rows, 0, \@moments_rh, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $KRON_FLUX_COL, 1, 1, $rows, 0, \@kron_flux, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $KRON_FLUX_ERR_COL, 1, 1, $rows, 0, \@kron_flux_err, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $KRON_FLUX_INNER_COL, 1, 1, $rows, 0, \@kron_flux_inner, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $KRON_FLUX_OUTER_COL, 1, 1, $rows, 0, \@kron_flux_outer, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TFLOAT, $FLAGS2_COL, 1, 1, $rows, 0, \@flags2, $anynul, $fs); _chkfs($fs);
+                    $fits->read_col(TSHORT, $N_FRAMES_COL, 1, 1, $rows, 0, \@n_frames, $anynul, $fs); _chkfs($fs);
+
+
+                    # Now save our stuff.
+                    $i = 0;
+                    my $s2n;
+                    my $detnum;
+                    my $idet;
+                    my $det;
+
+                    my $ra_sigma_deg;
+                    my $dec_sigma_deg;
+                    my $min_mag = $mops_config->{ingest}->{photometry}->{min_mag} || -99;
+                    my $max_mag = $mops_config->{ingest}->{photometry}->{max_mag} || 999;
+
+                    my $fulldetid;          # want to manufacture det IDs using IPP_IDET, e.g. o6092g0017o45.00327
+                    my $chipn = $chip;
+                    $chipn =~ s/XY//;       # convert 'XY01' => '01'
+
+#                    print STDERR "Got $rows rows for $chip.\n";
+                    while ($i < $rows) {
+                        $dets_seen++;
+                        $idet = $ipp_idet[$i];
+                        #$fulldetid = sprintf "${fpa_id}${chipn}.%05d", $idet;
+                        $fulldetid = sprintf "$fpa_id.%02d%08d", $chipnum, $idet;
+                        if ($nonstationary_tbl->{$fulldetid} and $mag_sigma[$i] > 0 and !($flags[$i] & 0x3888)) {
+                            $s2n = $PS1_MAGSIG2SNR / $mag_sigma[$i];
+                            my $mag = $mags[$i];
+                            if ($mag > $min_mag and $mag < $max_mag and ($s2n > $s2n_cut_ing) and $moments_xx[$i] > 0 and $moments_yy[$i] > 0) {
+                                if ($psf_x_sig[$i] ne 'nan' and $psf_y_sig[$i] ne 'nan') {
+                                    $dets_used++;
+
+                                    # OK, we're here.  If it's in the keep list, keep it!
+                                    ($ra_sigma_deg, $dec_sigma_deg) = _make_sigmas(
+                                        $s2n,
+                                        $moments_xx[$i],
+                                        $moments_yy[$i],
+                                        $psf_x_sig[$i],
+                                        $psf_y_sig[$i],
+                                        $posangle[$i],
+                                        $pltscale[$i],
+                                    );
+
+                                    $detnum = $ipp_idet[$i] * 100 + $chipn;     # uniq det ID for this exposure; incorporate chip #
+                                    $det = PS::MOPS::DC::Detection->new($inst,
+                                        ra => $ra_deg[$i],
+                                        raSigma => $ra_sigma_deg,
+                                        dec => $dec_deg[$i],
+                                        decSigma => $dec_sigma_deg,
+                                        epoch => $epoch_mjd,
+                                        mag => $mags[$i],
+                                        magSigma => $mag_sigma[$i],
+                                        filter => $filter_id,
+                                        s2n => $s2n,
+                                        isSynthetic => 0,
+                                        orient_deg => 0,
+                                        length_deg => 0,
+                                        obscode => $obscode,
+                                        objectName => $MOPS_NONSYNTHETIC_OBJECT_NAME,
+                                        detNum => $detnum,
+                                        rawattr_v2 => [
+                                            $psf_chisq[$i],
+                                            $psf_ndof[$i],
+                                            $cr_nsigma[$i],
+                                            $ext_nsigma[$i],
+                                            $psf_major[$i],
+                                            $psf_minor[$i],
+                                            $psf_theta[$i],
+                                            $psf_qf[$i],
+                                            $psf_npix[$i],
+                                            $moments_xx[$i],
+                                            $moments_xy[$i],
+                                            $moments_yy[$i],
+                                            undef,                  # n_pos
+                                            undef,                  # f_pos
+                                            undef,                  # ratio_bad
+                                            undef,                  # ratio_mask
+                                            undef,                  # ratio_all
+                                            $flags[$i],
+                                            $ipp_idet[$i],
+                                            $psf_inst_flux[$i],
+                                            $psf_inst_flux_sig[$i],
+                                            $ap_mag[$i],
+                                            $ap_mag_raw[$i],
+                                            $ap_mag_radius[$i],
+                                            undef,                  # ap_flux
+                                            undef,                  # ap_flux_sig
+                                            $peak_flux_as_mag[$i],
+                                            $cal_psf_mag[$i],
+                                            $cal_psf_mag_sig[$i],
+                                            $sky[$i],
+                                            $sky_sigma[$i],
+                                            $psf_qf_perfect[$i],
+                                            $moments_r1[$i],
+                                            $moments_rh[$i],
+                                            $kron_flux[$i],
+                                            $kron_flux_err[$i],
+                                            $kron_flux_inner[$i],
+                                            $kron_flux_outer[$i],
+                                            undef,                  # diff_r_p
+                                            undef,                  # diff_sn_p
+                                            undef,                  # diff_r_m
+                                            undef,                  # diff_sn_p
+                                            $flags2[$i],
+                                            $n_frames[$i],
+                                        ],
+                                    );
+                                    push @dets, $det;
+                                }   # nan
+                            }   # mag cut
+                        }   # flags
+                        $i++;
+                    }
+
+                    print STDERR "  Used $dets_used/$dets_seen detections from $chip.\n";
+                }
+            }
+         
+
+            $fits->close_file($fs);
+            if (scalar @dets > 999) {
+#                @dets = @dets[0..999];
+            }
+            print STDERR "  Inserting ", scalar @dets, " detections into $fpa_id.\n";
+            $field->addDetections(@dets);
+        };
+        if ($@) {
+            $dbh->rollback();
+            $mops_logger->logdie($@);       # or just warn?
+        }
+        else {
+            $dbh->commit();
+            print STDERR "\nInserted $fpa_id.\n";
+        }
+    }
+    else {
+        $mops_logger->warn("already found field for $fpa_id; skipping");
+    }
+}
+
+
+sub _make_sigmas {
+    my ($s2n, $moments_xx, $moments_yy, $psf_x_in, $psf_y_in, $posang_deg, $pltscale) = @_;
+    my ($ra_sig_deg, $dec_sig_deg);
+
+    if ($astro_force_arcsec) {
+        $ra_sig_deg = $astro_force_arcsec / 3600;
+        $dec_sig_deg = $astro_force_arcsec / 3600;
+    }
+    else {
+        # Convert PSF X and Y sigmas to RA/DEC.  We have
+        # PSF X and Y sigmas in pixels
+        # local position angle (PA from north at detection)
+        # plate scale, arcsec/pix
+        my $psf_x = sqrt($moments_xx) / $s2n;
+        my $psf_y = sqrt($moments_yy) / $s2n;
+
+
+        my ($det_ra_sig, $det_dec_sig);
+        my $cos_posang = cos(deg2rad($posang_deg));
+        my $sin_posang = sin(deg2rad($posang_deg));
+
+        $det_ra_sig = $pltscale * sqrt(
+            $psf_x * $psf_x * $cos_posang * $cos_posang + 
+            $psf_y * $psf_y * $sin_posang * $sin_posang
+        );
+        $det_dec_sig = $pltscale * sqrt(
+            $psf_x * $psf_x * $sin_posang * $sin_posang + 
+            $psf_y * $psf_y * $cos_posang * $cos_posang
+        );
+
+        # Add floor and Poisson uncertainties in quadrature.
+        $ra_sig_deg = sqrt($astro_floor_arcsec * $astro_floor_arcsec + $det_ra_sig * $det_ra_sig);
+        $dec_sig_deg = sqrt($astro_floor_arcsec * $astro_floor_arcsec + $det_dec_sig * $det_dec_sig);
+
+        $ra_sig_deg = $astro_max_arcsec if ($ra_sig_deg > $astro_max_arcsec);
+        $dec_sig_deg = $astro_max_arcsec if ($dec_sig_deg > $astro_max_arcsec);
+
+        # Correct RA for declination and convert to degrees.
+        $ra_sig_deg *= 1 / 3600;
+        $dec_sig_deg *= 1 / 3600;
+    }
+
+    return ($ra_sig_deg, $dec_sig_deg);
+}
+
+
+sub _chkfs {
+    # Util routine to check FITS status.
+    my ($status, $msg) = @_;
+    if ($status != 0) {
+        fits_report_error('STDERR', $status);
+        if ($msg) {
+            croak $msg;
+        }
+        else {
+            croak;
+        }
+    }
+}
+
+
+sub _stripquotes {
+    my ($str) = @_;
+    $str =~ s/['"\s]+//g;
+    return $str;
+}
+
+
+sub _comment2surveymode {
+    # Convert IPP/OTIS comment string to MOPS survey mode.
+    my ($cmt) = @_;
+    if ($cmt =~ /3PI/) {
+        $cmt =~ s/ .*//;
+    }
+    elsif ($cmt =~ /([EM]?SS)/) {
+        $cmt =~ s/ .*//;
+    }
+    else {
+        $cmt = 'NA';
+    }
+    return $cmt;
+}
+
+
+sub _m2tf {
+    # Convert detection morphological params (moments) to detection
+    # length and orientation.
+    my ($moments_xx, $moments_yy, $moments_xy, $pixel_size_deg) = @_;
+    my ($g1, $g2, $g3);
+    my ($s1, $s2, $ang);
+
+    $g1 = $moments_xx + $moments_yy;
+    $g2 = $moments_xx - $moments_yy;
+    $g3 = sqrt($g2 * $g2 - 4 * $moments_xy * $moments_xy);
+    $s1 = sqrt(($g1 + $g3) / 2);
+    $s2 = sqrt(($g1 - $g3) / 2);
+
+    $s1 = $pixel_size_deg * $s1;
+
+    if ($2 * $moments_xy == 0 and $g2 == 0) {
+        $ang = 0;
+    }
+    else {
+        $ang = rad2deg(atan2(2 * $moments_xy, $g2));
+    }
+
+    return ($s1, $ang);     # length, orientation
+}
+
+
+sub _get_colnum {
+    my ($fits, $colname) = @_;
+    my $fs = 0;                 # FITS status
+    my $colnum;
+    $fits->get_colnum(1, $colname, $colnum, $fs);
+    _chkfs($fs);
+    return $colnum;
+}

@@ -1,0 +1,71 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+
+
+my $instance_name;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my %fields;
+
+
+my $line;
+while ($line = <STDIN>) {
+    next if $line =~ /^#/;
+    chomp $line;
+    my ($det_id, $mjd, $ra_deg, $dec_deg, $appmag, $filter, $obscode, $sigra, $sigdec, $sigmag, $fwhm, $flags) = split /\s+/, $line;
+    my ($fpa_id, $detnum) = split '\.', $det_id;
+    my ($filter_id, $dummy) = split '\.', $filter;
+
+    my $field = get_field($fpa_id);
+
+    my $det = PS::MOPS::DC::Detection->new(
+        $inst,
+        ra => $ra_deg, 
+        dec => $dec_deg,
+        epoch => $field->epoch,
+        mag => $appmag,
+        refMag => $appmag,
+        filter => $field->filter,
+        s2n => 1 / ($sigmag || 1),
+        isSynthetic => 0,
+        orient_deg => -1,
+        length_deg => -1,
+        raSigma => $sigra,
+        decSigma => $sigdec,
+        obscode => $obscode,
+        status => 'F',
+        objectName => $det_id,
+        detNum => $detnum,
+    );
+    $det->addToField($field);
+    print STDOUT "Added $det_id.\n";
+}
+
+
+exit;
+
+
+sub get_field {
+    my ($fpa_id) = @_;
+    my $f;
+    if (!exists($fields{$fpa_id})) {
+        $fields{$fpa_id} = modcf_retrieve($inst, fpaId => $fpa_id);
+    }
+    return $fields{$fpa_id};
+}

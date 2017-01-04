@@ -1,0 +1,197 @@
+#!/usr/bin/env python
+"""
+Hand-rolled condor_wait that works better than the original, which goes
+into infinite wait when waiting for short jobs.
+"""
+import sys
+import os
+import re
+import optparse
+import time
+
+
+# Global schtuff.
+STATUS_COMPLETED = 0
+STATUS_TIMEOUT = 1
+STATUS_FAILED = 2
+STATUS_ERROR = 99
+
+debug_mode = 0
+sleep_interval = 5
+
+
+USAGE = """\
+Usage: condor_wait [options] LOGFILE JOB_ID
+
+    LOGFILE : Condor log file to monitor
+    JOB_ID : Condor JOB_ID to search for in LOGFILE
+    --wait TIMEOUT : wait TIMEOUT seconds before exiting with timeout code
+    --num NUM_SUBJOBS : number of Condor subjobs in job (optional, otherwise all in file)
+    --sleep SLEEP_INTERVAL_SEC : number of seconds to sleep between checks
+
+If all jobs complete successfull, exit with status 0. If a timeout occurs,
+exit with status 1.  If a job failed, exit with status 2.  For all other
+errors, exit with status 99.
+"""
+
+
+def next_sleep_interval(cur_interval):
+    """
+    Given a current sleep interval in seconds, return the amount of
+    time we should sleep for the next check.  This allows us to check
+    quickly the first few times and at larger intervals later.
+    """
+    if cur_interval is None or cur_interval < 5:
+        return 5        # default
+    cur_interval = int(cur_interval * 1.2) + 1
+    if cur_interval > 60:
+        cur_interval = 60          # never longer than this
+
+    return cur_interval
+
+
+def count_stuff(logfile, job_id):
+    """
+    Count the number of submitted and completed jobs in logfile.  Return a
+    tuple of started and successfully completed and failed items.
+    """
+    num_started = 0
+    num_completed = 0
+    num_failed = 0
+
+    all_lines = file(logfile).readlines()
+
+    # Scan the file for Condorisms and count jobs we've submitted.
+    job_pattern = re.compile('\(%s\.\d+\..*submitted' % job_id)
+    job_lines = filter(lambda x: job_pattern.search(x), all_lines)
+    num_started = len(job_lines)
+
+    # Counting completed jobs+status is more complicated because the job's exit status
+    # is written on the following line.
+    completed_jobs = {}
+    job_pattern = re.compile('\(%s\.(\d+)\..*terminated' % job_id)
+    status_pattern = re.compile('\(return value (\d+)\)')
+
+    while len(all_lines) > 0:
+        line = all_lines.pop(0)     # get first item in list
+        foo = job_pattern.search(line)
+        if foo:
+            # Found a line indicating a job terminated.
+            subjob = foo.group(1)
+
+            # Now look for the exit status of this job, which should be on the next line.
+            if len(all_lines) > 0:
+                line = all_lines.pop(0)
+                foo = status_pattern.search(line)
+                if foo:
+                    completed_jobs[subjob] = int(foo.group(1))
+                else:
+                    sys.stderr.write('unexpected status line: %s\n' % line)
+                # <- if foo
+            # <- if len(all_lines)
+        # <= if foo
+    # <= while
+
+    num_completed = len(completed_jobs.keys())
+    num_failed = len(filter(lambda x: completed_jobs[x] != 0, completed_jobs.keys()))
+    return num_started, num_completed, num_failed
+
+
+
+# Scrub brain-damaged option specification in condor_wait so that we can
+# use std option parsers.
+sys.argv[1:] = map(lambda x: re.sub(r'^-wait$', '--wait', x), sys.argv[1:])
+sys.argv[1:] = map(lambda x: re.sub(r'^-num$', '--num', x), sys.argv[1:])
+
+# Get user input (tracks file) and make sure that it exists.
+parser = optparse.OptionParser(USAGE)
+parser.add_option('--wait',
+                  dest='timeout',
+                  type='float',
+                  default=None,
+                  help="timeout, in seconds")
+parser.add_option('--num',
+                  dest='num_subjobs',
+                  type='int',
+                  default=None,
+                  help="number of jobs to wait for")
+parser.add_option('--debug',
+                  dest='debug',
+                  default=False,
+                  action='store_true',
+                  help='enable debug mode')
+
+# Ger the command line options and also whatever is passed on STDIN.
+options, args = parser.parse_args()
+
+# Make sure that we have what we need.
+if len(args) < 2:
+    parser.error('LOGFILE and JOB_ID must be specified.')
+
+start_time = time.time()
+logfile, job_id = args
+
+exit_status = STATUS_COMPLETED
+done = False
+
+# Twiddle the job_id based on how we see it formatted in Condor log files.
+# It appears that if the job_id is < 100, then it is formatted %03d, 
+# otherwise %d.
+int_job_id = int(job_id)
+if int_job_id < 100:
+    job_id = "%03d" % int_job_id
+
+try:
+    while (not done):
+        if debug_mode:
+            sys.stderr.write('Checking %s/%s...\n' % (logfile, job_id))
+
+        num_started, num_completed, num_failed = count_stuff(logfile, job_id)
+        if debug_mode:
+            sys.stderr.write('%d started, %d completed, %d failed\n' % (num_started, num_completed, num_failed))
+        else:
+            sys.stderr.write('.')
+
+        # If num_subjobs was specified, we want to ensure that the number of
+        # completed jobs is equal to the number we expect.  Otherwise we will
+        # trust the number of started jobs as the number that must completed.
+        if options.num_subjobs is None:
+            options.num_subjobs = num_started
+
+        # Now compare our counts with what we expect.
+        if num_started > 0 and num_completed > 0 and num_started == options.num_subjobs:
+            """
+            We found the required number of subjobs.  So check how many have completed.
+            """
+            if num_completed == options.num_subjobs:
+                """
+                We're done!
+                """
+                if num_failed > 0:
+                    sys.stderr.write('\n%d jobs failed.\n' % num_failed)
+                    exit_status = STATUS_FAILED
+                else:
+                    sys.stderr.write('\n%d jobs completed successfully.\n' % num_completed)
+                    exit_status = STATUS_COMPLETED
+                done = True
+                break
+            # <= if
+        # <= if
+
+        # If we've exceeded our timeout, bail.
+        if (options.timeout is not None) and (time.time() - start_time > options.timeout):
+            exit_status = STATUS_TIMEOUT
+            break
+        # <= if
+
+        # Sleep a bit before checking again.
+        time.sleep(sleep_interval)
+        sleep_interval = next_sleep_interval(sleep_interval)
+    # <= while
+
+except KeyboardInterrupt, e:
+    # Error occurred, so log msg and abort.
+    sys.stderr.write("condor_wait failed: " + str(e) + "\n")
+    exit_status = STATUS_ERROR
+
+sys.exit(exit_status)

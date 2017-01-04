@@ -1,0 +1,89 @@
+#!/usr/bin/env perl
+# $Id: nssh 1359 2006-10-27 18:16:47Z fpierfed $
+
+use strict;
+use warnings;
+
+use threads;
+use FileHandle;
+use Pod::Usage;
+use Getopt::Long;
+use PS::MOPS::Config;
+
+
+my $SSH = 'ssh -q -n -x';
+
+my $seq;
+my $debug;
+my $help;
+GetOptions(
+    seq => \$seq,       # run commands sequentially
+    debug => \$debug,   # debug mode, don't run commands
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $command = shift or pod2usage(2);
+my $fh;
+my $mops_config = PS::MOPS::Config->new('cluster');
+my @nodes = @{$mops_config->{cluster}->{nodes}};
+
+
+sub do_cmd {
+    # Run a command on a node in a separate thread.  If global $seq
+    # is set, then join on the thread immediately.
+    my ($cmd) = @_;
+    system $cmd;
+}
+
+my %nodework;   # table of thread handles
+my $cmd;
+my $i = 0;
+foreach my $node (@nodes) {
+    $cmd = '';
+    $cmd = join ' ', 
+        qq{$SSH $node},
+        qq{'$command'};
+    $cmd =~ s/\%N/$node/;   # substitute node name
+    $cmd =~ s/\%P/$$/;      # substitute PID
+    $cmd =~ s/\%I/$i/;      # substitute thread number
+
+    print STDERR qq{About to run "$cmd"} if $debug;
+    unless ($debug) {
+        $nodework{$node} = threads->new(\&do_cmd, $cmd);
+        $nodework{$node}->join if $seq;         # if $seq then join immediately
+    }
+}
+
+unless ($seq) {
+    $nodework{$_}->join foreach keys %nodework; # join on all threads
+}
+
+
+=head1 NAME
+
+nssh - Run shell command on MOPS cluster nodes
+
+=head1 SYNOPSIS
+
+nssh [--seq] [--help] 'COMMAND'
+
+  --seq : run commands sequentially
+  --debug : display commands but don't run them
+  --help : display man page
+  COMMAND : command to execute
+
+=head1 DESCRIPTION
+
+nssh obtains the list of configured MOPS cluster nodes and runs COMMAND on
+each of then.  The following variables substitutions are allowed in the
+command string:
+
+  %N : the short hostname of the node
+  %I : the number of the node, starting from 0 through the number of hosts
+  %P : the PID of the master nssh process
+  
+The commands are executed simultaneously using Perl ithreads unless
+--seq is specified.
+
+=cut

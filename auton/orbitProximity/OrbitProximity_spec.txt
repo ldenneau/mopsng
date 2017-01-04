@@ -1,0 +1,213 @@
+Pan-STARRS MOPS OrbitProximity Interface Specification
+Author: Jeremy Kubica and Larry Denneau, Jr.
+Version: 1.0.3
+
+OVERVIEW
+
+This document describes the the interface by which the MOPS
+softwaresystem will interact with Jeremy Kubica's software for
+determining which data orbits are "close" to which query orbits.  The
+distance is measure using individual thresholds on proximity in
+parameter space.  
+
+
+DESCRIPTION
+
+OrbitProximity accepts as input two lists of inputs: data orbits and
+query orbits.  While reading input it builds KD-trees for the input
+data, which are then traversed when computing the result.
+
+The OrbitProximity library shall be provided as a
+statically-linkedlibrary compatible with Linux kernel version 2.4 and
+gcc 3.2.3.  Thefollowing entry points shall be provided:
+
+  OrbitProximity_Init 
+  OrbitProximity_AddDataOrbit
+  OrbitProximity_AddQueryOrbit
+  OrbitProximity_Run 
+  OrbitProximity_Num_Matches
+  OrbitProximity_Get_Match
+  OrbitProximity_Free
+
+
+CHANGES
+
+Version 1.0.3:
+- Added the ability to use optional orbitID strings
+
+Version 1.0.2
+- Fixed the version numbering.
+- Changed the default inclination threshold to 0.1.
+
+Version 1.0.1
+- Changed the time of perihelion distance computation.
+
+
+
+CONVENTIONS
+
+All C functions shall return zero upon success, and non-zero to
+indicatean error, except where otherwise explicitly defined.
+
+
+ORBIT DEFINITIONS
+
+The orbits are specified by 6 orbital parameters:
+
+e  - Eccentricity
+q  - Perihelion Distance (in AU)
+i  - Inclination (in degrees)
+w  - Argument of the perihelion (in degrees) 
+O  - Longitude of ascending node (in degrees)
+t0 - Time of perihelion passage (MJD)
+
+In addition, the user may specify the equinox of the orbit.  However,
+the code currently ignores differences in orbital equinox when
+computing proximity.
+
+
+DECLARATIONS
+
+typedef void *OrbitProximityStateHandle;  // opaque pointer to struct containing state info
+
+
+FUNCTIONS
+
+/* Initialize the OrbitProximity engine and return an opaque handle */
+/* that contains state info. */
+int OrbitProximity_Init(OrbitProximityStateHandle *ophp,
+    double q_thresh     /* Perihelion Distance threshold (in AU) */
+    double e_thresh     /* Eccentricity threshold */
+    double i_thresh     /* Inclination threshold (in degrees) */
+    double w_thresh     /* Argument of the perihelion threshold (in degrees) */
+    double O_thresh     /* Longitude of ascending node threshold (in degrees) */
+    double t_thresh     /* Time of perihelion passage threshold (in days) */
+    int verbosity,      /* 0 => no output, 1 => normal, 2 => verbose/debugging */
+    FILE *log_fp        /* use as way to pass file descriptor in for debugging output */
+);  /* initialize all structures for OP run */
+
+/* Add a data orbit to the tree.  Return the internal OrbitProximity */
+/* number for that orbit. */
+int OrbitProximity_AddDataOrbit(OrbitProximityStateHandle fph,
+    double q,             /* Perihelion Distance (in AU)              */
+    double e,             /* Eccentricity                             */
+    double i,             /* Inclination (in degrees)                 */
+    double w,             /* Argument of the perihelion (in degrees)  */
+    double O,             /* Longitude of ascending node (in degrees) */
+    double t0,            /* Time of perihelion passage (MJD)         */
+    double equinox        /* Equinox of orbit (in MJD)                */);
+
+/* Add a query orbit to the query set.  Return the internal OrbitProximity */
+/* number for that orbit. */
+int OrbitProximity_AddQueryOrbit(OrbitProximityStateHandle fph,
+    double q,             /* Perihelion Distance (in AU)              */
+    double e,             /* Eccentricity                             */
+    double i,             /* Inclination (in degrees)                 */
+    double w,             /* Argument of the perihelion (in degrees)  */
+    double O,             /* Longitude of ascending node (in degrees) */
+    double t0,            /* Time of perihelion passage (MJD)         */
+    double equinox        /* Equinox of orbit (in MJD)                */
+);
+
+
+/* Process the tree. */
+int OrbitProximity_Run(OrbitProximityStateHandle fph);
+
+
+/* Fetch a result from processing - determine the number of "nearby" data */
+/* orbits for query orbit number "query_num"                              */
+/* Note: query_num is the index returned by OrbitProximity_AddQueryOrbit  */
+int OrbitProximity_Num_Matches(OrbitProximityStateHandle fph, 
+    int query_num
+);
+
+
+/* Fetch a result from processing - return the "match_num"th matching       */
+/* orbit for query "query_num".  This function can be called N times        */
+/* for each query_num where: N = OrbitProximity_Num_Matches(fph,query_num)  */
+/* Returns -1 on an error and the corresponding data orbit index otherwise. */
+int OrbitProximity_Get_Match(OrbitProximityStateHandle fph,
+    int query_num,
+    int match_num
+);
+
+/* Release all data structures used by OrbitProximity. */
+int OrbitProximity_Free(OrbitProximityStateHandle fph);
+
+
+
+
+EXECUTABLE MODE:
+
+Orbitproximity can also be run as an executable from the command line.
+The program is called as
+
+./orbitproximity data DATAFILENAME queries [parameters]
+
+
+EXECUTABLE MODE - PARAMETERS:
+
+data - Filename of the data orbits.
+
+queries - Filename of the query orbits.
+
+matchfile - The name of the match file.
+
+q_thresh - Perihelion Distance threshold (in AU) 
+           default = 0.01
+
+e_thresh - Eccentricity threshold
+           default = 0.01
+
+i_thresh - Inclination threshold (in degrees)
+           default = 0.10
+
+w_thresh - Argument of the perihelion threshold (in degrees) 
+           default = 1.00
+
+O_thresh - Longitude of ascending node threshold (in degrees)
+           default = 1.00
+
+t_thresh - Time of perihelion passage threshold (in days)
+           default = 0.10
+
+           Uses the fractional passage criteria:
+
+            nPassages = (int) ( fabs(TP_1 - TP_2) / P_1 )
+            fFractionalPassage = FRAC( fabs(TP_1 - TP_2) / P_1 )
+            bOrbitProximity = fFractionalPassage < fThreshold * (nPassages + 1)
+
+verbosity - Verbosity level 0 => no output, 1 => normal, 
+                            2 => verbose/debugging
+            default = 0
+
+
+EXECUTABLE MODE - DATA:
+
+In executable mode, orbitproximity can read in both data orbits and
+
+Each line of the orbit file contains information for exactly one
+orbit:
+
+q e i O w t0 equinox [orbitID]
+
+with the entries on the line separated by white space.  The entries
+are:
+
+q  - Perihelion Distance (in AU)
+e  - Eccentricity
+i  - Inclination (in degrees)
+w  - Argument of the perihelion (in degrees)
+O  - Longitude of ascending node (in degrees)
+t0 - Time of perihelion passage (in MJD) 
+equinox - Orbit's equinox (in MJD)
+orbitID - a unique ID string for the orbit (OPTIONAL)
+
+
+EXECUTABLE MODE - OUTPUT:
+
+The match file contains the raw matching information.  Each line
+corresponds to one match and contains the (white space separated)
+query orbitID and data orbitID.  If the orbit IDs are NOT
+present for both orbits, the program returns the line number
+on which the orbit appears instead (zero indexed).

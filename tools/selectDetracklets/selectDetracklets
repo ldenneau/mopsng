@@ -1,0 +1,219 @@
+#!/usr/bin/env perl
+# $Id: selectDetracklets 4749 2012-01-09 19:48:53Z denneau $
+# select tracklets from MOPSDC for LinkTracklets processing
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DX;
+
+my $inst;
+my $instance_name;
+my $maxv_degperday;
+my $minv_degperday;
+
+my $target_field_id;
+my $start_epoch_mjd;
+my $end_epoch_mjd;
+my $format = 'MITI';
+my $translate_tids;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'maxv_degperday=f' => \$maxv_degperday,
+    'minv_degperday=f' => \$minv_degperday,
+
+    'target_field_id=i' => \$target_field_id,
+    'start_epoch_mjd=f' => \$start_epoch_mjd,
+    'end_epoch_mjd=f' => \$end_epoch_mjd,
+    'format=s' => \$format,
+    translate_tids => \$translate_tids,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_logger = $inst->getLogger();
+my $mops_config = $inst->getConfig();
+my $v2filt = $mops_config->{site}->{v2filt};
+
+my $B62_TEMPLATE = '000000000';
+
+
+sub _format_dt_miti {
+    # Output detracklet in MITI format.
+    my ($dt) = @_;
+    my $det_id = $translate_tids ? mopslib_toB62($dt->detId, $B62_TEMPLATE) : $dt->detId;
+
+    return join (" ", 
+        $det_id,
+        $dt->epoch, 
+        $dt->ra, 
+        $dt->dec, 
+        $dt->mag, 
+        $dt->obscode,
+        ($dt->objectName or ''),
+    ); 
+}
+
+
+sub _format_dt_des {
+    # Output detracklet in DES detection format.
+    my ($dt) = @_;
+    my $det_id = $translate_tids ? mopslib_toB62($dt->detId, $B62_TEMPLATE) : $dt->detId;
+
+    return join (" ", 
+        $det_id,
+        $dt->epoch, 
+        $dt->ra, 
+        $dt->dec, 
+        $dt->mag, 
+        $dt->obscode,
+        ($dt->objectName or ''),
+    ); 
+}
+
+
+# If target_field_id is specified, use a single SQL query to retrieve all
+# tracklets based on velocity, proximity and time interval.  It would be really
+# useful for the caller to provide $start_epoch_mjd, but if it's not provided we'll use
+# field time - $config->{linkod}->{max_link_days}
+
+my $printed_header;     # set when we've printed DES header
+
+if ($target_field_id) {
+    my $field = modcf_retrieve($inst, fieldId => $target_field_id);
+
+#    $mops_logger->logdie("--start_epoch_mjd is required with --target_field") unless $start_epoch_mjd;
+#    $mops_logger->logdie("--end_epoch_mjd is required with --target_field") unless $end_epoch_mjd;
+
+    if (!defined($end_epoch_mjd)) {
+        my $offset_hours = $mops_config->{site}->{gmt_offset_hours};
+        $end_epoch_mjd = mopslib_nn2mjd(mopslib_mjd2nn($field->epoch, $offset_hours), $offset_hours);  # anything before start of current night
+    }
+    if (!defined($start_epoch_mjd)) {
+        $start_epoch_mjd = $end_epoch_mjd - $mops_config->{linkod}->{max_link_days};
+    }
+    my $field_radius_deg;
+    if ($mops_config->{site}->{field_shape} eq 'circle') {
+        $field_radius_deg = sqrt($mops_config->{site}->{field_size_deg2} / $PI);
+    }
+    else {
+        $field_radius_deg = sqrt($mops_config->{site}->{field_size_deg2}) * 1.414 / 2;  # half diag dist of square
+    }
+
+    my @args = (
+        target_field => $field,
+        start_epoch_mjd => $start_epoch_mjd,
+        end_epoch_mjd => $end_epoch_mjd,
+        maxv_degperday => $maxv_degperday,
+        field_radius_deg => $field_radius_deg,
+        match_target_field_status => $mops_config->{linkod}->{match_target_field_status},
+        min_probability => ($mops_config->{linkod}->{min_probability} || 0),
+    );
+    if (defined($minv_degperday)) {
+        push @args, minv_degperday => $minv_degperday;
+    }
+
+    my $dt;
+    my $dt_i = modct_selectDetracklets($inst, @args);
+    while ($dt = $dt_i->next) {
+        $dt->mag(mopslib_filt2V($dt->mag, $dt->filter, $v2filt));
+        $dt->filter('V');
+        if ($format eq 'DES') {
+            if (!$printed_header) {
+                print $PS::MOPS::DX::header_DETECTION, "\n";
+                $printed_header = 1;
+            }
+            if ($translate_tids) {
+                $dt->detId(mopslib_toB62($dt->detId, $B62_TEMPLATE));
+            }
+            print join("\n", modx_toDETECTION($dt)), "\n";
+        }
+        else {
+            print join("\n", _format_dt_miti($dt)), "\n";
+        }
+    }
+}
+else {
+    # Old method; snarf a list of field IDs from STDIN and select
+    # stuff from them based on velocity limits.
+    my @field_ids = map { split /\s+/, $_ } <>;
+    foreach my $fid (@field_ids) {
+        my @args = (
+            fieldId => $fid,
+        );
+        if (defined($maxv_degperday)) {
+            push @args, maxv_degperday => $maxv_degperday;
+        }
+        if (defined($minv_degperday)) {
+            push @args, minv_degperday => $minv_degperday;
+        }
+
+        my $dt;
+        my $dt_i = modct_selectDetracklets($inst, @args);
+        while ($dt = $dt_i->next) {
+            # Conver the mag to V-band.
+            $dt->mag(mopslib_filt2V($dt->mag, $dt->filter, $v2filt));
+            $dt->filter('V');
+            if ($format eq 'DES') {
+                if (!$printed_header) {
+                    print $PS::MOPS::DX::header_DETECTION, "\n";
+                    $printed_header = 1;
+                }
+                if ($translate_tids) {
+                    $dt->detId(mopslib_toB62($dt->detId, $B62_TEMPLATE));
+                }
+                print join("\n", modx_toDETECTION($dt)), "\n";
+            }
+            else {
+                print join("\n", _format_dt_miti($dt)), "\n";
+            }
+        }
+    }
+}
+
+=head1 NAME
+
+selectDetracklets - provides an interface into PS::MOPS::DC::Tracklet's 
+selectDetracklets method to select tracklets in "detection-like" form
+
+=head1 SYNOPSIS
+
+selectDetracklets [options] FIELD_ID1 FIELD_ID2 ...
+
+  --minv_degperday RATE : specify minimum deg/day sky-plane motion
+  --maxv_degperday RATE : specify maximum deg/day sky-plane motion
+  --target_field_id ID : select tracklets that could terminate in field
+  --start_epoch_mjd START_MJD : MJD of window start
+  --end_epoch_mjd START_MJD : MJD of window end
+  --format FMT : specify format, only DES or MITI accepted for now
+  --translate_tids : translate tracklet IDs from MOPS numeric IDs to base-62
+  --help : show help
+
+=head1 DESCRIPTION
+
+SelectDetracklets outputs all tracklets that have an extRA and extDEC
+(extrapolated RA and DEC) that terminate in specified field.
+
+This script differs from selectTracklets in that it uses "detracklets",
+detection-like objects that are created from single PSMOPS queries,
+reducing full object fetches when obtaining child detections from
+tracklets and observatory codes from fields.
+
+=head1 MAGNITUDES
+
+Detections are stored in the MOPS DB using their observed magnitude and
+filter; however, the JPL orbit determination code uses V-band, so 
+selectDetracklets performs a conversion to V-band using the instance's
+configuration information.
+
+=cut
+

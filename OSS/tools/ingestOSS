@@ -1,0 +1,623 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+ingestOSS - Ingests detections and tracks into OSS simulation and retrieves the
+            corresponding stamps from the stamp server. Retrieved stamps can be
+            viewed at http://mopshq2.ifa.hawaii.edu/oss/index.html
+
+=head1 SYNOPSIS
+
+ingestOSS [options] [DATAFILE]
+
+  DATAFILE   : Archive file containing detections and tracks. 
+  --instance : Optional argument that specifes the database schema to ingest
+               the data into. If this argument is not specified then it will 
+               use the value specified by the OSS_DBINSTANCE environment variable.
+  --debug    : generates additional messages for debugging purposes.
+  --help     : shows this documentation
+
+=head1 DESCRIPTION
+
+The OSS ingest program takes as input an archive file that contains the 
+OSS detections and tracks data. It will create an entry in the fields table
+by retrieving the needed data from the MOPS or IPP database. The data in the 
+detections file will then be inserted into the detections table and tracks 
+inserted into the tracklets table. Once tracks are inserted stamps will be 
+retrieved for each for detections ingested. Retrieved stamps can be viewed at 
+http://mopshq2.ifa.hawaii.edu/oss/index.html.
+
+Error messages are logged to /home/mops/MOPS_STABLE/var/<dbname>/log/mops.log
+
+=head1 USAGE
+
+ingestOSS 180.0_-001.2_06399.ont11.tar.gz
+
+=head1 INTERNAL FUNCTIONS
+
+=cut
+
+use strict;
+use warnings;
+
+use Archive::Tar;
+use Astro::SLA;
+use Cwd;
+use Data::Dumper;
+use Digest::MD5 qw(md5_base64);
+use File::Basename;
+use File::Path;
+use File::Slurp;
+use File::Temp qw(tempfile);
+use Getopt::Long;
+use IO::Zlib;
+use Log::Log4perl qw(:levels);
+use LWP;        # XXX eventually remove
+use Net::SMTP;
+use Params::Validate;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::GCR;
+use PS::MOPS::IPPDB;
+use PS::MOPS::Lib qw(:all);
+
+my $inst;
+my $instance_name;
+my $to;
+my $cc;
+my $debug;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'to:s' => \$to,
+    'cc:s' => \$cc,
+    debug => \$debug,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+my @data_files = @ARGV;         # user-specified files to ingest
+die "No files specified for ingestion. Exiting.\n" if (@data_files == 0);
+
+$instance_name = $instance_name || $ENV{OSS_DBINSTANCE} || 
+    die "Database not specified. Please specify a database via the --instance argument or the OSS_DBINSTANCE environment variable\n";
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $ol = $inst->getLogger;      # Handle to OSS log file.
+
+$ol->level($DEBUG) if ($debug);
+
+# Process OSS archive files.
+process_file($inst, $_) foreach @data_files;
+exit;
+
+
+=head2 create_field
+
+  Title    : create_field
+  Usage    : my $results = create_field( fpa_id => 'argument_value' );
+  Function : creates a entry in the fields table by:
+                1. retrieving data from one of the fields tables in the two MOPS databases
+                2. retrieving data from the IPP rawExp table.
+             using the provided focal plane array id.
+  Returns  : field_id of created field.
+  Args     : named arguments:
+           : fpa_id => string representing the focal plane array id
+           : inst => database instance object in which to create field
+
+=cut
+sub create_field {
+    my ($inst, $fpa_id) = @_;
+    my $dbh = $inst->dbh;
+    my @de;
+    my $fromdb = undef;
+    my %field;
+    my $rv;
+    my $mops_config = $inst->getConfig;
+    
+    #Constants
+    my $SECONDS_IN_DAY = 86400;   
+    my $SOURCE_DB1 = "psmops_ps1_mdrm137";
+    my $SOURCE_DB2 = "psmops_ps1_mdrm152";
+    my $FIELD_XYIDX_SIZE = $mops_config->{site}->{field_xyidx_size} || 101;
+    my $PIXEL_SPACING = $mops_config->{site}->{pixel_scale} || 0.25;
+    my $GMT_OFFSET_HOURS = $mops_config->{site}->{gmt_offset_hours} || -10;
+    my $FOV_DEG = 2.98541066072092;
+
+    # Determine if field data can be retrieved from the MOPS mdrm137 or mdrm152 databases.    
+    if ($dbh->selectrow_array("select fpa_id from $SOURCE_DB1.fields where fpa_id=?", undef, $fpa_id)) {
+        $fromdb = $SOURCE_DB1;
+    }
+    elsif ($dbh->selectrow_array("select fpa_id from $SOURCE_DB2.fields where fpa_id=?", undef, $fpa_id)) {
+        $fromdb = $SOURCE_DB2;
+    }
+    
+    if ($fromdb) {
+        # Retrieved field data from one of the two MOPS database.
+        $dbh->do("insert into fields (epoch_mjd, uncorrected_epoch_mjd, ra_deg,
+                  dec_deg, survey_mode, time_start, time_stop, filter_id,
+                  limiting_mag, ra_sigma, dec_sigma, obscode, de1, de2, de3, de4,
+                  de5, de6, de7, de8, de9, de10, ocnum, nn, fpa_id, exp_id,
+                  diff_id, pa_deg, fov_deg, xyidx_size, se_deg, eb_deg, gb_deg,
+                  status, parent_id) 
+                  select epoch_mjd, uncorrected_epoch_mjd, ra_deg,
+                  dec_deg, survey_mode, time_start, time_stop, filter_id,
+                  limiting_mag, ra_sigma, dec_sigma, obscode, de1, de2, de3, de4,
+                  de5, de6, de7, de8, de9, de10, ocnum, nn, fpa_id, exp_id,
+                  diff_id, pa_deg, fov_deg, xyidx_size, se_deg, eb_deg, gb_deg,
+                  status, parent_id from $fromdb.fields where fpa_id=?", undef, $fpa_id) or 
+            $ol->logdie("ingestOSS: Failed to insert field data for $fpa_id\n");
+        $ol->debug("ingestOSS: Added $fpa_id to fields table from $fromdb.\n");
+    }
+    else {
+        # Can't get data from MOPS, try and get it from IPP.
+        my $dbh_ipp = PS::MOPS::IPPDB::dbh();
+   	    my $sql = <<"SQL";
+SELECT substring_index(comment, ' ', 1) AS survey_mode, 
+dateobs as time_start, 
+sun_angle as se_deg, 
+(ra * 57.2957795) as ra_deg, 
+(decl * 57.2957795) as dec_deg, 
+exp_time, 
+left(filter, 1) as filter, 
+exp_id, 
+posang 
+FROM rawExp
+WHERE exp_name = ? 
+SQL
+        my $sth_ipp = $dbh_ipp->prepare($sql) or $ol->logdie("ingestOSS: $dbh_ipp->errstr\n");
+        $sth_ipp->execute($fpa_id) or $ol->logdie("ingestOSS: Cannot retrieve data from IPP!\n $sth_ipp->errstr\n");
+	    while (my $href = $sth_ipp->fetchrow_hashref) {
+	        # Calculate time_start and time_end.
+	        # Get shutter open time which is reported as YYYY-MM-DDTHH:MM:SS
+            # and convert it to an MJD date.
+            $href->{time_start} =~ /^(\d{4})\D+(\d+)\D+(\d+)\D+(\d+)\D+(\d+)\D+(\d+)$/;
+            $field{time_start} = mopslib_calut2mjd($1, $2, $3, $4, $5, $6);
+            $field{time_stop} = $field{time_start} + ($href->{exp_time} / $SECONDS_IN_DAY);
+		    
+		    # Calculate epoch which is the mid-point of the exposure.
+		    $field{epoch_mjd} = $field{time_start} + ($href->{exp_time} / $SECONDS_IN_DAY / 2);
+		    
+		    # Get ra_deg and dec_deg.
+		    $field{ra_deg} = $href->{ra_deg};
+		    $field{dec_deg} = $href->{dec_deg};
+		    
+		    # Get survey mode.
+		    $field{survey_mode} = $href->{survey_mode};
+		    
+		    # Set field status to derived.
+		    $field{status} = $FIELD_STATUS_LINKDONE;
+		    
+		    # Get filter.
+		    $field{filter} = $href->{filter};
+		    
+		    # Set limiting_mag, ra_sigma, dec_sigma, parent_id, diff_id to null;
+		    $field{limiting_mag} = undef;
+		    $field{ra_sigma} = undef;
+		    $field{dec_sigma} = undef;
+		    $field{parent_id} = undef;
+		    $field{diff_id} = undef;
+		    $field{xyidx_size} = undef;
+		    
+		    $field{exp_id} = $href->{exp_id};
+		    $field{fpa_id} = $fpa_id;
+		    
+		    # Set obscode to panSTARRS
+		    $field{obscode} = "F51";
+		   
+		    # Set position angle
+		    $field{pa_deg} = $href->{posang};
+		  
+		    # Set fov size in square degrees
+		    $field{fov_deg} = $FOV_DEG;
+		    
+		    # Set solar elongation
+		    $field{se_deg} = $href->{se_deg};
+		    
+		    # Set ecliptic latitude  
+		    $field{eb_deg} = mopslib_computeEclipticLatitude($field{epoch_mjd}, $field{ra_deg}, $field{dec_deg});
+		  
+		    # Set galactic latitude  
+		    $field{gb_deg} = mopslib_computeGalacticLatitude($field{ra_deg}, $field{dec_deg});
+		    
+		    # Set lunar cycle.
+		    $field{ocnum} = mopslib_mjd2ocnum($field{epoch_mjd});
+		    
+		    # Set night number.
+		    $field{nn} = mopslib_mjd2nn($field{epoch_mjd}, $GMT_OFFSET_HOURS);
+		    
+		    # Set detection efficency
+		    @de = (undef, undef, undef, undef, undef, undef, undef, undef, undef, $PIXEL_SPACING);   
+
+            my @args = @field{qw(
+                epoch_mjd ra_deg dec_deg survey_mode time_start time_stop status
+                filter limiting_mag ra_sigma dec_sigma obscode parent_id fpa_id exp_id diff_id xyidx_size pa_deg fov_deg
+                se_deg eb_deg gb_deg
+            )};
+
+            # Tack on DEs.
+            push @args, map { $de[$_] } (0..9);
+		    
+		    # Add ocnum and nn
+		    push @args, ($field{ocnum}, $field{nn});
+		    $rv = $dbh->do(<<"SQL", undef,@args);
+insert into `fields` (
+epoch_mjd, ra_deg, dec_deg, survey_mode, time_start, time_stop, status, filter_id,
+limiting_mag, ra_sigma, dec_sigma, obscode, parent_id, fpa_id, exp_id, diff_id, xyidx_size, pa_deg, fov_deg, se_deg, eb_deg, gb_deg,
+de1, de2, de3, de4, de5, de6, de7, de8, de9, de10,
+ocnum, nn
+)
+values (
+?, ?, ?, ?, ?, ?, ?, ?,
+?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
+?, ?
+)
+SQL
+            if ($rv) {
+                $ol->debug("ingestOSS: Added $fpa_id to fields table from ipp.\n");
+            }
+            else {
+                $ol->logwarn("ingestOSS: Couldn't insert field $fpa_id. \n\n $dbh->errstr\n");
+            }
+        }
+        $sth_ipp->finish();
+        $dbh_ipp->disconnect();        
+    }
+    # Return field object for provided fpa_id.
+    return modcf_retrieve($inst, fpaId => $fpa_id);
+}
+
+
+=head2 get_detids
+
+  Title    : get_detids
+  Usage    : my @results = get_detids( $sth, $line );
+  Function : Parses a line of data retrieved from the tracks file, retrieving
+             the individual mops generated detection ids making up the tracks.
+  Returns  : array containing the ids of the detections in the track.
+  Args     : named arguments:
+           : sth =>  DBI sql statement handle to a statement used to to retieve
+             the corresponding mops detection id given on OSS detection id.
+           : line => line of data read from the OSS tracks file.
+
+=cut
+sub get_detids {
+    my ($sth, $line) = @_;
+    
+    chomp $line;
+    my @o = split '=', $line;
+    my @det_ids;
+    for my $detid (@o) {
+        $sth->execute($detid) or die $sth->errstr;
+        push @det_ids, $sth->fetchrow_array;
+    }
+    return @det_ids;
+}
+
+
+=head2 ingest_detections
+
+  Title    : ingest_detections
+  Usage    : ingest_detections( $inst, $tfile );
+  Function : Copies the contents of the OSS detection file into MOPS and submits
+             the stamp requests for the detections.
+  Returns  : nil
+  Args     : named arguments:
+           : inst =>  handle to MOPS database
+           : tfile => Handle to file containing OSS detections.
+
+=cut
+sub ingest_detections {
+    my ($inst, $tfile) = @_;
+    my $dbh = $inst->dbh;
+    my $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+insert into `detection_region` (det_id, ra_deg, dec_deg, region_idx)
+values (?, ?, ?, ?)
+SQL
+    
+    my $data = $tfile->get_content;
+    open my $dets, '<', \$data or $ol->logdie("ingestOSS: $!\n");
+    
+    my %seenfield;      # Hash of fpa_id's that have been added to the fields table.
+    my $line;
+    my $field;
+    my @det_ids;        # Array of detection ids which will be used when requesting stamps.
+
+    print STDOUT "Ingesting detections from " . $tfile->name . ".\n";    
+    while ($line = <$dets>) {
+        print STDOUT ".";        
+        next if $line =~ /^#/;
+        chomp $line;
+        my ($det_id, $mjd, $ra_deg, $dec_deg, $appmag, $filter, $obscode, $sigra, $sigdec, $sigmag, $s2n, $fwhm, $flags, $reg_ra, $reg_dec, $reg_idx) = split /\s+/, $line;
+        my ($fpa_id, $detnum) = split '\.', $det_id;
+        my ($filter_id, $dummy) = split '\.', $filter;
+        my $id;
+        
+        # Determine if detection has already been added to the database. If it has then skip it.      
+        if ($id = $dbh->selectrow_array("select det_id from detections where object_name =?", undef, $det_id)) {
+            push(@det_ids, $id);    # Add detection id to detection ids list.
+            $ol->logwarn("ingestOSS: $det_id has already been ingested. Skipping...");
+            next;
+        }
+    
+        # Determine if field already exists in database. If it does not create it.
+        if ($seenfield{$fpa_id}) {
+            # Field already seen during ingest.
+            $field = $seenfield{$fpa_id};
+        }                
+        else {
+            # Field not seen yet during ingest. See if field has been created 
+            # during an earlier ingest. If not then create it.
+            $field = modcf_retrieve($inst, fpaId => $fpa_id);
+            $field = create_field($inst, $fpa_id) unless ($field);
+            $seenfield{$fpa_id} = $field if ($field);    # record fpa_id as being inserted.
+        }
+        unless ($field) {
+            $ol->logdie("ingestOSS: Failed to retrieve/create field for $fpa_id\n");
+        }
+        
+        # Create detection and add it to the database.
+        my $det = PS::MOPS::DC::Detection->new(
+            $inst,
+            ra => $ra_deg, 
+            dec => $dec_deg,
+            epoch => $field->epoch,
+            mag => $appmag,
+            refMag => $appmag,
+            filter => $field->filter,
+            s2n => $s2n,
+            isSynthetic => 0,
+            orient_deg => -1,
+            length_deg => -1,
+            raSigma => $sigra,
+            decSigma => $sigdec,
+            obscode => $obscode,
+            status => 'F',
+            objectName => $det_id,
+            detNum => $detnum,
+        );
+        $det->addToField($field);
+        
+        # Add detection id to list of detection ids.
+        push(@det_ids, $det->detId);    
+        
+        # Save HEALPix region detection was found in.
+        my $rv = $sth->execute($det->detId, $reg_ra, $reg_dec, $reg_idx);
+        if ($rv) {
+            $ol->debug("ingestOSS: Added record to detection_region: det_id - $det_id \t region index - $reg_idx.\n");
+        }
+        else {
+            $ol->logwarn("ingestOSS: Couldn't insert region. \n\n $sth->errstr\n");
+        }
+
+    }
+    close $dets or $ol->logwarn("ingestOSS: $!\n");
+    print STDOUT "\nCompleted ingest of " . $tfile->name . ".\n";
+    
+    # Create a temporary file containing the ingested detections. This file will
+    # be passed to submit_stamps.
+    my ($detections_fh, $detections_filename) = tempfile('/tmp/detections_ossXXXXXX', UNLINK => 1);
+    foreach (@det_ids) {
+        print $detections_fh "$_\n";
+    }
+    close $detections_fh;
+    
+    # Call submit_stamps and have it retrieve the stamps for the detections in
+    # the temporary file.
+    print STDOUT "Getting stamps for ingested detections.\n";
+    my $db_name = $inst->dbname;
+    my $submit_cmd = "submit_stamps --instance $db_name --det_file $detections_filename --cleaned --type chip";
+    system("$submit_cmd") == 0 or $ol->logwarn("ingestOSS: Failed to submit stamps: $?\n");
+}
+
+
+=head2 ingest_tracks
+
+  Title    : ingest_tracks
+  Usage    : ingest_tracks( $inst, $tfile );
+  Function : Copies the contents of the OSS tracks file into MOPS.
+  Returns  : nil
+  Args     : named arguments:
+           : inst =>  handle to MOPS database
+           : tfile => Handle to file containing OSS tracks.
+
+=cut
+sub ingest_tracks {
+    my ($inst, $tfile) = @_;
+
+    # Create file handle that can be used to retrieve data from the tracks file
+    # a line at a time.
+    my $data = $tfile->get_content;
+    open my $tracks, '<', \$data or $ol->logdie("ingestOSS: $!\n");
+    print STDOUT "Ingesting tracks from " . $tfile->name . "\n";
+    
+    # Get handle to database
+    my $dbh = $inst->dbh;
+    
+    # Cached sql statement to retrieve detection id.
+    my $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select det_id from detections where object_name = ?
+SQL
+    # Cached sql statement to determine if a track has already been ingested.
+    my $sth2 = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select oss_id from tracklet_oss where oss_id = ? 
+SQL
+    # Cached sql statement to add unique oss_id to table used to determine if 
+    # a track has already been ingested.
+    my $sth3 = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+insert into tracklet_oss (tracklet_id, oss_id) values ( ?, ? )
+SQL
+
+    my $line;
+    my $trk_id;
+    
+    # Ingest tracks a line at a time
+    while ($line = <$tracks>) {
+        print STDOUT ".";
+        
+        next if $line =~ /^#/;      # Skip comment lines.
+        chomp $line;                # Remove trailing newline.
+        
+        # Check tracklet_oss table to see if this tracklet has already been added.
+        # Encode the track as a 22 character base64 md5 digest which will be used
+        # as the oss_id.
+        my $oss_id = md5_base64(lc($line));
+        $sth2->execute($oss_id) or die $dbh->errstr;
+        if ($sth2->fetchrow_array()) {
+            $ol->warn("ingestOSS: $line has already been ingested. Skipping...");
+            next;                   # Track already ingested skip it.
+        }
+       
+        # Get detections that make up the track. 
+        my @det_ids = get_detids($sth, $line);
+        
+        # Skip creating track if no detections were found.
+        next if (scalar @det_ids) == 0;    
+        
+        # Workaround for two-detection tracklets.
+        my @dets = map { modcd_retrieve($inst, detId => $_) } @det_ids;
+        my $gcr_arcsec = @dets == 2 ? 0 : PS::MOPS::GCR::compute_gcr(\@dets);
+    
+        # Create tracklet object and add it to the database.
+        my $tracklet = PS::MOPS::DC::Tracklet->new(
+            $inst,
+            detections => \@dets,
+            classification => 'N',
+            gcr_arcsec => $gcr_arcsec,
+            digest => 0,
+        ) or $ol->logdie("ingestOSS: Can't create tracklet using detections " . join(' ', @det_ids));
+    
+        $trk_id = $tracklet->insert() or $ol->logdie("ingestOSS: Can't insert tracklet");
+        my $mesg = sprintf("ingestOSS: Created tracklet ID %s, v_tot=%.2f deg/day, digest=%.1f\n", $tracklet->trackletId, $tracklet->vTot, $tracklet->digest);
+        $ol->debug($mesg);
+        
+        # Add entry to tracklet_oss table to record the addition of the OSS tracklet to the MOPS table
+        $sth3->execute($trk_id, $oss_id);
+        
+    }
+    print STDOUT "\n";
+    $sth->finish();
+    $sth2->finish();
+    $sth3->finish();
+}
+
+    
+=head2 process_file
+
+  Title    : process_file
+  Usage    : process_file( $inst, $archive );
+  Function : Unpacks the specified tar file contiaing the OSS detections and 
+             tracks and ingests them into MOPS. Sends out an email once the 
+             ingest is done
+  Returns  : nil
+  Args     : named arguments:
+           : inst =>  handle to MOPS database
+           : archive => Name and location of the OSS archive file to be ingested.
+
+=cut
+sub process_file {
+    my $DET_SUFFIX = 'det_log';
+    my $TRK_SUFFIX = 'track_log';
+    my ($det_file, $trk_file);
+    
+    my ($inst, $archive) = @_;
+    
+    # Verify that file exists and is readable. If it does not return.
+    unless (-e $archive) {
+        $ol->logerror("ingestOSS: $archive does not exsit. Stopping ...\n");
+        print STDOUT "$archive does not exsit. Stopping ...\n";
+        return;
+    }
+    unless (-r $archive) {
+        $ol->logerror("ingestOSS: $archive is not readable. Stopping ...\n");
+        print STDOUT "$archive is not readable. Stopping ...\n";
+        return;
+    }
+    
+    # Retrieve directory and file name.
+    my($filename, $dir) = fileparse($archive);
+    
+    # Extract list of files in archives.
+    my $tar = Archive::Tar->new($archive);
+    my @tfiles = $tar->get_files;
+    
+    # Get the suffix of the file name as this will determine how it is 
+    # processed.
+    foreach my $tfile (@tfiles) {
+        my $suffix = (split(/\./, $tfile->name))[-1];
+        
+        if (lc($suffix) eq $DET_SUFFIX) {
+            # Extracted file contains detections.
+            $det_file = $tfile;
+        }
+        elsif (lc($suffix) eq $TRK_SUFFIX) {
+            # Extracted file contains tracks.
+            $trk_file = $tfile;
+        }
+    }
+    
+    # Ingest data, detections first, then tracks.
+    ingest_detections($inst, $det_file) if $det_file;
+    ingest_tracks($inst, $trk_file) if $trk_file;
+    
+    # Send email indicating that data has been imported.
+	my $message = "Ingest of " . $trk_file->name . " and " . $det_file->name . " completed.\n";
+	my $subject = "Import of OSS data completed";
+	$to = 'dgreen@ifa.hawaii.edu' unless $to;
+	send_mail($to, $subject, $message, $cc);
+
+	# Indicate that report was sent.
+	printf STDOUT "Ingest of $archive completed.\n";
+    $ol->info("ingestOSS: Ingest of $archive completed.\n");
+}
+ 
+=head2 send_mail
+
+  Title    : send_mail
+  Usage    : send_mail($to, $subject, $message, $cc);
+  Function : Sends an email containing the body provided to 
+             the addresses indicated using the default mailer.
+  Returns  : nil
+  Args     : to 
+                Address(es) to send email to. Multiple addesses are eparated 
+                by white space. 
+		   : subject 
+		        Subject of email
+		   : body
+		        Body of email message.
+           : cc
+                Addess(es) to carbon copy.
+                
+=cut
+sub send_mail {
+
+	# get supplied parameters
+	my ($to, $subject, $body, $cc) = @_; 
+  	# specify from address
+  	my $from = "from: \"PS1-MOPS\" <noreply\@ifa.hawaii.edu>\n";
+  	# specify smtp server to use and open connection to it.
+  	my $smtp_server = "hale.ifa.hawaii.edu";
+  	my $smtp = Net::SMTP->new($smtp_server,
+  					Timeout => 60,
+  					Debug   => 1);
+	# tell smtp server where to send mail  					
+  	$smtp->mail($from);
+  	$smtp->to((split /\s+/, $to), { SkipBad => 1}); # handle multiple addresses
+  	$smtp->cc((split /\s+/, $cc), { SkipBad => 1}) if $cc;
+  	$to = "to: $to\n";
+  	$cc = "cc: $cc\n" if $cc;
+
+  	$subject = "subject: $subject\n";	    
+	$smtp->data;
+	$smtp->datasend($to);
+	$smtp->datasend($cc) if $cc;
+	$smtp->datasend($subject);
+  	$smtp->datasend($body);
+  	$smtp->dataend;
+  	$smtp->quit          # complete the message and send it
+      or die "couldn't send email: $!\n";
+}

@@ -1,0 +1,378 @@
+#!/usr/bin/env perl
+# $Id: guessRecoverableOC 1197 2006-07-28 03:56:47Z fpierfed $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+
+use PS::MOPS::MITI;
+use PS::MOPS::DC::Instance;
+
+my $inst;
+my $instance_name;
+my $cumul;
+my $debug;
+my $help;
+my $maglimit;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'maglimit=f' => \$maglimit,
+    cumul => \$cumul,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+
+my $dbh = $inst->dbh;       # global DB handle
+my $sth;                    # global DB statement handle
+my $aref;                   # util ARRAYREF
+my $href;                   # util HASHREF
+
+my @ocs;                    # list of OCs to analyze
+#    S0 => {},
+#    S1 => {},
+#    St => {},
+#    SC => {},
+#    ST => {},
+#    SS => {},
+#    Sc => {},
+my %all1 = ();           # simply indicates found
+my %all2 = ();           # simply indicates found
+my %all3 = ();           # simply indicates found
+my %per_oc1;             # num new objs per OC, by family
+my %cum_oc1;             # cumulative num new objs per OC, by family
+my %per_oc2;             # num new objs per OC, by family
+my %cum_oc2;             # cumulative num new objs per OC, by family
+my %per_oc3;             # num new objs per OC, by family
+my %cum_oc3;             # cumulative num new objs per OC, by family
+
+my %dist1;              # distribution of 1-nighters
+my %dist2;              # distribution of 2-nighters
+my %dist3;              # distribution of 3-nighters
+
+sub get_all_dets {
+    my ($ocnum) = @_;
+    my $aref = $dbh->selectall_arrayref(<<"SQL", { Columns => [1, 2] }) or die "can't select: " . $dbh->errstr;
+select object_name, d.epoch from detections d, `fields` f
+where d.field_id=f.field_id
+and f.ocnum=$ocnum
+SQL
+    my %goo;
+    foreach (@$aref) {
+        push @{$goo{$_->[0]}}, $_->[1] if exists($all1{$_->[0]});
+    }
+    return \%goo;
+}
+
+
+sub find_recoverable3 {
+    # Return a list of objects that appear 3 nights in the lunation.
+    my ($dref) = @_;
+    my %all_objects;
+    my @recoverable;
+
+    # Simply keep a table of all objects and the integer MJDs they appear.
+    my $name;
+    my $epochs; 
+    while (($name, $epochs) = each %$dref) {
+        $all_objects{$name} = {} unless $all_objects{$name};
+        $all_objects{$name}->{int($_)} = 1 foreach @$epochs;
+    }
+
+    # Scan all objects and report the ones for which we have at least 
+    # three nights of observations.
+    foreach my $obj (sort keys %all_objects) {
+        if (scalar keys %{$all_objects{$obj}} >= 3) {    # require > 3 days
+            push @recoverable, $obj;
+        }
+    }
+    return \@recoverable;
+}
+
+sub find_recoverable2 {
+    # Return a list of objects that appear 2 nights in the lunation.
+    my ($dref) = @_;
+    my %all_objects;
+    my @recoverable;
+
+    # Simply keep a table of all objects and the integer MJDs they appear.
+    my $name;
+    my $epochs; 
+    while (($name, $epochs) = each %$dref) {
+        $all_objects{$name} = {} unless $all_objects{$name};
+        $all_objects{$name}->{int($_)} = 1 foreach @$epochs;
+    }
+
+    # Scan all objects and report the ones for which we have at least 
+    # three nights of observations.
+    foreach my $obj (sort keys %all_objects) {
+        if (scalar keys %{$all_objects{$obj}} >= 2) {    # require > 2 days
+            push @recoverable, $obj;
+        }
+    }
+    return \@recoverable;
+}
+
+sub find_recoverable1 {
+    my ($dref) = @_;
+    my %all_objects;
+    my @recoverable;
+
+    # Simply keep a table of all objects and the integer MJDs they appear.
+    my $name;
+    my $epochs; 
+    while (($name, $epochs) = each %$dref) {
+        $all_objects{$name} = {} unless $all_objects{$name};
+        $all_objects{$name}->{int($_)} = 1 foreach @$epochs;
+    }
+
+    # Scan all objects and report the ones for which we have at least 
+    # three nights of observations.
+    foreach my $obj (sort keys %all_objects) {
+        if (scalar keys %{$all_objects{$obj}} >= 1) {    # require > 1 days
+            push @recoverable, $obj;
+        }
+    }
+    return \@recoverable;
+}
+
+# Get a list of all objects.
+my $hvlimit = '';
+if ($maglimit) {
+    $hvlimit = "where h_v < $maglimit";
+}
+
+$aref = $dbh->selectcol_arrayref(<<"SQL") or die "can't select: " . $dbh->errstr;
+select object_name from ssm
+$hvlimit
+SQL
+my $prefix;
+foreach (@$aref) {      # each object_name
+    $all1{$_} = 0;
+    $all2{$_} = 0;
+    $all3{$_} = 0;
+}
+
+# Get a list of all OCs.
+$aref = $dbh->selectcol_arrayref(<<"SQL") or die "can't select: " . $dbh->errstr;
+select distinct ocnum from `fields`
+where status <> 'N'
+SQL
+@ocs = @$aref;  # copy ARRAYREF contents
+@ocs = @ocs[0..3] if $debug;
+
+
+# Now, for each OC, get all detections.  Find the objects that are
+# 'findable', and log them in as found at least once .
+my $dets;
+my $recoverable;
+foreach my $ocnum (@ocs) {
+    print STDERR "Processing OC $ocnum\n";
+    $dets = get_all_dets($ocnum);           # ref to list of epoch, name pairs
+    my $found_this_oc;
+
+    # Count 1-nighters.
+    $recoverable = find_recoverable1($dets); # ref to list of obj names
+    $found_this_oc = {
+        ALL => 0,
+        S0 => 0,
+        S1 => 0,
+        St => 0,
+        SC => 0,
+        ST => 0,
+        SS => 0,
+        Sc => 0,
+    };
+    foreach my $name (@$recoverable) {
+        $prefix = substr($name, 0, 2);      # two-char prefix
+        if (!$all1{$name}) {                 # first time seen
+            $all1{$name} = 1;                # indicate found
+            $found_this_oc->{ALL}++;
+            $found_this_oc->{$prefix}++;
+        }
+        push @{$dist1{ALL}->{$name}}, $ocnum;   # log OC num this obj was seen
+        push @{$dist1{$prefix}->{$name}}, $ocnum;   # log OC num this obj was seen by family
+    }
+    # Update per-OC totals.
+    $per_oc1{$ocnum} = $found_this_oc;
+    if ($ocnum == $ocs[0]) {
+        $cum_oc1{$ocnum}->{$_} = $found_this_oc->{$_} foreach keys %$found_this_oc;
+    }
+    else {
+        $cum_oc1{$ocnum}->{$_} = $found_this_oc->{$_} + $cum_oc1{$ocnum - 1}->{$_} foreach keys %$found_this_oc;
+    }
+
+    # Count 2-nighters.
+    $recoverable = find_recoverable2($dets); # ref to list of obj names
+    $found_this_oc = {
+        ALL => 0,
+        S0 => 0,
+        S1 => 0,
+        St => 0,
+        SC => 0,
+        ST => 0,
+        SS => 0,
+        Sc => 0,
+    };
+    foreach my $name (@$recoverable) {
+        $prefix = substr($name, 0, 2);      # two-char prefix
+        if (!$all2{$name}) {                 # not found yet
+            $all2{$name} = 1;                # indicate found
+            $found_this_oc->{ALL}++;
+            $found_this_oc->{$prefix}++;
+        }
+        push @{$dist2{ALL}->{$name}}, $ocnum;   # log OC num this obj was seen
+        push @{$dist2{$prefix}->{$name}}, $ocnum;   # log OC num this obj was seen by family
+    }
+    $per_oc2{$ocnum} = $found_this_oc;
+    if ($ocnum == $ocs[0]) {
+        $cum_oc2{$ocnum}->{$_} = $found_this_oc->{$_} foreach keys %$found_this_oc;
+    }
+    else {
+        $cum_oc2{$ocnum}->{$_} = $found_this_oc->{$_} + $cum_oc2{$ocnum - 1}->{$_} foreach keys %$found_this_oc;
+    }
+
+    # Count 3-nighters.
+    $recoverable = find_recoverable3($dets); # ref to list of obj names
+    $found_this_oc = {
+        ALL => 0,
+        S0 => 0,
+        S1 => 0,
+        St => 0,
+        SC => 0,
+        ST => 0,
+        SS => 0,
+        Sc => 0,
+    };
+    foreach my $name (@$recoverable) {
+        $prefix = substr($name, 0, 2);      # two-char prefix
+        if (!$all3{$name}) {                 # not found yet
+            $all3{$name} = 1;                # indicate found
+            $found_this_oc->{ALL}++;
+            $found_this_oc->{$prefix}++;
+        }
+        push @{$dist3{ALL}->{$name}}, $ocnum;   # log OC num this obj was seen
+        push @{$dist3{$prefix}->{$name}}, $ocnum;   # log OC num this obj was seen by family
+    }
+    $per_oc3{$ocnum} = $found_this_oc;
+    if ($ocnum == $ocs[0]) {
+        $cum_oc3{$ocnum}->{$_} = $found_this_oc->{$_} foreach keys %$found_this_oc;
+    }
+    else {
+        $cum_oc3{$ocnum}->{$_} = $found_this_oc->{$_} + $cum_oc3{$ocnum - 1}->{$_} foreach keys %$found_this_oc;
+    }
+
+
+
+}
+
+# Print results.
+my %tot_by_prefix = (
+    ALL => 0,
+    S0 => 0,
+    S1 => 0,
+    St => 0,
+    SC => 0,
+    ST => 0,
+    SS => 0,
+    Sc => 0,
+);
+foreach (keys %all1) {
+    $prefix = substr($_, 0, 2);      # two-char prefix
+    $tot_by_prefix{ALL}++;
+    $tot_by_prefix{$prefix}++;
+}
+print join("\t", 'n/a', sort keys %tot_by_prefix), "\n";
+print join("\t", 'n/a', map { $tot_by_prefix{$_} } sort keys %tot_by_prefix ), "\n";
+
+foreach my $ocnum (@ocs) {
+    if (!$cumul) {
+        print join("\t", $ocnum, map { $per_oc1{$ocnum}->{$_} } sort keys %{$per_oc1{$ocnum}} ), "\n";
+    }
+    else {
+        print join("\t", $ocnum, map { $cum_oc1{$ocnum}->{$_} } sort keys %{$per_oc1{$ocnum}} ), "\n";
+    }
+}
+print "\n";
+
+foreach my $ocnum (@ocs) {
+    if (!$cumul) {
+        print join("\t", $ocnum, map { $per_oc2{$ocnum}->{$_} } sort keys %{$per_oc2{$ocnum}} ), "\n";
+    }
+    else {
+        print join("\t", $ocnum, map { $cum_oc2{$ocnum}->{$_} } sort keys %{$per_oc2{$ocnum}} ), "\n";
+    }
+}
+print "\n";
+
+foreach my $ocnum (@ocs) {
+    if (!$cumul) {
+        print join("\t", $ocnum, map { $per_oc3{$ocnum}->{$_} } sort keys %{$per_oc3{$ocnum}} ), "\n";
+    }
+    else {
+        print join("\t", $ocnum, map { $cum_oc3{$ocnum}->{$_} } sort keys %{$per_oc3{$ocnum}} ), "\n";
+    }
+}
+print "\n";
+
+# Print histograms by family; distributions of numbers of times an object was seen.
+my @hist;
+my $family;
+
+foreach $family (qw(ALL S0 S1 St SC ST SS Sc)) {
+    @hist = ();
+    foreach my $key (keys %{$dist1{$family}}) {
+        $hist[scalar @{$dist1{$family}->{$key}}]++;
+    }
+    print "1/$family\n";
+    foreach (1..$#hist) {
+        print $_, "\t", ($hist[$_] || 0), "\n";
+    }
+}
+
+foreach $family (qw(ALL S0 S1 St SC ST SS Sc)) {
+    @hist = ();
+    foreach my $key (keys %{$dist2{$family}}) {
+        $hist[scalar @{$dist2{$family}->{$key}}]++;
+    }
+    print "2/$family\n";
+    foreach (1..$#hist) {
+        print $_, "\t", ($hist[$_] || 0), "\n";
+    }
+}
+
+foreach $family (qw(ALL S0 S1 St SC ST SS Sc)) {
+    @hist = ();
+    foreach my $key (keys %{$dist3{$family}}) {
+        $hist[scalar @{$dist3{$family}->{$key}}]++;
+    }
+    print "3/$family\n";
+    foreach (1..$#hist) {
+        print $_, "\t", ($hist[$_] || 0), "\n";
+    }
+}
+
+exit;
+
+=head1 DESCRIPTION
+
+This program calculates the number of synthetic objects that are
+cumulatively recoverable in the SSM data, by OC/lunation.
+
+First all SSM objects are retrieved by ID, to be used as the reference
+dataset, then all detections are fetched for OCs that have data, and
+objects that satisfy the 3-night requirement are counted and tabulated.
+
+The final output is the number of new objects found for the OC,
+separated by two-character SSM object prefix, and in total.
+
+=head1 SYNOPSIS
+
+guessRecoverableByOC [--help] 
+
+  --help : show man page
+
+=cut

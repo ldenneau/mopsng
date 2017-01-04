@@ -1,0 +1,45 @@
+#!/bin/bash
+ 
+# Verification test for CR 4.2.4.7 (IOD efficiency)
+# Mikael Granvik  07/24/2008
+
+USERNAME="granvik"
+STUB="cr_4247_verification"
+INSTANCE_NAME="psmops_${USERNAME}_cr_test_SIM"
+
+echo "1..1"
+
+# Query iod efficiency:
+iodeff=`echo \
+"
+select
+  truncate(1.-fail_iod/(fail_diffcor + success),5) iod_efficiency
+from (
+  select
+    sum(if(h.orbit_code='I',1,0)) fail_iod,
+    sum(if(h.orbit_code='D',1,0)) fail_diffcor,
+    sum(if(h.orbit_code='F',1,0)) fail_other,
+    sum(if(h.orbit_code='Y',1,0)) success
+  from
+    history h
+  where
+    h.event_type='D'
+    and (h.classification='C' or h.classification='X')
+  ) sub
+" | \
+mysql -umops -pmops -hschmopc01 $INSTANCE_NAME`
+
+# Remove header from result and convert to integer so that poor Bash
+# understands what we want:
+iodeff=${iodeff#iod_efficiency}
+iodeff=`echo "$iodeff * 100000" | bc`
+iodeff=${iodeff/.*/}
+
+# Check whether the 99% criterion is met:
+if (( $iodeff > "99000" )) ; then
+    echo "ok 1 - ${STUB}"
+else
+    echo "not ok 1 - ${STUB}"
+fi
+
+exit

@@ -1,0 +1,92 @@
+#!/usr/bin/env perl
+# $Id: guessTracklets 1197 2006-07-28 03:56:47Z fpierfed $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use PS::MOPS::MITI;
+
+
+my $detections;
+my $verbose;
+my $help;
+GetOptions(
+    detections => \$detections,
+    verbose => \$verbose,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+pod2usage(3) unless @ARGV;
+
+
+my @stuff = miti_slurp(shift);      # grab entire file
+my %all_objects;
+
+unless ($detections) {
+    # Scan file and group things by tracklets.
+    my %tracklets;  # table of tracklets by ID
+    foreach my $t (@stuff) {
+        push @{$tracklets{$t->[0]}}, $t;  # add entire line to entry for this ID
+    }
+
+
+    # Walk tracklets.  If the tracklet is clean, the store the
+    # integer MJDs for the detections.
+    foreach my $t (values %tracklets) {
+
+        # Test that the tracklet is clean.
+        my %clean;
+        my $objectName;
+        $clean{$_->[-1]} = 1 foreach (@{$t});   # -1th element in list is objectName
+
+        if (scalar keys %clean == 1) {
+            $objectName = $t->[0]->[-1];
+            $all_objects{$objectName} ||= {};
+            $all_objects{$objectName}{int($_->[1])} = 1 foreach @{$t};
+        }
+    }
+}
+else {
+    # Simply keep a table of all objects and the integer MJDs they appear.
+    my $objectName;
+    foreach my $t (@stuff) {
+        $objectName = $t->[-1];
+        $all_objects{$objectName} ||= {};
+        $all_objects{$objectName}{int($t->[1])} = 1;
+    }
+}
+
+# Scan all objects and report the ones for which we have at least 
+# three nights of observations.
+foreach my $obj (sort keys %all_objects) {
+    if (scalar keys %{$all_objects{$obj}} > 2) {    # require > 3 days
+        if ($verbose) {
+            print join("\t", $obj, sort keys %{$all_objects{$obj}}), "\n";
+        }
+        else {
+            print $obj, "\n";
+        }
+    }
+}
+
+=head1 DESCRIPTION
+
+Read an MITI file that is the output of selectTracklets and estimate how
+many objects should be "recoverable"; that is, have detection data that
+meet the MOPS requirement of N days over a lunation.
+
+At first pass this will mean that on object occurs in at least
+three clean tracklets on different days.
+
+=head1 SYNOPSIS
+
+guessTracklets [--help] tracklets.miti
+
+  tracklets.miti : output of selectTracklets
+  --detections : input data is detections, not tracklets
+  --verbose : show extra data (usually just objectName)
+  --help : show man page
+
+=cut

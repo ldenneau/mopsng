@@ -1,0 +1,324 @@
+#!/usr/bin/env perl
+# $Id: effReport 2479 2008-04-03 23:29:13Z denneau $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::History;
+use PS::MOPS::DC::Efficiency;
+
+
+use subs qw(
+    _sum
+    _out_events
+    _out_tabbed
+    _out_csv
+    _pct_str
+);
+
+# Globals.
+my @_tracklets_header_nn = qw(
+    fieldId NN Available Clean Clean_pct Unfound Unfound_pct Mixed Mixed_pct Bad Bad_pct Nonsynth
+);
+my @_events_header_ocnum = qw(
+    NN Available Linked Linked_pct PassIOD PassIOD_pct PassDIFF PassDIFF_pct Mixed Mixed_pct Bad Bad_pct Nonsynth Dup Dup_pct
+);
+my @_events_header_nn = qw(
+    fieldId Available Linked Linked_pct PassIOD PassIOD_pct PassDIFF PassDIFF_pct Mixed Mixed_pct Bad Bad_pct Nonsynth Dup Dup_pct
+);
+
+
+my $inst;
+my $instance_name;
+my $type;
+my $ocnum;
+my $nn;
+my $csv;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'type=s' => \$type,
+    'ocnum=i' => \$ocnum,
+    'nn=i' => \$nn,
+    'mjd=i' => \$nn,            # kind of a synonym for nn
+    csv => \$csv,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+pod2usage(-message => "--ocnum or --nn required.\n") unless ($ocnum or $nn);
+pod2usage(-message => "TYPE must be specified.\n") unless ($type);
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+
+
+my $stuff;
+my $title;
+
+if ($type eq 'T') {
+    die "Sorry, but --ocnum is not supported for --type T.  Use --nn MJD.\n" unless $nn;
+    $title = "Tracklets";
+    $stuff = modce_retrieve($inst, category => $EFF_TRACKLETS, epoch_mjd => $nn);
+    unshift @{$stuff}, {
+        fieldId => 'N/A',
+        nn => 'Total',
+        avail => _sum(map { $_->{avail} } @{$stuff}),
+        clean => _sum(map { $_->{clean} } @{$stuff}),
+        unfound => _sum(map { $_->{unfound} } @{$stuff}),
+        mixed => _sum(map { $_->{mixed} } @{$stuff}),
+        bad => _sum(map { $_->{bad} } @{$stuff}),
+        nonsynthetic => _sum(map { $_->{nonsynthetic} } @{$stuff}),
+    };
+    _out_tracklets_nn("$title, Night Number $nn", $stuff);
+}
+elsif ($type =~ /^[DAPIR]$/) {
+    if ($nn) {
+        if ($type eq 'D') {
+            $stuff = modce_retrieve($inst, category => $EFF_DERIVEDOBJECTS, byField => 1, epoch_mjd => $nn);
+            $title = 'Derivations';
+        }
+        elsif ($type eq 'A') {
+            $stuff = modce_retrieve($inst, category => $EFF_ATTRIBUTIONS, byField => 1, epoch_mjd => $nn);
+            $title = 'Attributions';
+        }
+        elsif ($type eq 'P') {
+            $stuff = modce_retrieve($inst, category => $EFF_PRECOVERIES, byField => 1, epoch_mjd => $nn);
+            $title = 'Precoveries';
+        }
+        elsif ($type eq 'I') {
+            $stuff = modce_retrieve($inst, category => $EFF_IDENTIFICATIONS, byField => 1, epoch_mjd => $nn);
+            $title = 'Identifications';
+        }
+
+        unshift @{$stuff}, {
+            fieldId => 'N/A',
+            nn => 'Total',
+            avail => _sum(map { $_->{avail} } @{$stuff}),
+            failiod => _sum(map { $_->{failiod} } @{$stuff}),
+            clean => _sum(map { $_->{clean} } @{$stuff}),
+            unfound => _sum(map { $_->{unfound} } @{$stuff}),
+            unlinked => _sum(map { $_->{unlinked} } @{$stuff}),
+            failod => _sum(map { $_->{failod} } @{$stuff}),
+            mixed => _sum(map { $_->{mixed} } @{$stuff}),
+            bad => _sum(map { $_->{bad} } @{$stuff}),
+            nonsynthetic => _sum(map { $_->{nonsynthetic} } @{$stuff}),
+            duplicate => _sum(map { $_->{duplicate} } @{$stuff}),
+        };
+        _out_events_nn("$title, Night Number $nn", $stuff);
+    }
+    else {
+        if ($type eq 'D') {
+            $stuff = modce_retrieve($inst, category => $EFF_DERIVEDOBJECTS, ocnum => $ocnum);
+            $title = 'Derivations';
+        }
+        elsif ($type eq 'A') {
+            $stuff = modce_retrieve($inst, category => $EFF_ATTRIBUTIONS, ocnum => $ocnum);
+            $title = 'Attributions';
+        }
+        elsif ($type eq 'P') {
+            $stuff = modce_retrieve($inst, category => $EFF_PRECOVERIES, ocnum => $ocnum);
+            $title = 'Precoveries';
+        }
+        elsif ($type eq 'I') {
+            $stuff = modce_retrieve($inst, category => $EFF_IDENTIFICATIONS, ocnum => $ocnum);
+            $title = 'Identifications';
+        }
+
+        unshift @{$stuff}, {
+            nn => 'Total',
+            avail => _sum(map { $_->{avail} } @{$stuff}),
+            failiod => _sum(map { $_->{failiod} } @{$stuff}),
+            clean => _sum(map { $_->{clean} } @{$stuff}),
+            unfound => _sum(map { $_->{unfound} } @{$stuff}),
+            unlinked => _sum(map { $_->{unlinked} } @{$stuff}),
+            failod => _sum(map { $_->{failod} } @{$stuff}),
+            mixed => _sum(map { $_->{mixed} } @{$stuff}),
+            bad => _sum(map { $_->{bad} } @{$stuff}),
+            nonsynthetic => _sum(map { $_->{nonsynthetic} } @{$stuff}),
+            duplicate => _sum(map { $_->{duplicate} } @{$stuff}),
+        };
+        _out_events_ocnum("$title, OCNUM $ocnum", \@_events_header_ocnum, $stuff);
+    }
+}
+
+exit;
+
+
+
+
+sub _sum {
+    my @data = @_;
+    my $tot = 0;
+    $tot += $_ foreach @_;
+    return $tot;
+}
+
+
+sub _out_tabbed {
+    my (@fields) = @_;
+    print join("\t", @fields), "\n";
+}
+
+
+sub _out_csv {
+    my (@fields) = @_;
+    print join(",", @fields), "\n";
+}
+
+
+sub _out_tracklets_nn {
+    my ($title, $stuff) = @_;
+    my @fields;
+    my $avail;
+    my $den;
+    my $row;
+    my @all_fields;
+    
+    foreach $row (@{$stuff}) {
+        $den = $row->{avail} || 1;      # denominator for percentage calcs
+        push @all_fields, [
+            $row->{fieldId},       # field ID
+            $row->{nn},      # epoch
+            $row->{avail},          # available
+            $row->{clean}, _pct_str($row->{clean} / $den),    # clean
+            $row->{unfound}, _pct_str($row->{unfound} / $den),    # clean
+            $row->{mixed}, _pct_str($row->{mixed} / $den),    # mixed
+            $row->{bad}, _pct_str($row->{bad} / $den),        # bad
+            $row->{nonsynthetic},                   # nonsynthetic
+        ];
+    }
+
+    if ($csv) {
+        _out_csv($title);
+        _out_csv(@_tracklets_header_nn);
+        _out_csv(@{$_}) foreach @all_fields;
+    }
+    else {
+        _out_tabbed($title);
+        _out_tabbed(@_tracklets_header_nn);
+        _out_tabbed(@{$_}) foreach @all_fields;
+    }
+}
+
+
+
+sub _out_events_nn {
+    my ($title, $stuff) = @_;
+    my @fields;
+    my $avail;
+    my $den;
+    my $row;
+    my @all_fields;
+    
+    foreach $row (@{$stuff}) {
+        $den = $row->{avail} || 1;      # denominator for percentage calcs
+        push @all_fields, [
+            $row->{fieldId},       # field ID
+#            $row->{nn},      # epoch
+            $row->{avail},          # available
+            ($row->{avail} - $row->{unlinked}), _pct_str(($row->{avail} - $row->{unlinked}) / $den),  # linked
+            ($row->{avail} - $row->{unlinked} - $row->{failiod}), _pct_str(($row->{avail} - $row->{unlinked} - $row->{failiod}) / $den),  # pass IOD
+            $row->{clean}, _pct_str($row->{clean} / $den),    # pass diffcor
+            $row->{mixed}, _pct_str($row->{mixed} / $den),    # mixed
+            $row->{bad}, _pct_str($row->{bad} / $den),        # bad
+            $row->{nonsynthetic},                                   # nonsynthetic
+            $row->{duplicate}, _pct_str($row->{duplicate} / $den),  # duplicates
+        ];
+    }
+
+    if ($csv) {
+        _out_csv($title);
+        _out_csv(@_events_header_nn);
+        _out_csv(@{$_}) foreach @all_fields;
+    }
+    else {
+        _out_tabbed($title);
+        _out_tabbed(@_events_header_nn);
+        _out_tabbed(@{$_}) foreach @all_fields;
+    }
+}
+
+
+
+
+sub _out_events_ocnum {
+    my ($title, $header, $stuff) = @_;
+    my @fields;
+    my $avail;
+    my $den;
+    my $row;
+    my @all_fields;
+    
+    foreach $row (@{$stuff}) {
+        $den = $row->{avail} || 1;      # denominator for percentage calcs
+        push @all_fields, [
+            $row->{nn},      # epoch
+            $row->{avail},          # available
+            ($row->{avail} - $row->{unlinked}), _pct_str(($row->{avail} - $row->{unlinked}) / $den),  # linked
+            ($row->{avail} - $row->{unlinked} - $row->{failiod}), _pct_str(($row->{avail} - $row->{unlinked} - $row->{failiod}) / $den),  # pass IOD
+            $row->{clean}, _pct_str($row->{clean} / $den),    # pass diffcor
+            $row->{mixed}, _pct_str($row->{mixed} / $den),    # mixed
+            $row->{bad}, _pct_str($row->{bad} / $den),        # bad
+            $row->{nonsynthetic},                                   # nonsynthetic
+            $row->{duplicate}, _pct_str($row->{duplicate} / $den),  # duplicates
+        ];
+    }
+
+    if ($csv) {
+        _out_csv($title);
+        _out_csv(@_events_header_ocnum);
+        _out_csv(@{$_}) foreach @all_fields;
+    }
+    else {
+        _out_tabbed($title);
+        _out_tabbed(@_events_header_ocnum);
+        _out_tabbed(@{$_}) foreach @all_fields;
+    }
+}
+
+
+sub _pct_str {
+    my ($d) = @_;
+    return sprintf "%.3f", 100 * $d;
+}
+
+
+=head1 SYNOPSIS
+
+effReport [--options] 
+
+  --type TYPE : specify event type, T/D/A/I/P/R
+  --ocnum OCNUM : which observing cycle to summarize
+  --nn MJD : which MJD-based night-number to summarize
+  --csv : output report in CSV format (otherwise tab-delimited)
+  --help : show man page
+
+=head1 DESCRIPTION
+ 
+Create text efficiency reports.  TYPE must be one of 
+
+=item T
+
+Tracklets
+
+=item D
+
+Derivations
+
+=item A
+
+Attributions
+
+=item P
+
+Precoveries
+
+=item I
+
+Identifications
+
+=cut

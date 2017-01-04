@@ -1,0 +1,477 @@
+#! /usr/bin/env perl
+
+=head1 NAME
+
+fakedq - Generate fake detectability query responses
+
+=head1 SYNOPSIS
+
+fakedq FILESET
+
+  FILESET : name of fileset to read detectability query from
+
+=head1 DESCRIPTION
+
+Reads all detectability queries from the specified fileset on the local
+datastore and generates artificial responses on the local datastore.
+
+=cut
+
+# $Id$
+
+use warnings;
+use strict;
+
+use Carp;
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use LWP;
+use File::Temp;
+use File::Path;
+
+use Astro::FITS::CFITSIO;
+
+use PS::MOPS::Detectability;
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Detection;
+
+use subs qw(
+    read_query_items
+    make_up_responses
+    write_response_items
+);
+
+my $instance_name;
+my $inst;
+my $help;
+
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+my $FILESET = shift or pod2usage(-msg => 'FILESET is required');
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+
+my $ua = LWP::UserAgent->new();
+my $ds_url = "http://localhost/ds/mops-detectability-requests/$FILESET/index.txt";
+my $res = $ua->get($ds_url);
+my @items = grep { !/^#/ } split /\n/, $res->content;
+
+# For each item, create a matching file with the detectability response
+# and write it to the filesystem.
+my ($id, $sz, $md5, $type);
+my $url;
+my $tempdir = File::Temp::tempdir('fakedqXXXX', DIR => '/tmp', CLEANUP => 1);
+my $tmpfn = "$tempdir/foo";
+my @dets;
+
+my $newdir = "$ENV{MOPS_HOME}/ds/dsroot/mops-detectability-responses/$FILESET";
+eval { mkpath($newdir) };
+die $@ if $@;
+
+foreach my $item (@items) {
+    ($id, $sz, $md5, $type) = split /\|/, $item;
+
+    # Read FITS file to local file.
+    $url = "http://localhost/ds/mops-detectability-requests/$FILESET/$id";
+    $res = $ua->get($url, ':content_file' => $tmpfn);
+
+
+    # Read file; get detections; write file.
+    my $query = DetectabilityQuery->new($tmpfn) or die "can't create DQ from file $tmpfn";
+    @dets = read_query_items($query);
+    $query->closefile();
+
+
+    my $newfn = "$newdir/$id";
+    my $response = DetectabilityResponse->new($newfn, {
+        QUERY_ID => $query->{_keys}->{QUERY_ID},
+        FPA_ID => $query->{_keys}->{FPA_ID},
+    });
+    @dets = make_up_responses(@dets);
+    write_response_items($response, @dets);
+    $response->closefile();
+    print STDERR '.';
+}
+print STDERR "\n";
+
+# Register the created fileset.
+my $register_cmd = 'register_fileset';
+my $product = 'mops-detectability-responses';
+
+system(
+    $register_cmd, 
+    '--add',
+    "--type=mops_detectability_response",
+    "--product=$product",
+    "--fileset=$FILESET",
+) == 0 or die("register for $FILESET failed");
+
+# Diagnostics.
+#print join("\n", @items), "\n";
+exit;
+
+
+sub read_query_items {
+    # Read all the query items from the FITS detectability query,
+    # and return ROWNUM, RA1, DEC1, MAG
+    my ($query) = @_;
+    my @rec;
+    my @dets;
+    while (@rec = $query->readrecord()) {   # read entire record
+        push @dets, [ @rec[0, 1, 2, 5] ];
+    }
+
+    return @dets;
+}
+
+
+sub make_up_responses {
+    # Given a list of detection detectability requests, return a list of
+    # fake detectability responses.  For now we'll just assign a
+    # random number of pixels to the request and a uniform probability
+    # of detection.
+    my @dets = @_;
+    my $det;
+    my @response;
+    foreach $det (@dets) {
+        push @response, [
+            $det->[0],    # ROWNUM
+            int(5 + rand() * 10),   # 5-14 pixels
+            rand(),                 # uniform [0-1)
+            rand() * 100,           # target flux
+        ];
+    }
+
+    return @response;
+}
+
+
+sub write_response_items {
+    # Given a FITS detectability response object and a list of detection
+    # responses, write them.
+    my ($response, @dets) = @_;
+    foreach my $det (@dets) {
+        $response->writerecord(@{$det});
+    }
+}
+
+
+=pod
+
+Simple package to handle reading and writing of detectability reqests for
+our fake regime.  Note that format we read is different from the format
+we write: we read "requests" (as written by MOPS) and write "responses"
+(usually written by IPP).
+
+=cut
+
+
+package DetectabilityQuery;
+use Carp;
+
+sub keyval {
+    my ($self, $key, $value) = @_;
+    $self->{'_keys'}{$key} = $value if defined($value);
+    return $self->{'_keys'}{$key};
+}
+
+sub _check_status {
+    # Private utility routine to just report the status and die
+    # if the status is non-zero.
+    my ($status, $msg) = @_;
+	if ($status) {
+		Astro::FITS::CFITSIO::fits_report_error('STDERR', $status);
+		confess "FITS status: $status: $msg";
+	}
+}
+
+
+sub new {
+	my ($pkg, $base_filename) = @_;
+	my $self = {
+		_extname => 'MOPS_DETECTABILITY_QUERY',
+		_tablever => 'UNKNOWN',
+		_keys => undef,
+		_data => undef,
+		_fptr => undef,
+		_row => undef,
+		_nrows => undef,
+	};
+
+	bless $self, $pkg;
+
+    # The field metadata is stored in the zeroth extention.  So read 
+    # this HDU and extract the stuff from it.  Then open the first 
+    # extention, where we will find detectiions.
+	my $status = 0;                         # cfitsio $status variable.
+    my $filename;                           # general-purpose filename with FITS HDU attached
+    my $value;
+	my $comment;
+
+	# Open and read the fits file.
+#	$filename = $base_filename . "[0]";
+	$filename = $base_filename;
+	$self->{_fptr} = Astro::FITS::CFITSIO::open_file($filename, Astro::FITS::CFITSIO::READONLY(), $status);
+    _check_status($status, "error while reading $filename");
+
+    # Detections, etc.
+	$self->{_fptr}->movrel_hdu(1, undef, $status);
+    _check_status($status, "error moving to HDU 1 in $filename");
+	$self->{_row} = 1;
+
+	# Metadata keywords.
+	$self->{_keys} = undef;
+
+    my %read_keydefs = (
+        QUERY_ID => [ Astro::FITS::CFITSIO::TSTRING(), 20, 'Unique Query identifier' ],
+        FPA_ID => [ Astro::FITS::CFITSIO::TSTRING(), 20, 'IPP FPA identifier' ],
+        'MJD-OBS' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, 'Midpoint time' ],
+        FILTER => [ Astro::FITS::CFITSIO::TSTRING(), 3, '' ],
+        OBSCODE => [ Astro::FITS::CFITSIO::TSTRING(), 3, ''],
+    );
+	for my $key (keys %read_keydefs) {
+		$self->{_fptr}->read_keyword($key, $value, $comment, $status);
+
+		if (!defined($value)) {
+            die "Undefined keyword $key while reading $filename";
+		}
+		$value =~ s/^'//;
+		$value =~ s/ *'$//;
+		$self->{_keys}{$key} = $value;
+	}
+
+	# Read the extension name.
+	$self->{_fptr}->read_keyword("EXTNAME", $value, $comment, $status);
+    _check_status($status, "error reading keyword 'EXTNAME'");
+	$self->{_extname} = $value;
+
+	# Read the version name.
+	$self->{_tablever} = 'UNKNOWN';
+
+	#  Get the number of rows
+	$self->{_fptr}->get_num_rows($self->{'_nrows'}, $status);
+    _check_status($status, "error getting number of rows");
+
+    $self->{READ_COLS} = [qw(
+        ROWNUM
+        RA1_DEG
+        DEC1_DEG
+        RA2_DEG
+        DEC2_DEG
+        MAG
+    )];
+
+    $self->{READ_COLDEFS} = {
+        ROWNUM => [ Astro::FITS::CFITSIO::TSTRING(), '20A' ],
+        RA1_DEG => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+        DEC1_DEG => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+        RA2_DEG => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+        DEC2_DEG => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+        MAG => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+    };
+
+    return $self;
+}
+
+sub readrecord()
+{
+	my ($self) = @_;
+	my $status = 0;
+	my @data = ();
+
+	if ($self->{'_row'} > $self->{'_nrows'}) {
+		return ();
+	}
+
+    # Read columns.
+    # Rownum.
+	my $i = 1;
+    my $anynul;
+    my @datum;
+
+    $self->{_fptr}->read_col(Astro::FITS::CFITSIO::TSTRING(), $i,
+        $self->{_row}, 1, 1, 0, \@datum, $anynul, $status);
+    _check_status($status, "error reading column");
+    push @data, $datum[0];
+
+    # Other columns.
+	foreach my $col (@{$self->{READ_COLS}}) {
+        if ($i > 1) {   # skip first col (ROWNUM)
+            my $colname;
+            my $colnum;
+            my @datum;
+
+            $self->{_fptr}->read_col(Astro::FITS::CFITSIO::TDOUBLE(), $i,
+                $self->{_row}, 1, 1, 0, \@datum, $anynul, $status);
+            _check_status($status, "error reading column");
+            push @data, $datum[0];
+        }
+		$i++;
+	}
+
+	$self->{_row}++;
+	return @data;
+}
+
+sub closefile {
+	my ($self) = @_;
+	my $status = 0;
+	$self->{_fptr}->close_file($status);
+    _check_status($status, "cannot close file");
+	$self->{_fptr} = undef;
+	$self->{_row} = undef;
+	$self->{_nrows} = undef;
+}
+
+
+package DetectabilityResponse;
+use Carp;
+
+sub keyval {
+    my ($self, $key, $value) = @_;
+    $self->{'_keys'}{$key} = $value if defined($value);
+    return $self->{'_keys'}{$key};
+}
+
+
+sub _check_status {
+    # Private utility routine to just report the status and die
+    # if the status is non-zero.
+    my ($status, $msg) = @_;
+	if ($status) {
+		Astro::FITS::CFITSIO::fits_report_error('STDERR', $status);
+		confess "FITS status: $status: $msg";
+	}
+}
+
+
+sub new {
+	my ($pkg, $filename, $force, %keys) = @_;
+	my $self = {
+		_extname => 'MOPS_DETECTABILITY_RESPONSE',
+		_tablever => 'UNKNOWN',
+		_keys => undef,
+		_data => undef,
+		_fptr => undef,
+		_row => undef,
+		_nrows => undef,
+	};
+
+	bless $self, $pkg;
+	my @null_ttype = ();
+	my @null_tform = ();
+
+	for my $key (keys %keys) {
+		$self->{'_keys'}{$key} = $keys{$key};
+	}
+
+	# Parameter checking and variable initializing
+	if ( not defined $filename ) {
+		die "Must specify filename"
+	}
+
+	# The cfitsio status variable.
+	my $status = 0;
+
+	# Open the file
+	if ($force) {
+		$self->{_fptr} = Astro::FITS::CFITSIO::create_file('!' . $filename, $status);
+	} else {
+		$self->{_fptr} = Astro::FITS::CFITSIO::create_file($filename, $status);
+	}
+    _check_status($status, "cannot create file $filename");
+
+    $self->{_fptr}->create_img(16, 0, undef, $status);
+    _check_status($status, "cannot create img $filename");
+
+	$self->{_fptr}->create_tbl(Astro::FITS::CFITSIO::BINARY_TBL(),
+		0, 0, \@null_ttype, \@null_tform, 0, $self->{_extname}, $status);
+    _check_status($status, "cannot create table");
+
+	$self->{_row} = 1;
+
+    my %write_keydefs = (
+        QUERY_ID => [ Astro::FITS::CFITSIO::TSTRING(), 20, 'Unique Query identifier' ],
+        FPA_ID => [ Astro::FITS::CFITSIO::TSTRING(), 20, 'IPP FPA identifier' ],
+    );
+	for my $key (sort keys %write_keydefs) {
+		my $type = $write_keydefs{$key}[0];
+		my $width = $write_keydefs{$key}[1];
+		my $comment = $write_keydefs{$key}[2];
+		my $value = $self->{'_keys'}{$key} || '';
+
+		$self->{_fptr}->write_key($type, $key, $value, $comment, $status);
+        _check_status($status, "cannot write key $key to file $filename");
+	}
+
+	$self->{_fptr}->write_key(Astro::FITS::CFITSIO::TSTRING(),
+		'TABLEVER', $self->{_tablever}, 'Table Version', $status);
+    _check_status($status, "cannot write key 'TABLEVER'");
+
+	# Create the matching format string.
+    my @write_cols = qw(
+        ROWNUM
+        DETECT_N
+        DETECT_F
+        TARGET_FLUX
+    );
+    my %write_coldefs = (
+        ROWNUM => [ Astro::FITS::CFITSIO::TSTRING(), '20A' ],
+        DETECT_N => [ Astro::FITS::CFITSIO::TUINT(), '1J1' ],
+        DETECT_F => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+        TARGET_FLUX => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+    );
+	my @write_tform = ();
+	for my $key (@write_cols) {
+        push @write_tform, $write_coldefs{$key}[1];
+	}
+	$self->{_fptr}->insert_cols(1, @write_cols + 0, \@write_cols, \@write_tform, $status);
+    _check_status($status, "cannot insert columns");
+
+    return $self;
+}
+
+sub writerecord {
+	my ($self, @data) = @_;
+	my $status = 0;
+
+    my @datum = $data[0];
+    $self->{_fptr}->write_col(Astro::FITS::CFITSIO::TSTRING(), 1,
+        $self->{_row}, 1, 1, \@datum, $status);
+    _check_status($status, "error writing column 0");
+
+    @datum = $data[1];
+    $self->{_fptr}->write_col(Astro::FITS::CFITSIO::TUINT(), 2,
+        $self->{_row}, 1, 1, \@datum, $status);
+    _check_status($status, "error writing column 1");
+
+    @datum = $data[2];
+    $self->{_fptr}->write_col(Astro::FITS::CFITSIO::TDOUBLE(), 3,
+        $self->{_row}, 1, 1, \@datum, $status);
+    _check_status($status, "error writing column 2");
+
+    @datum = $data[3];
+    $self->{_fptr}->write_col(Astro::FITS::CFITSIO::TDOUBLE(), 4,
+        $self->{_row}, 1, 1, \@datum, $status);
+    _check_status($status, "error writing column 3");
+
+	$self->{_row}++;
+}
+
+sub closefile {
+	my ($self) = @_;
+	my $status = 0;
+	$self->{_fptr}->close_file($status);
+    _check_status($status, "cannot close file");
+	$self->{_fptr} = undef;
+	$self->{_row} = undef;
+	$self->{_nrows} = undef;
+}

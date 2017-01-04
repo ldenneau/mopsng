@@ -1,0 +1,27 @@
+#!/bin/sh
+
+# Program invoked as pvm slave that calculates ephems for 
+# orbits in specified file and writes them back to STDOUT,
+# which is captured by the pvm master.
+
+if [ $# -ne 1 ]
+then
+    echo "usage: genEphems MJD"
+    exit 99
+fi
+
+EPOCH=$1
+NODE=`hostname --short`
+
+# Set up files.
+OUTFILE=/tmp/genEphem-$EPOCH.$NODE
+ORBITFILE=$HOME/var/objects/all_orbits.$NODE
+
+# Generate ephemerides to /tmp file.
+$HOME/MOPS/bin/genEphem $EPOCH.416666 $OUTFILE < $ORBITFILE 2&>1 > /dev/null
+
+# Write to STDOUT.
+/bin/cat $OUTFILE
+
+# Clean up.
+/bin/rm $OUTFILE

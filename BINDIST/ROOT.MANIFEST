@@ -1,0 +1,8 @@
+config/backend.cf
+config/cluster.cf
+config/log4perl.conf
+config/master.cf
+config/version
+.psmops_rootpw
+.bash_profile
+README

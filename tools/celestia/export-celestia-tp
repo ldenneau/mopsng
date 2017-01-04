@@ -1,0 +1,89 @@
+#!/usr/bin/env perl
+#
+use strict;
+use warnings;
+
+use Math::Trig;
+
+sub cvt {
+    my ($line) = @_;
+
+    # Process lines.
+    my ($q_AU, $e, $i_deg, $node_deg, $arg_peri_deg, $time_peri_mjd, $h_v, $epoch_mjd);
+    my $class;
+    my ($id, $dummy);
+    my $radius_km;
+    my $period_y;
+    my @output; 
+    my $tan_E2;
+    my $a_AU;
+    my $E;
+    my $T_days;
+    my $M;
+
+    ($q_AU, $e, $i_deg, $node_deg, $arg_peri_deg, $time_peri_mjd, $h_v, $epoch_mjd, $id) = split /\s+/, $line;
+
+    # Convert true anomaly to time of perihelion.
+#    $E = atan2(sin($true_anomaly * pi / 180) * sqrt(1 - $e * $e), $e + cos($true_anomaly * pi / 180));
+#    $M = $E - $e * sin($E);
+    $M = 0;
+    $a_AU = $q_AU / (1 - $e);
+    $period_y = sqrt($q_AU ** 3);
+#    $time_peri_mjd = $epoch_mjd + ($period_y * 365) * $M / 360;
+    
+
+    warn "bogus line $line" unless defined($epoch_mjd);
+#    $M *= 180 / pi;
+    $epoch_mjd += 2400000.5;    # convert MJD to JD
+    $time_peri_mjd += 2400000.5;    # convert MJD to JD
+
+    # Calculate radius in km.  Note: eqn returns diameter in km, so / 2 for radius.  Also
+    # 0.316 = sqrt(.1).  Also convert to m.
+
+    $h_v = 8;       # silly, but bright dot in celestia
+    $radius_km = (1329 * 10 ** (-0.25 * $h_v)) / .316 / 2 * 1000;
+
+    if ($id =~ /^Sc/) {
+        $class = 'comet';
+    }
+    else {
+        $class = 'asteroid';
+    }
+
+    push @output, <<"TEMPLATE";
+# $id
+# "name of object"  "name of primary"
+  "$id"       "Sol"
+{
+        Class   "$class"
+        Texture "asteroid.jpg"
+        Mesh    "asteroid.cms"
+        Radius         $radius_km
+        RotationPeriod 11.34  # arbitrary
+
+        EllipticalOrbit
+         {
+                 Period                $period_y
+                 PericenterDistance    $q_AU
+                 Eccentricity          $e
+                 Inclination           $i_deg
+                 AscendingNode         $node_deg
+                 ArgOfPericenter       $arg_peri_deg
+                 MeanAnomaly           $M
+                 Epoch                 $time_peri_mjd
+         }
+
+}
+TEMPLATE
+
+    return join('', @output);
+}
+
+
+my $line;
+while (defined($line = <>)) {
+    next if $line =~ /^(#|!)/;
+    chomp $line;
+
+    print cvt($line);
+}

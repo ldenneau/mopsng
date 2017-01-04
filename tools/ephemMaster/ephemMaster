@@ -1,0 +1,84 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use File::Slurp;
+use Getopt::Long;
+
+
+sub usage {
+    return <<"USAGE";
+usage: ephemMaster EPOCH
+  EPOCH : epoch to calculate coarse ephemerides for (MJD)
+USAGE
+}
+
+
+# Options.
+my $help;
+my $debug;
+my $rv;
+$rv = GetOptions(
+    help => \$help,
+    debug => \$debug,
+);
+die usage() if !$rv or $help;
+
+my $EPOCH = shift or die usage();
+my $NODE;
+my $VARDIR;
+
+my @nodes;
+my $cmd;
+
+
+# Get nodes.
+my $NODE_FILE = "$ENV{MOPS_HOME}/config/mops.lst";
+die "can't find $NODE_FILE" unless -f $NODE_FILE;
+@nodes = read_file($NODE_FILE);
+chomp @nodes;
+
+# Move to correct directory.
+$VARDIR = "$ENV{MOPS_HOME}/var/coarseEphem";
+die "not a dir: $VARDIR" unless -d $VARDIR;
+chdir $VARDIR or die "can't chdir to $VARDIR";
+
+
+printf STDERR "Dispatching to %d nodes.\n", scalar @nodes;
+foreach $NODE (@nodes) {
+    $cmd = <<"EOF";
+(ssh $NODE /home/denneau/bin/ephemSlave $EPOCH > $EPOCH.$NODE.tmp; mv $EPOCH.$NODE.tmp $EPOCH.$NODE) &
+EOF
+    system $cmd;
+}
+
+# Now wait for jobs to finish.  Scan for all tmp files to be
+# moved to final state.
+print STDERR "Waiting...\n";
+while (1) {
+    sleep 10;
+
+    # Scan directory
+    my %found;
+    opendir DIR, "." or die "can't read current directory";
+    $found{$_} = 1 foreach readdir DIR;  # tag all found files in this dir
+    closedir DIR;
+
+    # Now check that all nodes have completed -- that their $EPOCH.$NODE files exist. 
+    my $found_bad = 0;
+    foreach my $n (@nodes) {
+        if (!exists($found{"$EPOCH.$n"})) {
+            $found_bad = 1; # note it
+            last;   # abort foreach()
+        }
+    }
+
+    last unless $found_bad;
+}
+
+# Concatenate all the node files into a single file.
+print STDERR "Building output file $EPOCH.\n";
+my $all_nodes = join " ", map { "$EPOCH.$_" } @nodes;
+system "/bin/cat $all_nodes > $EPOCH";
+unlink "$EPOCH.$_" foreach @nodes;

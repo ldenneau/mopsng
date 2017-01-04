@@ -1,0 +1,7 @@
+Build and install modules:
+
+Makefile.PL:
+  perl Makefile.PL INSTALL_BASE=/mops
+
+Build.PL:
+  Perl Build.PL install --install_base /mops

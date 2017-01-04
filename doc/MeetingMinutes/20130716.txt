@@ -1,0 +1,27 @@
+Attendees:
+Bolin (BB), Chambers (KC), Chastel (SC/Chair/Scribe), Denneau (LD), Engelhardt (TE), Hsieh (HH), Huber (MH), Magnier (EM), Schunova (ES), Wainscoat (RW)
+
+* Telescope Status (KC): Good weather. Still a few minor concerns with focus.
+
+* Data Processing
+  * Trail Fitting (EM): Ready. Should be in production next week. EM will send SC/LD when it's in production. Will be run on all detections but for high density areas (values will be all NaN).
+  * w-band calibration (EM): Cloudy weather is apparently not well taken into account on the MOPS side. The zeropoint value should be checked to identify that kind of issues.
+  * Convolution issues (MH): work done by MH and CW (Waters) should reduce the number of disappearing sources. Has to be evaluated though (both by the IPP and then on our side).
+  * Pantasks publishing (SC to EM): publishing regularly misses exposures in the early morning. EM needs to analyze what.
+  * Postage server (SC): Slow. Bill is investigating (and the problem has been fixed: hardware concern on the IPP side)
+  * Comets (HH): Offset of sqrt(2). EM: Oops. Will check code.
+  * Ingestion concerns when close to GP (SC): Don't ingest an exposure (or an OTA) when the number of detections is too large.
+
+* NEO Status (RW): 32 new ones this lunation. Ahead G96. Our main problem is confirmation
+
+* NEO Czaring (BB)
+  * Cross-talk in g-band: BB suggests not to send anything in g-band unless it's obviously trailed
+  * Recompute digest when a detection is unchecked. Idea: Mark the unchecked detection(s) in the trail. Update trail info in db.
+  * Pairs and cross-talk: difficult question. Objects might be real. Two traclekets were shown and the conclusion was to submit them.
+  * Czaring organization: Czaring time is reduced when the posttracklet stage has identified known objects. However that's an extra hour of waiting. Associated source code will be difficult if not impossible to rewrite.
+
+* Submit comet button (RJW)?
+  * E-mails with "comet" or "NEO and digest > 50" are always put on the confirmation page
+  * Send an e-mail with "comet" in the subject
+  * In webpage: Set background of suspected comet to different color so that it's not inadvertently submitted as a regular object.
+

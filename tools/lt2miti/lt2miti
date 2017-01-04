@@ -1,0 +1,83 @@
+#!/usr/bin/env perl
+
+# Quickie to take LinkTracklets summary file, which contains track
+# IDs and line numbers from source tracklets file, and generates
+# a MITI or MIF tracklets file.
+
+use strict;
+use warnings;
+use PS::MOPS::MITI;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use FileHandle;
+
+my ($sum, $trkl) = @ARGV;
+
+my $trkl_fh = new FileHandle "$trkl" or die "can't open $trkl";
+my @trkl = <$trkl_fh>;   # read entire file
+chomp @trkl;
+close $trkl_fh;
+
+# Loop through track IDs in the summary file.  On each
+# line is a tracklet ID and line number from the source
+# file.  Snag the MITI source line and replace with the
+# track ID.
+
+my ($id, $trkl_id, $line_no);
+my $miti;       # MITI text line
+my %mh;         # MITI data hash
+my $sum_fh = new FileHandle $sum;
+my $line;
+
+# Plan is to accumulate MITI lines for each detection, saving tracklet
+# ids.  When we get to a new track, then print out the previous track.
+while (defined($line = <$sum_fh>)) {
+    chomp $line;
+    ($id, $trkl_id, $line_no) = split /\s+/, $line, 3;
+    $miti = $trkl[$line_no];    # fetch from MITI source data
+    %mh = miti_parse($miti);    # convert to MITI hash table
+    $mh{ID} = $id;              # replace ID
+    print miti_format_hash(%mh);
+}
+
+=head1 NAME
+
+lt2miti - Program to convert LinkTracklets track output to MOPS MITI format.
+
+=head1 SYNOPSIS
+
+lt2miti < tracks.sum
+
+=head1 DESCRIPTION
+
+lt2miti takes LinkTracklets output of the form
+
+track_id tracklet_id line_no
+track_id tracklet_id line_no
+track_id tracklet_id line_no
+etc.
+
+for example,
+
+000000 14             43
+000000 14             44
+000000 14             45
+000000 14             46
+000000 165           131
+000000 165           132
+000000 273             7
+000000 273             8
+000001 85             37
+000001 85             38
+000001 182           115
+000001 182           116
+000001 216             4
+000001 216             5
+000001 216             6
+
+Each line contains a unique track_id, tracklet_id, detetion_id tuple.  The output
+of lt2miti is a list of detections aggregated by track_id that can be submitted
+to initial orbit determination.
+
+=cut
+

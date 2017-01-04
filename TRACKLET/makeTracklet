@@ -1,0 +1,115 @@
+#!/usr/bin/env perl
+
+=pod
+
+=head1 NAME
+
+makeTracklet - manufacture a tracklet by hand given some detection IDs
+
+=head1 SYNOPSIS
+
+makeTracklet DET_ID1 DET_ID2 ...
+
+  DET_IDn : detection IDs (without leading "D")
+  --help : show man page
+
+=head1 DESCRIPTION
+
+Constructs a MOPS tracklet object given the detection IDs.
+
+=cut
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+use File::Slurp;
+use FileHandle;
+use Params::Validate;
+
+use Astro::SLA;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::GCR;
+
+
+our $nosubmit = 0;
+
+
+# Globals.
+my $debug;
+my $t0 = time;                          # for timing
+
+my $inst;
+my $instance_name;
+my $nn;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => 'No detection IDs specified') unless @ARGV;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+my @det_ids = @ARGV;
+s/^D// foreach @det_ids;     # strip leading "D" if present
+my @dets = map { modcd_retrieve($inst, detId => $_) } @det_ids;
+
+# Workaround for two-detection tracklets.
+my $gcr_arcsec = @dets == 2 ? 0 : PS::MOPS::GCR::compute_gcr(\@dets);
+
+my ($classification, $objectName) = modcd_classifyDetections($inst, @dets);
+my $ssm_id = modcs_objectName2ssmId($inst, $objectName);
+
+my $tracklet = PS::MOPS::DC::Tracklet->new(
+    $inst,
+    detections => \@dets,
+    classification => $classification,
+    ssmId => $ssm_id,
+    gcr_arcsec => $gcr_arcsec,
+) or $mops_logger->logdie("can't create tracklet using detections " . join(' ', @det_ids));
+
+$tracklet->insert() or $mops_logger->logdie("can't insert tracklet");
+
+my $digest = get_digest($tracklet->trackletId);
+$tracklet->digest($digest);
+printf STDERR "Created tracklet ID %s, v_tot=%.2f deg/day, digest=%.1f, probability=%.2f\n", $tracklet->trackletId, $tracklet->vTot, $digest, $tracklet->probability;
+exit;
+
+
+sub get_digest {
+    # Invoke the neodigest script and scrape out the digest.
+    my ($tid) = @_;
+    my $digest = 0;
+    my $cmd = join(' ', 'neodigest', $inst->dbname, 'T' . $tid);
+    my @foo = `$cmd`;
+    if (@foo) {
+        chomp @foo;
+        foreach my $line (@foo) {
+            if ($line =~ /^MT/) {
+                $digest = (split /\s+/, $line)[-1];
+                last;
+            }
+        }
+        if (!defined($digest)) {
+            print STDERR "Didn't see NEO output from neodigest.\n";
+            $digest = 0;
+        }
+    }
+    else {
+        print STDERR "Got empty output from neodigest.\n";
+    }
+    return $digest;
+}

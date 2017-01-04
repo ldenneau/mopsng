@@ -1,0 +1,412 @@
+#! /usr/bin/env perl
+# $Id: table.pm 186 2007-03-10 01:39:17Z yamada $
+
+use strict;
+use warnings;
+
+package table;
+use Carp;
+use Astro::FITS::CFITSIO;
+use File::Temp qw(tempfile tempdir);
+
+
+###########################################################################
+# Key definitions:
+#     FITS data type
+#     field width (only relevant for strings)
+#     FITS comment string
+#
+# TODO: Add appropriate comment fields 
+# TODO: String I/O should use field width
+###########################################################################
+
+my %keydefs = (
+	'FPA_ID' => [ Astro::FITS::CFITSIO::TSTRING(), 20, 'Identifier' ],
+	'MJD-OBS' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, 'Midpoint time' ],
+	'RA' => [ Astro::FITS::CFITSIO::TSTRING(), 12, 'RA' ],
+	'DEC' => [ Astro::FITS::CFITSIO::TSTRING(), 9, 'Dec' ],
+	'EXPTIME' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'ROTANGLE' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'FILTER' => [ Astro::FITS::CFITSIO::TSTRING(), 3, '' ],
+	'STARPSF' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'LIMITMAG' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'DE1' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'DE2' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'DE3' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'DE4' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'DE5' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'DE6' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'DE7' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'DE8' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'DE9' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'DE10' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'OBSCODE' => [ Astro::FITS::CFITSIO::TSTRING(), 5, ''],
+	'TEL_ALT' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+	'TEL_AZ' => [ Astro::FITS::CFITSIO::TDOUBLE(), 0, '' ],
+);
+
+###########################################################################
+# Column definitions: data type, data format
+#
+# The @cols array defines the order of the fields, so changing it
+# will restructure the file.
+###########################################################################
+
+my @cols = ('RA_DEG', 'DEC_DEG', 'RA_SIG', 'DEC_SIG', 'FLUX', 'FLUX_SIG',
+	'ANG', 'ANG_SIG', 'LEN', 'LEN_SIG' );
+
+my %coldefs = (
+	'RA_DEG' => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+	'DEC_DEG' => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+	'RA_SIG' => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+	'DEC_SIG' => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+	'FLUX' => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+	'FLUX_SIG' => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+	'ANG' => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+	'ANG_SIG' => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+	'LEN' => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ],
+	'LEN_SIG' => [ Astro::FITS::CFITSIO::TDOUBLE(), '1D1' ]
+);
+
+
+sub _check_status {
+    # Private utility routine to just report the status and die
+    # if the status is non-zero.
+    my ($status, $msg) = @_;
+	if ($status) {
+		Astro::FITS::CFITSIO::fits_report_error('STDERR', $status);
+		confess "FITS status: $status: $msg";
+	}
+}
+
+sub keyval {
+    my ( $self, $key, $value ) = @_;
+
+    $self->{'_keys'}{$key} = $value if defined($value);
+    return $self->{'_keys'}{$key};
+}
+
+
+sub openfile {
+	##############################################################
+	# Parameter checking and variable initialization
+	##############################################################
+
+	my ( $self, $base_filename ) = @_;
+	if ( not defined $base_filename ) {
+		die "Must specify $base_filename"
+	}
+
+    # The field metadata is stored in the zeroth extention.  So read 
+    # this HDU and extract the stuff from it.  Then open the first 
+    # extention, where we will find detectiions.
+	my $status = 0;                         # cfitsio $status variable.
+    my $filename;                           # general-purpose filename with FITS HDU attached
+    my $value;
+	my $comment;
+
+	# Open and read the fits file.
+#	$filename = $base_filename . "[0]";
+	$filename = $base_filename;
+	$self->{_fptr} = Astro::FITS::CFITSIO::open_file($filename, 
+		Astro::FITS::CFITSIO::READONLY(), $status);
+    _check_status($status, "error while reading $filename");
+
+	# Metadata keywords.
+	$self->{_keys} = undef;
+	for my $key (keys %keydefs) {
+		$self->{_fptr}->read_keyword($key, $value, $comment, $status);
+
+		if (!defined($value)) {
+            die "Undefined keyword $key while reading $filename";
+		}
+		$value =~ s/^'//;
+		$value =~ s/ *'$//;
+		$self->{_keys}{$key} = $value;
+	}
+
+
+    # Detections, etc.
+	$self->{_fptr}->movrel_hdu(1, undef, $status);
+    _check_status($status, "error moving to HDU 1 in $filename");
+	$self->{_row} = 1;
+
+	# Read the extension name.
+	$self->{_fptr}->read_keyword("EXTNAME", $value, $comment, $status);
+    _check_status($status, "error reading keyword 'EXTNAME'");
+	$self->{_extname} = $value;
+
+	# Read the version name.
+#	$self->{_fptr}->read_keyword("TABLEVER", $value, $comment, $status);
+#	$self->{_tablever} = $value;
+	$self->{_tablever} = 'UNKNOWN';
+#    _check_status($status, "error getting TABLEVER");
+
+
+	#  Get the number of rows
+	$self->{_fptr}->get_num_rows($self->{'_nrows'}, $status);
+    _check_status($status, "error getting number of rows");
+
+    return 1;
+}
+
+
+sub readrecord()
+{
+	my ($self) = @_;
+
+	my $status = 0;
+	my @data = ();
+
+	if ($self->{'_row'} > $self->{'_nrows'}) {
+		return ();
+	}
+
+	#
+	# Read each column in turn, and display the corresponding value.  For
+	# now, I just read the first row.
+	#
+
+	my $i = 1;
+	for my $col (@cols) {
+		my $colname;
+		my $colnum;
+		my @datum;
+
+		#$self->{_fptr}->get_colname(0, $col, $colname, $colnum, $status);
+		#if ($status) {
+		#	print "status = ", $status, "\n";
+		#	Astro::FITS::CFITSIO::fits_report_error('STDERR', $status);
+		#	die "Error while reading $filename";
+		#}
+
+		#
+		# TODO: type of column should not be hard coded as a double.
+		#
+
+		$self->{_fptr}->read_col(Astro::FITS::CFITSIO::TDOUBLE(), $i,
+			$self->{_row}, 1, 1, 0, \@datum, my $anynul, $status);
+        _check_status($status, "error reading column");
+		@data = (@data, $datum[0]);
+		$i++;
+	}
+
+	$self->{_row}++;
+
+	return @data;
+}
+
+
+sub closefile {
+	my ( $self ) = @_;
+
+	my $status = 0;
+
+	$self->{_fptr}->close_file($status);
+    _check_status($status, "cannot close file");
+
+	$self->{_fptr} = undef;
+	$self->{_row} = undef;
+	$self->{_nrows} = undef;
+}
+
+
+sub new {
+	my ($class) = @_;
+	my $self = {
+		_extname => 'MOPS_TRANSIENT_DETECTIONS',
+		_tablever => 'UNKNOWN',
+		_keys => undef,
+		_data => undef,
+		_fptr => undef,
+		_row => undef,
+		_nrows => undef,
+	};
+
+	bless $self, $class;
+	return $self;
+}
+
+
+package main;
+use Getopt::Long;
+use Pod::Usage;
+use File::Basename;
+
+use subs qw(
+    dump_file
+);
+
+
+my $mag_limit;
+ $proxrad_thresh_deg = 0.00013;         # default, about 0.5 arcsec
+my $out_filename;
+my $help;
+GetOptions(
+    'mag_limit=f' => \$mag_limit,
+    'proxrad_thresh_deg=f' => \$proxrad_thresh_deg,
+    'out=s' => \$out_filename,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => 'No files specified.') unless @ARGV;
+pod2usage(-msg => 'No output file specified.') unless $out_filename;
+
+my $global_epoch_mjd;           # epoch for all skycells
+my $global_obscode;             # obscode for all skycells
+my $global_filter;              # filter for all skycells
+my $skycell_root;               # root name for skycell, e.g. 'mops.1'
+
+my $all_href;                   # table of all detections.
+foreach my $filename (@ARGV) {
+    # Get file root, the 'mops.X' part of the basename.
+    my $root;
+    my $base = basename($filenaem);
+    if ($base =~ /^(mops\.\d+)\./) {
+        $root = $1;
+    }
+    else {
+        die "can't get root for $filename";
+    }
+
+    # Check that roots of all files are the same.
+    if (!defined($skycell_root)) {
+        $skycell_root = $root;
+    }
+    else {
+        die "root $root doesn't match $skycell_root"
+            unless $root eq $skycell_root;
+    }
+
+    grab_file($all_href, $filename);
+}
+
+# Now all our detections are loaded into a table.  We want to astroclean, then
+# write to a single FITS file that can be ingested into MOPS.
+$cleaned_stuff = do_astroclean($filename, $all_href);
+write_fits($out_filename, $cleaned_stuff);
+exit;
+
+
+sub grab_file {
+    my ($stuff, $filename) = @_;
+    my $table = new table;
+    $table->openfile($filename) or die "can't open $filename";
+
+    my ($epoch_mjd, $obscode, $filter);
+    $epoch_mjd = $table->keyval('MJD-OBS');
+    $obscode = $table->keyval('OBSCODE');
+    $filter = substr($table->keyval('FILTER'), 0, 1);
+
+    if (!defined($global_epoch_mjd)) {
+        $global_epoch_mjd = $epoch_mjd;
+    }
+    else {
+        die "Epoch ($epoch_mjd) differs from global ($global_epoch_mjd)" 
+            unless $epoch_mjd == $global_epoch_mjd; 
+    }
+
+    if (!defined($global_obscode)) {
+        $global_obscode = $obscode;
+    }
+    else {
+        die "OBSCODE ($obscode) differs from global ($global_obscode)" 
+            unless $obscode == $global_obscode; 
+    }
+
+    $filename =~ s|^.*/||;          # strip up to filename
+    $filename =~ s|\.fits||;        # strip more stuff
+    my $base_det_id;
+    if ($filename =~ m|mops\.\d+\.skycell\.(.*)$|) {
+        $base_det_id = $1;
+    }
+    else {
+        die "can't get base_det_id from $filename";
+    }
+
+    print STDERR "Processing $base_det_id.\n";
+    do_skycell($stuff, $base_det_id, $table);
+
+    $table->closefile();
+}
+
+
+sub do_skycell {
+    # Just emit all the detections for this skycell, in our beloved MITIish format.
+    my ($base_det_id, $skycell_table) = @_;
+    my @data;
+    my $rownum = 0;
+    while (@data = $skycell_table->readrecord()) {
+        my ($ra_deg, $dec_deg, $ra_sigma_deg, $dec_sigma_deg, $flux, $flux_sigma) = @data;
+        my $det_id = sprintf("$base_det_id.%09d", $rownum);
+
+
+        # IPP (psphot actually) is reporting zero mags.  So chuck these.
+        if ($mag > 0 && (defined($mag_limit) && $mag < $mag_limit)) {
+#            print join(' ', 
+#                $det_id,
+#                $global_epoch_mjd,
+#                $ra_deg,
+#                $dec_deg,
+#                $mag,
+#                $global_obscode,
+#                'NA',
+#            ), "\n";
+#           
+            $stuff->{$det_id} = [@data];
+        }
+
+        $rownum++;
+    }
+}
+
+
+sub do_astroclean {
+    my ($stuff) = @_;
+    my $det_id;
+    my $dir = tempdir(CLEANUP => 1, DIR => '/tmp');
+    my ($ac_infh, $ac_infilename) = tempfile(DIR => $dir);
+    my ($ra_deg, $dec_deg, $ra_sigma_deg, $dec_sigma_deg, $flux, $flux_sigma);
+    my $mag;
+
+    foreach $det_id (keys %{$stuff}) {
+        ($ra_deg, $dec_deg, $ra_sigma_deg, $dec_sigma_deg, $flux, $flux_sigma) = @{$stuff->{$det_id}};
+        $mag = $flux;
+
+        # Write out det to file.
+        print $ac_infh join(' ', 
+            $det_id,
+            $global_epoch_mjd,
+            $ra_deg,
+            $dec_deg,
+            $mag,
+            $global_obscode,
+            'NA',
+        ), "\n";
+    }
+
+    my $cmd = <<"EOF";
+astroclean file $ac_infilename outtype 1 proxrad $proxrad_thresh_deg clean_file $ac_outfilename
+EOF
+    system($cmd);
+
+    $ac_infh->close();
+    unlink $ac_infilename;
+    unlink $ac_outfilename;
+    rmdir $dir or die "can't remove dir $dir";
+
+    return $cleaned_stuff;
+}
+
+
+=head1 SYNOPSIS
+
+dumpSkycells FILES
+
+=head1 DESCRIPTION
+
+Just dump the specified skycell data into MITI files with the format
+
+DET_ID EPOCH_MJD RA_DEG DEC_DEG MAG OBSCODE OBJECT_NAME RA_SIGMA_DEG DEC_SIGMA_DEG
+
+=cut

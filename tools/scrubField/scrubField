@@ -1,0 +1,216 @@
+#! /usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Carp;
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Copy;
+use File::Basename;
+use File::Temp qw(tempfile tempdir);
+
+use PS::MOPS::FITS::IPP2;
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+
+use subs qw(
+    dump_file
+);
+
+
+our $PS1_MAGSIG2SNR = 2.5 / log(10);            # convert MAG_ERR to S/N
+
+my $instance_name;
+my $inst;
+my $gmt_offset_hours;
+
+my $stationrad_thresh_deg = 0.00026;            # default, about 1.0 arcsec
+my $min_s2n = 5.0;                              # min S/N to accept file
+my $density_perdeg2 = 50000;                    # for density filtering
+my $density_radius_deg = .010;                  # local radius deg
+my $out_filename;
+my $remove_list;                                # file containing "removed" detections
+my $suffix = 'REMOVED';
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'min_s2n=f' => \$min_s2n,
+    'density_perdeg2=f' => \$density_perdeg2,
+    'density_radius_deg=f' => \$density_radius_deg,
+    'stationrad_thresh_deg=f' => \$stationrad_thresh_deg,
+    'remove_list=s' => \$remove_list,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => '--remove_list is required') unless $remove_list;
+my @files = @ARGV;
+pod2usage(-msg => 'No files specified') unless @files;
+
+
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+$gmt_offset_hours = $inst->getConfig()->{site}->{gmt_offset_hours};
+die "can't get gmt_offset_hours" unless defined($gmt_offset_hours);
+my $mops_logger = $inst->getLogger();
+
+foreach my $filename (@files) {
+    my $f1_href = {};               # table of field metadata
+    my $d1_href = {};
+    my %ignore_tbl = ();            # list of det nums to ignore
+
+    my $src1_fits = grab_file($f1_href, $d1_href, $filename, $remove_list, \%ignore_tbl);
+    do_scrub($d1_href, \%ignore_tbl);
+
+    my $ignore_fh = new FileHandle ">>$remove_list" or die "can't open $remove_list";
+    print $ignore_fh "$_\n" foreach keys %ignore_tbl;
+    $ignore_fh->close();
+}
+
+exit;
+
+
+sub grab_file {
+    my ($field_href, $stuff, $filename, $remove_list, $remove_href) = @_;
+    my $table = new PS::MOPS::FITS::IPP2;
+    $table->openfile($filename);
+
+    my ($epoch_mjd, $obscode, $filter);
+    $epoch_mjd = $table->keyval('MJD-OBS');
+    $obscode = $table->keyval('OBSCODE');
+    $filter = substr($table->keyval('FILTER'), 0, 1);
+
+    print STDERR "Reading $filename.\n";
+    do_fits($stuff, $table, $remove_href);
+    %{$field_href} = %{$table->{_keys}};
+    $table->closefile();
+
+    return $table;
+}
+
+
+sub do_fits {
+    # Read the FITS table and accumulate in $stuff.
+    my ($stuff, $fpa_table, $remove_href) = @_;
+    my @data;
+
+    my $min_mag_sigma = 0;
+    my $max_mag_sigma = $PS1_MAGSIG2SNR / $min_s2n;
+
+    while (@data = $fpa_table->readrecordshort()) {
+        my ($rownum, $ra_deg, $ra_sigma_deg, $dec_deg, $dec_sigma_deg, $mag, $mag_sigma, $starpsf,
+            $ang_deg, $ang_sig_deg, $len_deg, $len_sig_deg, $flags, $proc_id) = @data;
+
+        unless (exists(${$remove_href}{$rownum})) {
+            my $s2n = $PS1_MAGSIG2SNR / $mag_sigma;
+            my $det_id = sprintf("%09d", $rownum);
+            $stuff->{$det_id} = [@data];
+        }
+    }
+}
+
+
+sub do_scrub {
+    # Process the current set of detections in $stuff, send it to the cleaners, and
+    # remove anything that was scrubbed by astroclean.
+    my ($d1_stuff, $remove_href) = @_;
+    my $det_id;
+    my $dir = tempdir(CLEANUP => 1, DIR => '/tmp');
+    my ($ac_infh, $ac_infilename) = tempfile(DIR => $dir);
+    my ($rownum, $ra_deg, $dec_deg, $ra_sigma_deg, $dec_sigma_deg, $mag, $mag_sigma);
+    my %d1_keep_stuff;
+
+    my $fake_epoch_mjd = '0.0000';
+    my $fake_obscode = 'PS1';
+
+    # Note that we pass mag_sigma as the mag.  This is because astroclean selects the "brightest" 
+    # in reducing density, meaning smaller mags.  But we want our FOM to be a quality selector,
+    # so we'll select based on smallest mag_sigma.
+    foreach $det_id (keys %{$d1_stuff}) {
+        ($rownum, $ra_deg, $ra_sigma_deg, $dec_deg, $dec_sigma_deg, $mag, $mag_sigma) = @{$d1_stuff->{$det_id}};
+        print $ac_infh join(' ', 'A'.$det_id, $fake_epoch_mjd, $ra_deg, $dec_deg, $mag_sigma, $fake_obscode), "\n";
+    }
+
+    $ac_infh->close();
+
+    my $OUTTYPE_MITI = 1;
+    my ($ac_outfh, $ac_outfilename) = tempfile(DIR => $dir);
+    $ac_outfh->close();                         # just need filename, not fh
+
+#astroclean file $ac_infilename outtype 1 density 1000 Dradius .0010 proxrad $proxrad_thresh_deg clean_file $ac_outfilename
+    my $cmd = <<"EOF";
+astroclean file $ac_infilename outtype $OUTTYPE_MITI density $density_perdeg2 Dradius $density_radius_deg clean_file $ac_outfilename
+EOF
+    system($cmd) == 0 or die "command failed: $? : $cmd";
+
+    # Read output file into table, return table.
+    $ac_outfh = new FileHandle $ac_outfilename;
+    my $line;
+    my $remainder;
+    my ($epoch_mjd, $obscode);
+    my $prefix;
+    while (defined($line = <$ac_outfh>)) {
+        next if $line =~ /^(!|#)/;   # comment, skip
+        chomp $line;
+        ($det_id, $remainder) = split /\s+/, $line, 2;
+        $prefix = substr($det_id, 0, 1);
+        if ($prefix eq 'A') {
+            $d1_keep_stuff{substr($det_id, 1)} = 1;     # strip leading character to get field 1 det ID
+        }
+        else {
+            die "bogus det prefix: $prefix";
+        }
+    }
+    $ac_outfh->close();
+
+    unlink $ac_infilename;
+    unlink $ac_outfilename;
+    rmdir $dir or die "can't remove dir $dir";
+
+    # Now walk through our table of stuff and throw out anything that's not in the keep table.
+    my $num_removed;
+
+    foreach my $key (keys %{$d1_stuff}) {
+#        delete ${$d1_stuff}{$key} unless exists($d1_keep_stuff{$key});
+        $remove_href->{int($key)} = 1 unless exists($d1_keep_stuff{$key});
+    }
+}
+
+
+# obsolete
+sub write_fits {
+    # Should really go in PS::MOPS::FITS::IPP.
+    my ($src_fits, $filename, $field_href, $dets_href) = @_;
+    my $t = new PS::MOPS::FITS::IPP2;
+
+    my $force = 1;      # force file overwrite
+    my $filter = substr($field_href->{FILTER}, 0, 1);
+
+    $t->createfile($filename, $force, %{$src_fits->{_keys}});
+
+    my ($det_id, $det);
+    while (($det_id, $det) = each %{$dets_href}) {
+        $t->writerecord(@{$det});
+    }
+}
+
+
+=head1 SYNOPSIS
+
+scrubField [options] FILE1.fits [FILE2.fits FILE3.fits ...]
+
+=head1 DESCRIPTION
+
+Clean the specified FITS files for ingest by performing various astroClean
+operations on them.
+
+If --remove_list is specified, don't write out a FITS file; instead, just
+write out a list of rownums to be ignored by the next consumer of the file.
+
+=head1 BUGS
+
+Probably should consolidate with removeStationaries so that we can select from a
+menu of cleaning options.
+
+=cut

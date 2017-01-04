@@ -1,0 +1,17 @@
+# Full sequence for download & processing of files.
+
+export PATH=~denneau/tr/tools/mpcknown:$PATH
+
+# 1. Gets all files from web
+#sh get
+
+# Extract F51 observations
+perl -ane 'print if substr($_,77,3) eq "F51"' < CmtObs.txt > F51COMET.obs
+
+# For each one, look it up and generate SQL for it for our master MPC table.
+#munge --comet --sql F51.sql F51.obs 2>F51.err >F51.out
+munge --comet --sql F51COMET.sql F51COMET.obs 
+
+# Insert into DB.
+#mysql -umopsroot -ppanstar1 -hmops01 comets < createdb.sql 
+#mysql -umopspipe -pepip -hmops01 comets < F51COMET.sql 

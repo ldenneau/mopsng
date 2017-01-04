@@ -1,0 +1,216 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use FileHandle;
+use File::Path;
+use LWP;
+use Cwd;
+
+use PS::MOPS::FITS::IPP;
+use PS::MOPS::Lib qw(:all);
+
+# Hardwire mirror directory for now.
+our $STAGE_DIR = shift @ARGV || '/data/mops01.0/MOPS_STAGE/lap';
+print STDERR "Using stage directory $STAGE_DIR.\n";
+chdir $STAGE_DIR or die "can't chdir to $STAGE_DIR";
+
+our $INDEX_URL = 'http://datastore.ipp.ifa.hawaii.edu/IPP-MOPS-LAP/index.txt';
+our $ROOT_URL = 'http://datastore.ipp.ifa.hawaii.edu/IPP-MOPS-LAP';
+our $ROOTDIR = 'IPP-MOPS';
+our $SUBDIR = 'IPP-MOPS/raw';
+our $MAX_TRIES = 5;
+our $NO_RENAME = 1;
+our $F51_GMT_OFFSET_HOURS = -10;        # HST - GMT
+
+# Plan.
+# 1. If there is a latest file, add to URL.
+# 2. Get index URL (text version).
+# 3. For each item:
+#   a. chkdir/mkdir
+#   b. Get index
+#   c. chkfiles/getfiles
+
+my $last = '';
+my $fh = new FileHandle "LAST";
+if ($fh) {
+    my $line = <$fh>;
+    chomp($line);
+    $last = "?$line" if $line;;
+}
+
+my $ua = LWP::UserAgent->new(timeout => 10);
+my $res;
+
+
+# Fetch with retry.
+$res = fetch_url($ua, $INDEX_URL . $last);
+
+
+my @lines = split /[\r\n]+/, $res->content;
+
+my $last_fileset_id;
+foreach my $line (@lines) {
+	next if $line =~ /^#/ or $line =~ /^\s*$/;
+    my ($fileset_id, $reg_time, $type, $comment, @dummy) = split /\|/, $line;
+    $fileset_id =~ s/\s+//g;     # strip all whitespace
+    $comment =~ s/\s+$// if $comment;       # strip trailing whitespace
+
+    # Files will be in IPP-MOPS dir.
+    do_fileset($ua, $fileset_id);
+
+    # Record this fileset as processed.
+    $fh = new FileHandle ">LAST";
+    print $fh "$fileset_id\n";
+    $fh->close();
+
+    print STDERR "\n";
+}
+
+
+exit;
+
+
+sub do_fileset {
+    my ($ua, $fileset_id) = @_;
+    print STDERR "Processing fileset $fileset_id.\n";
+
+    my $url = "$ROOT_URL/$fileset_id/index.txt";
+    my $res = fetch_url($ua, $url);
+    my @lines = split /[\r\n]+/, $res->content;
+
+    foreach my $line (@lines) {
+        next if $line =~ /^#/ or $line =~ /^\s*$/;
+        my ($file_id, $size, $md5, $type, $disp, @dummy) = split /\|/, $line;
+        do_file($ua, $fileset_id, $file_id, $size, $md5);
+    }
+}
+
+
+sub do_file {
+    my ($ua, $fileset_id, $file_id, $size, $md5) = @_;
+
+    my $diff_id = get_diff_id($fileset_id);
+    unless (defined($diff_id)) {
+        die "Got strange diff ID for $fileset_id.\n";
+    }
+    my $diff_subdir = substr($diff_id, -2, 1) . '/' . substr($diff_id, -1, 1);
+    
+    # Check if file exists and has matching size.  If so, skip. 
+    # Otherwise download.
+    my $file = "$SUBDIR/$diff_subdir/$fileset_id/$file_id";
+    if (-f $file and -s $file == $size) {
+        print STDERR "Found $file_id.\n";
+    }
+    else {
+        # Download.
+        print STDERR "Downloading $file...";
+
+        # Make save directory.
+        eval { mkpath("$SUBDIR/$diff_subdir/$fileset_id"); };
+        die $@ if $@;
+
+        my $download_url = "$ROOT_URL/$fileset_id/$file_id";
+        my $t0 = time();
+        system("wget -q -O $file $download_url") == 0 || die $?;
+        my $dt = time() - $t0;
+        $dt = .0001 if $dt == 0;
+        printf STDERR "done (%.1fs, %.1f KB/s).\n", $dt, $size / $dt / 1024;
+    }
+
+    # Make the exp_name symlink to the source FITS file.
+    make_link($file);
+}
+
+
+sub fetch_url {
+    my ($ua, $url) = @_;
+    print STDERR "Retrieving $url";
+    my $tries = 0;
+    do {
+        print STDERR ".";
+        $res = $ua->get($url);
+    } while (!$res->is_success and $tries++ < $MAX_TRIES);
+    print STDERR "\n";
+    die sprintf "Fetch failed: %s\n", $res->content unless $res->is_success;;
+    return $res;
+}
+
+
+sub get_diff_id {
+    # Given a fileset ID, get a diff ID from it.  We expect one of
+    # diff.123456
+    # pub.1234567.diff.123456
+    my ($fileset_id) = @_;
+    if ($fileset_id =~ /diff\.(\d\d+)$/) {
+        return $1;
+    }
+}
+
+
+sub make_link {
+    my ($file) = @_;
+    my $table = new PS::MOPS::FITS::IPP;
+    $table->openfile($file);
+
+    my $exp_name = $table->{_keys}->{EXP_NAME} || 'NA';
+    $table->closefile();    # just need FITS headers
+
+    die "bad EXP_NAME ($exp_name) for $file" unless $exp_name =~ /^\w\d\d\d\d\w\d\d\d\d.$/;
+
+    # Got all our info, so link away. Need several:
+    # $SUBDIR/$OCNUM/$exp_name => $file
+    # $SUBDIR/$OCNUM/chunks/$survey_mode.$exp_name => $SUBDIR/$OCNUM/$exp_name
+    my $ocnum = mopslib_mjd2ocnum($table->{_keys}->{'MJD-OBS'});
+    my $nn = mopslib_mjd2nn($table->{_keys}->{'MJD-OBS'}, $F51_GMT_OFFSET_HOURS);
+
+    # 1. Generic link $EXP_NAME => $FILE.
+    my $ocpath;
+    eval {
+        $ocpath = "$ROOTDIR/$ocnum/$nn";
+        if (!-d $ocpath) {
+            mkpath([$ocpath]);
+        }
+    };
+    make_symlink($file, '../../..', $ocpath, $exp_name) or die "can't create symlink $ocpath/$exp_name to $file";
+    print STDERR "Linked $file to $ocpath/$exp_name.\n";
+}
+
+
+sub make_symlink {
+    # Make a symlink to $file with the name $link.
+    # If the link already exists, rename the link using a numeric suffix.
+    my ($file, $rel, $dir, $link) = @_;
+    my $newlink;
+    my $tries = 0;
+
+
+    my $oldwd = getcwd;
+    chdir $dir or die "can't chdir to $dir";
+
+    if ($NO_RENAME) {
+        if (!-l $link) {
+            # Rel contains relative directory information to get to the root of our 
+            # our raw file tree.
+            symlink "$rel/$file", $link or die "can't link $link to $file";
+        }
+    }
+    else {
+        # Rename link if exists.
+        if (-l $link) {
+            while ($tries++ < 10) {
+                $newlink = "$link.$tries";
+                if (!-e $newlink) {
+                    rename $link, $newlink or die "can't rename $link to $newlink";     # suffixed link
+                    last;
+                }
+            }
+            die "existing symlink $link to $file" if -l $link;
+        }
+        # Rel contains relative directory information to get to the root of our 
+        # our raw file tree.
+        symlink "$rel/$file", $link or die "can't link $link to $file";
+    }
+
+    chdir $oldwd or die "can't restore working directory $oldwd";
+}

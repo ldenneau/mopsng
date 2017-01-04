@@ -1,0 +1,84 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Detection;
+
+
+# Start program here.
+my $inst;
+my $instance_name;
+my $id;
+my $terminal = 'png';
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'id' => \$id,
+    'terminal=s' => \$terminal,
+    help => \$help,
+) or pod2usage(2);
+my $objname = shift;        # id or object name
+pod2usage(2) unless $objname;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+
+
+# Scrub opts.
+$terminal = 'postscript solid' 
+    if ($terminal eq 'postsscript' or $terminal eq 'eps');
+$terminal = 'postscript enhanced color solid' 
+    if ($terminal eq 'postscriptc' or $terminal eq 'epsc');
+
+
+print <<"EOF";
+set terminal $terminal
+EOF
+
+
+# Grab detections.
+my $det_i = modcd_retrieve($inst, objectName => $objname);
+my @dets;
+my $det;
+while (defined($det = $det_i->next)) {
+    push @dets, $det;
+}
+#@dets = sort { $a->epoch <=> $b->epoch } @dets; # sort by epoch
+
+#set terminal postscript enhanced color solid
+print <<"EOF";
+set title 'Magnitude Plot for Object $objname'
+set xlabel 'Time (MJD)'
+set ylabel 'Magnitude'
+plot \\
+"-" using 1:2
+EOF
+
+foreach my $det (@dets) {
+    print join(", ", $det->epoch, $det->mag), "\n";
+}
+
+print <<"EOF";          # end of plot
+e
+EOF
+
+=head1 NAME
+
+magtplot - Plot magnitude vs t (epoch)
+
+=head1 SYNOPSIS
+
+magtplot [--id ID] objectName
+
+  --id ID : retrieve detections from object with specified SSM/derived objectName
+  objectName : SSM object name
+
+=head1 DESCRIPTION
+
+magtplot obtains all detections for the specified object and generates a GNUPlot
+file for the data.
+
+=cut

@@ -1,0 +1,73 @@
+#!/usr/bin/env perl
+# $Id: sample 2153 2007-12-14 01:11:44Z denneau $
+
+use strict;
+use warnings;
+
+use File::Slurp;
+use Pod::Usage;
+use Getopt::Long;
+
+my $interval;
+my $offset;
+my $help;
+GetOptions(
+    'offset=i' => \$offset,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+$interval = shift or pod2usage(2);
+my $filename = shift;
+my $fh;
+
+if ($filename) {
+    open $fh, $filename or die "can't open $filename";
+}
+else {
+    $fh = \*STDIN;
+}
+
+my $line;
+if ($offset) {
+    while ($offset > 0) {
+        $line = <$fh>;
+        if ($line !~ /^!!/) {   
+            $offset--;      # not a comment, so count as skipped line
+        }
+    }
+}
+
+my $lineno = 0;
+while (defined($line = <$fh>)) {
+    if ($line =~ /^!!/) {
+        print $line;        # always print comment lines
+        next;
+    }
+
+    print $line if $lineno == 0;            # print if we're on interval
+    $lineno++;                              # inc counter
+    $lineno = 0 if $lineno == $interval;    # wrap counter at interval
+}
+
+
+=head1 NAME
+
+sample - Output every Nth line from a file.
+
+=head1 SYNOPSIS
+
+sample [--help] [--offset I] N file
+
+  N : sampling interval
+  --offset I : starting offset into file 
+  --help : display help page
+  file : file to process; STDIN if not specified
+
+=head1 DESCRIPTION
+
+nsplit takes a file and prints out every Nth line.  If --offset is
+specified, the first I lines are skipped, then the remaining lines 
+are sampled at interval N.
+
+=cut

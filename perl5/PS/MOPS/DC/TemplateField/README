@@ -1,0 +1,24 @@
+PS/MOPS/DC/TemplateField version 0.01
+===================================
+
+TemplateField.pm is a pure-Perl interface to a library of template
+fields that can be ingested into a MOPS simulation.
+
+INSTALLATION
+
+To install this module type the following:
+
+   perl Makefile.PL LIB=$MOPS_HOME/lib/perl5
+   make
+   make test
+   make install
+
+DEPENDENCIES
+
+This module requires these other modules and libraries:
+
+  PS::MOPS::DC;
+
+COPYRIGHT AND LICENCE
+
+Copyright (C) 2008 Institute for Astronomy, University of Hawaii

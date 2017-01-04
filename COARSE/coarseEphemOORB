@@ -1,0 +1,85 @@
+#!/usr/bin/env perl
+
+# Act like coarseEphem but us OORB 2-body orbits.
+# coarseEphem --obscode F51 --delta_mjd 1.0                --limiting_mag 30.0 56066.41667 /tmp/ephempWFkXDD < stdin
+
+# MITI orbit (q, e, i, node, argPeri, timePeri, hV, epoch, ID)
+# 0.587562433707  0.73561398202   16.5977955852    204.483077768135  161.381135775099  56060.8649086863  13.935  56295.5  S000000Aa
+
+# OORB
+# Designation Code MJD_UTC/UT1 Delta RA Dec dDelta/dt dRA/dt dDec/dt VMag Alt Phase LunarElon LunarAlt LunarPhase SolarElon SolarAlt r HLon HLat TLon TLat TOCLon TOCLat HOCLon HOCLat TOppLon TOppLat HEclObj_X HEclObj_Y HEclObj_Z HEclObj_dX/dt HEclObj_dY/dt HEclObj_dZ/dt HEclObsy_X HEclObsy_Y HEclObsy_Z
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Temp qw/tempfile tempdir/;
+use Astro::SLA;
+
+
+my $obscode;
+my $delta_mjd;
+my $limiting_mag;
+my $debug;
+my $help;
+GetOptions(
+    'obscode=s' => \$obscode,
+    'delta_mjd=f' => \$delta_mjd,
+    'limiting_mag=f' => \$limiting_mag,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my ($epoch_mjd, $outfn) = @ARGV;
+my $dt = slaDtt($epoch_mjd) / 86400;
+
+
+# Need to write out DES formatted orbs for OORB.
+#my ($ofh, $ofn) = tempfile("/tmp/coarsessmXXXXX");
+my ($dir) = tempdir("/tmp/coarsessmXXXXX", CLEANUP => 1);
+my $ofn = "$dir/orbs.des";
+my $ofh = new FileHandle ">$ofn";
+print $ofh <<"EOF";
+!!OID FORMAT q e i Omega argperi t_p H t_0 INDEX N_PAR MOID COMPCODE
+EOF
+my @orbs = <STDIN>; # slurp
+my @foo;
+my $mjd0 = $epoch_mjd - $delta_mjd;
+foreach my $line (@orbs) {
+    @foo = split /\s+/, $line; 
+    if ($foo[1] >= 0) {
+        # toss e < 0 problem orbits
+        print $ofh join(' ', $foo[-1], 'COM', @foo[0, 1, 2, 3, 4, 5, 6], $mjd0 + $dt, 1, 6, -1, 'MOPS'), "\n";
+    }
+}
+$ofh->close;
+
+# Now write positions:
+# ID epoch ra_deg dec_deg V
+
+my $mjd = $epoch_mjd - $delta_mjd;
+my @z = `oorb --conf=/home/mops/MOPS_STABLE/config/oorb.conf --code=$obscode --task=ephemeris --timespan=2.0 --step=1.0 --orb-in=$ofn`;
+my (@foo1, @foo2, @foo3);
+my ($m1, $m2, $m3);
+my $i = 1;
+my $outfh = new FileHandle ">$outfn";
+while ($i <= $#z) {
+    @foo1 = split /\s+/, $z[$i++];
+    @foo2 = split /\s+/, $z[$i++];
+    @foo3 = split /\s+/, $z[$i++];
+    $m1 = $foo1[9];
+    $m2 = $foo2[9];
+    $m3 = $foo3[9];
+
+    if ($m1 <= $limiting_mag || $m2 <= $limiting_mag || $m3 <= $limiting_mag) {
+        print $outfh join(' ', $foo1[0], @foo1[2,4,5,9]), "\n";
+        print $outfh join(' ', $foo2[0], @foo2[2,4,5,9]), "\n";
+        print $outfh join(' ', $foo3[0], @foo3[2,4,5,9]), "\n";
+    }
+    print STDERR $z[$i - 2] if $debug;
+    print STDERR $z[$i - 1] if $debug;
+    print STDERR $z[$i - 0] if $debug;
+}
+$outfh->close;

@@ -1,0 +1,27 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+
+use PS::MOPS::NEOS ':all';
+use PS::MOPS::MPC ':all';
+
+my $test_file = shift or die "no test file specified";
+my $detections = mpc_slurp($test_file);
+
+my $ret = neos_run(
+    detections => $detections,
+    no_delete => 1,
+);
+
+# Count tracks with low residuals.
+my $low = 0;
+my $orb;
+foreach $orb (values %{$ret->{ORBITS}}) {
+    $low++ if $orb->{RMS} < .1;
+}
+
+printf "tracks: %d\n", scalar(keys %{$ret->{TRACKS}});
+printf "low-residuals: %d\n", $low;

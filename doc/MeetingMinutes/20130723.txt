@@ -1,0 +1,108 @@
+Bolin (BB), Chastel (SC/chair), Denneau (LD), Engelhardt (TE), Fitzsimmons (AF), Jedicke (RJ/scribe), Meech (KM), Veres (PV), Wainscoat (RW)
+ 
+* Status of w-band photometry (Fitzsimmons)
+looks like mdrm137 w-band is now calibrated
+it is chip mags
+not all the data is 'photometrically brilliant'
+there are still problems in mdrm152
+  - strange photometry
+  - missing detections
+  - looks like a problem on the IPP side
+?LD does this mean that we have the mags in-hand?
+yes, believable mags and uncertainties
+?LD shouldn't uncertainty reflect non-photometric nights?
+it does not, but SNR changes with S on non-photometric nights
+we need a flag indicating that photometry is good
+AF does not know whether the flag exists
+until we have a way to identify whether mags are useful the mags are useless
+AF will organize meeting w/ appropriate people to discuss how to get the flag and input data into MOPS
+* Missing PS1 data (Fitzsimmons)
+AF there are w-band exposures in mdrm137 that are not in MOPS from the early survey days
+?AF is there a record of what was not processed thru MOPS?
+LD in the beginning there were non-standard MOPS databases due to e.g. magic
+AF will send LD some exposures that are not in MOPS
+* New IPP convolution (Fitzsimmons & Chastel)
+IPP has implemented a new convolution that should be better in terms of reducing false positives and finding more real positives
+SC has asked for new data from existing OSS field for comparison w/ old data
+* Photometric calibration against PS1 catalogs (Meech)
+the TAC is not allowing time for calibration images because they claim that all calibrations should come from PS1
+but KM asked other PS1 people who claim that PS1 can not yet provide calibrated photometry across the sky
+i.e. she wants calibrated stellar mags across the sky
+KM requests that 'some one' should write a note that it is not yet available
+we agreed that Chambers is the appropriate person to write this note
+KM will ask Chambers to write the note
+* PS1 telescope status (Chastel)
+mirror model was changed last night to improve image quality
+IPP trail fitting has been implemented in production
+IPP reports that trail fitting is good
+MOPS personnel will need to test trail fitting
+then implement trail fits in tracklet linking
+PV & SC will assess IPP trail fitting parameters
+* MOPS processing (Chastel)
+no changes, nothing to report
+* PS1 NEO status (Veres & Wainscoat)
+so far in OC 166 we have 40 confirmed NEO discoveries
+4 of them are PHAs
+PS1 has 26 more NEOs than G96 for the year
+but more than 5 might be shortly announced (depending on follow-up)
+this will make the current observing cycle the most successful ever
+~13 NEO candidates in OC 166 with digest>95 that were lost
+either not followed-up or one-nighters that dropped out of the confirmation site
+lost candidates were either too fast, too faint or in pairs (or combined)
+RW some objects not found because they weren't where they were 'supposed' to be
+2 of the 13 were like this
+?RJ losing 13 objects is inconsistent w/ PV's old study showing essentially 100% followup of tracklets w/ digest >95?
+PV we are finding more, finding fainter objects, finding faster moving objects
+RW future PS1+PS2 will have to do self-followup
+PV is creating a tool to make precovery detection easier using OpenOrb ranging
+KM has been tasked to write a report for Jim Green (NASA HQ) to assess ground-based followup need/capabilities - PS1 followup will be good motivation 
+MSS was rich in new comets
+2 are still on confirmation page
+KM says Reipurth's VYSOS facility might be employed for high-priority comet followup
+* NEO czaring (Bolin)
+not much happening now during bright time
+BB is training Andrei Sherstyuk (ATLAS)
+this weekend may be good as we might get OSS this weekend
+SC and PV are scheduled to assist czaring over the weekend
+RW thinks MSS is more likely than OSS
+RW says MSS has been very productive
+* MOPS computing time (Wainscoat)
+RW concerned that MOPS may not have enough compute power
+RW says single chunk processing still takes 1+ hours
+SC solid state drives would improve I/O
+SC known_server is slow to load the catalogue
+?RJ why isn't the catalogue loaded and retained in memory?
+very difficult to modify known_server 
+BB suggests using MPCChecker when the # of tracklets is small
+PV has some useful code but it does take a long time
+there were concerns about overwhelming MPC with requests
+known_server also does a lot of quality control
+* Comets (Chastel)
+2 announced and 2 currently on confirmation page
+HH reported that IPP parameters have changed again and this has trickled down to influencing comet page
+the difference was a sqrt(2) and IPP knows that it happened but not clear to us why
+* MOPS Meeting Times (Jedicke & Chastel)
+RJ would like the meeting time to change
+sent out a survey but SC is now willing to open up meeting times for the entire week
+RJ will send out another survey with more times
+* MOPS efficiency studies (Engelhardt & Veres)
+TE is fitting all efficiency data from all nights in all filters to the standard efficiency data
+note that this is a work in progress and he expects to provide nearly-final results next week
+PV points out there is some spurious non-zero efficiency for V>23?
+needs to put some more cuts on data that goes into the fits to get only reasonable fits
+presented histograms of the max eff (eff0), limiting mag (L), and width of the drop (w)
+presented histogram showing error flag frequency
+RJ encouraged by results - gets good fits on most nights for which there is data
+?RJ will SC include results in MOPS and implement update on a nightly basis?
+SC yes
+?PV is IPP stellar detection efficiency calculated in the same way?
+SC it is available but not in MOPS products
+SC thinks it would be good to have both available
+RJ it is possible to imagine studying IPP eff(V) vs. MOPS eff(V) when available so that eff(V) could be evaluated on a per field or chip basis
+* Synthetic detection processing thru IPP (Chastel)
+requests assistance in developing comparison tests
+SC will talk to PV
+PV says IPP mag comparisons will change with rate of motion
+* Subaru image processing (Bolin)
+continues to work on developing this capability
+

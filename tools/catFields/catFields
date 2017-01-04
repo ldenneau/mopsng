@@ -1,0 +1,146 @@
+#!/usr/bin/env perl
+
+# $Id: catFields 3716 2009-07-14 01:41:11Z denneau $
+# write out MOPSDC fields in FieldProximity input format.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Params::Validate;
+use File::Temp qw(tmpnam);
+use Astro::Time;
+
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Instance;
+
+
+sub elems2str {
+    my ($field, $radius_deg, $format) = @_;
+    if (!$field) {
+        warn "bogus field";
+        return;
+    }
+
+    if ($format eq 'MIF-FS') {
+        return join(' ', 
+            $field->fieldId,
+            $field->epoch,
+            $field->ra,
+            $field->dec,
+            $field->surveyMode,
+            $field->timeStart,
+            $field->timeStop,
+            $field->filter,
+            $field->limitingMag,
+            $field->raSigma,
+            $field->decSigma,
+            $field->obscode,
+        ), "\n";
+    }
+    else {
+        if (defined($radius_deg)) {
+            return (join " ", 
+                $field->fieldId, 
+                $field->epoch, 
+                $field->ra, 
+                $field->dec, 
+                $radius_deg) . "\n";
+        }
+        else {
+            return (join " ", 
+                $field->fieldId, 
+                $field->epoch, 
+                $field->ra, 
+                $field->dec) . "\n";
+        }
+    }
+}
+
+
+my $inst;
+my %OPTS;
+#getopts('hd:i:r:', \%OPTS);
+GetOptions(\%OPTS, qw(
+    instance=s
+    radius_deg=f
+    date_mjd=f
+    nn=i
+    fieldId=s
+    status=s
+    format=s
+    help
+)) or pod2usage(2);
+pod2usage(-verbose => 2) if $OPTS{help};
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $OPTS{instance});
+my $mops_config = $inst->getConfig();
+
+my $radius_deg = ($OPTS{radius_deg} or undef);
+my $field_i;  # DC result iterator
+my $field;
+my @status_args;
+
+
+if ($OPTS{status}) {
+    @status_args = (status => $OPTS{status});
+}
+
+if ($OPTS{nn}) {
+    # Convert to MJD.
+    $OPTS{date_mjd} = mopslib_nn2mjd($OPTS{nn}, $mops_config->{site}->{gmt_offset_hours});
+}
+
+# Header.
+my $fmt;
+if ($OPTS{format} and $OPTS{format} eq 'MIF-FS') {
+    $fmt = 'MIF-FS';
+    print "#MIF-FS FPA_ID EPOCH_MJD RA_DEG DEC_DEG SURVEY_MODE TIME_START_MJD TIME_STOP_MJD FILTER_ID LIMITING_MAG RA_SIGMA DEC_SIGMA OBSCODE\n";
+}
+
+if ($OPTS{date_mjd}) {
+    $field_i = modcf_retrieve($inst, date_mjd => $OPTS{date_mjd}, @status_args);  # fetch iterator object
+    while (defined($field = $field_i->next)) {
+        print elems2str($field, $radius_deg, $fmt);
+    }
+}
+elsif ($OPTS{fieldId}) {
+    $field = modcf_retrieve($inst, fieldId => $OPTS{fieldId});
+    print elems2str($field, $radius_deg, $fmt);
+}
+else {
+    $field_i = modcf_retrieve($inst, all => 1);
+    while (defined($field = $field_i->next)) {
+        print elems2str($field, $radius_deg, $fmt);
+    }
+}
+
+=head1 NAME
+ 
+catFields - Query fields in MOPSDC and write out information
+ 
+=head1 SYNOPSIS
+ 
+catFields [options]
+
+  --nn NIGHT_NUMBER : MOPS local night number
+  --date_mjd DATE_MJD : date of fields to output, MJD
+  --fieldId ID : fetch single field with specified ID
+  --radius_deg R_deg : radius value to append on each line, degrees
+  --help : show usage
+
+=head1 DESCRIPTION
+
+Output all fields in MOPSDC that occur between MJD date and MJD
+date + 1.  If radius_deg is specified, append this value to each line for
+use by FieldProximity.
+
+If NIGHT_NUMBER is specified, this is converted to MJD, then used as
+described above.
+
+=head1 NOTES
+
+=cut
+

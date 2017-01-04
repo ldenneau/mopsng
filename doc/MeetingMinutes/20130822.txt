@@ -1,0 +1,66 @@
+ATTENDING:
+Veres, Chastel, Engelhardt, Hsieh, Denneau, Jedicke (scribe), Wainscoat, Bolin
+MINUTES:
+* Telescope Status (KC)
+no report
+* IPP
+  * IPP Trail fitting (PV)
+no progress
+LD reminds everybody that trail fitting has been an IPP requirement since the beginning of PanSTARRS
+  * mdrm137 Ubercal (SC for AF)
+calibration mostly done for 3pi
+w-band for 152 might be another 1-2 months
+MD fields won't be available for a long time
+  * Convolution (SC)
+not had the time to evaluate 
+* Data Processing (SC)
+IPP delays continue due to imminent cluster move
+IPP is particularly late today because one of the nodes was on fire!!!
+MOPS is still missing some data/footprints from last friday
+seems to be related to high detection density in the galactic plane
+SC & LD are investigating and trying to find a way to eliminate or reduce the problem
+* NEO Status (RW/PV)
+PV discovered geocentric object in PS1 data!!!
+he was looking for precovery of a submitted tracklet that was not recovered by others
+detailed search found one more tracklet
+detections are trailed (5 deg/day) with obvious light curve modification
+detection position angles changed within a detection!
+even 4 detections w/ 2 day arc provided good enough orbit
+now followed up by Slovak colleague
+now MPECed as 2013 QW1
+PS1 imaged the location last night but we are waiting for IPP
+RW reports that he found 3 detections last night
+RJ showed Lockheed Martin movie using preliminary (guess) orbit
+  - see https://dl.dropboxusercontent.com/u/33273427/P1087SO.wmv
+    (not a long term file!)
+note that findobj *works* for geocentric objects because findobj integrates orbits
+PV will run findobj asap
+RW and MM verified that object was probably not seen in earlier PS1 images
+very high inclination so manages to be not where PS1 is imaging
+RW suggests getting Gemini DDT
+RW if this object is more common than expected than maybe more of our tracklets are like this
+
+* NEO Czaring (BB)
+not much to report because of bright time
+there is a lot of backlogged recovery from just prior to bright time
+followup is being complicated because of reduced availability of megacam
+
+* Comets (HH/JK)
+2 comets found in the past couple weeks
+neither have been CBETed yet, maybe because they are waiting for more observations?
+'Comet' P2 will be undesignated as a comet
+HH suggests discussion for bright time comet followup
+RW: Tholen has more time on the 88" and maybe some could be scheduled in brighter time?
+* ATLAS (RJ/LD/AS)
+Armin Rest is visiting ATLAS to teach how to use photpipe
+expects within 1-2 weeks to be able to show image processing from images to asteroid detections with stamps shown in MOPS
+ATLAS uses PV's ATLAS survey strategy, injects real stars and asteroids directly into the image
+* AOB
+IPP rejection flags: SC created a tool to determine why detections are rejected. SC is investigating why some detections are rejected even though there are no flags
+OTIS DB: RW reports that this DB no longer appears to be available
+Toni's Efficiency: SC not yet implemented
+TE suggests using LD's algorithm if it is better
+LD suggests using the R script
+SC will make the call once he evaluates the issue
+digest scores: not yet fixed for manual added detections
+

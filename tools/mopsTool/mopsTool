@@ -1,0 +1,28 @@
+#!/usr/bin/env perl
+# $Id: mopsTool 1197 2006-07-28 03:56:47Z fpierfed $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Data::Dumper;
+use Pod::Usage;
+
+use PS::MOPS::DC::Instance;
+
+
+my $inst;
+my $instance_name;
+my $config;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    config => \$config,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+
+if ($config) {
+    print Dumper($inst->getConfig);
+}

@@ -1,0 +1,450 @@
+#!/usr/bin/env perl
+# $Id: insertSpacewatchFields 2185 2008-01-03 20:13:09Z denneau $
+
+use strict;
+
+use Pod::Usage;
+use Getopt::Long;
+use File::Slurp;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::MITI;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+
+
+=head1 NAME
+
+insertSpacewatchFields - Program to insert MITI files containing
+Spacewatch data
+
+=head1 SYNOPSIS
+
+insertSpacewatchFields [--reffile REFFILE] [--ia] 
+    [--limiting_mag MAG] [--max_dets M]
+    [--debug] [--help] file1.miti file2.miti ... 
+
+  --reffile REFFILE : ref data for transient catalogs
+  --ia : treat input files as Spacewatch incidental astrometry
+  --limiting_mag MAG : use MAG as a global limiting mag for all fields
+  --max_dets M : reduce per-field limiting mag resulting in max M dets/field
+  --debug : enable secret debug mode
+  --help : show man page
+
+=cut
+
+
+# Globals.
+my @default_de = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+# Options.
+my $inst;
+my $instance_name;
+my $reffile;
+my $ia;
+my $limiting_mag = 21.5; # from http://spacewatch.lpl.arizona.edu/09meter.html
+my $max_dets = 20000;
+my $help = 0;
+my $debug = 0;
+my $POSITION_ERROR_DEGREES = .3 / 3600;     # .3 arcsec, in degrees
+my $DEFAULT_S2N = 5;
+
+# Start program here.
+GetOptions(
+    'instance=s' => \$instance_name,
+    'reffile=s' => \$reffile,
+    ia => \$ia,
+    'limiting_mag=f' => \$limiting_mag,
+    'max_dets=n' => \$max_dets,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(2) if !@ARGV;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+
+# Config stuff.
+my $obscode = $mops_config->{site}->{obscode} or die "obscode not in configuration";
+print STDERR "Using observatory code $obscode.\n";
+
+
+sub _find_center {
+    my ($aref) = @_;        # input ARRAYREF list of detections
+    my ($ra, $dec);
+
+    my $ra_min0 = 10000;
+    my $ra_max0 = -10000;
+    my $ra_min1 = 10000;
+    my $ra_max1 = -10000;
+    my $dec_min = 10000;
+    my $dec_max = -10000;
+
+    foreach my $det (@{$aref}) {
+        ($ra, $dec) = ($det->{RA_DEG}, $det->{DEC_DEG});
+        $dec_min = $dec if $dec < $dec_min;
+        $dec_max = $dec if $dec > $dec_max;
+
+        $ra_min0 = $ra if $ra < $ra_min0;
+        $ra_max0 = $ra if $ra > $ra_max0;
+
+        # Wrap the RA and do another min/max.  We will use a min/max that is not
+        # wrapped.
+        $ra += 180;
+        $ra -= 360 if $ra > 360;
+
+        $ra_min1 = $ra if $ra < $ra_min1;
+        $ra_max1 = $ra if $ra > $ra_max1;
+    }
+
+    # Now select the appropriate min/max.
+    my ($ra_min, $ra_max, $ra_avg);
+    if ($ra_max0 - $ra_min0 > 300) {
+        # Looks like wraparound
+        $ra_min = $ra_min1 - 180;
+        $ra_max = $ra_max1 - 180;
+        $ra_avg = ($ra_max + $ra_min) / 2;
+        $ra_avg += 360 if $ra_avg < 0;
+    }
+    else {
+        $ra_min = $ra_min0;
+        $ra_max = $ra_max0;
+        $ra_avg = ($ra_max + $ra_min) / 2;
+    }
+
+    return ($ra_avg, ($dec_max + $dec_min) / 2);
+}
+
+
+sub process_catalog {
+    my $filename = $_[0];
+
+    # Get all fields
+    my @lines = read_file($filename) or warn "empty file $filename";
+    my %field_h = miti_parse(shift @lines);     # get zeroth line
+
+    # Insert into DB.
+    $inst->pushAutocommit(0); # disable DC autocommit
+    my $id;
+    my $field;
+
+    $field = PS::MOPS::DC::Field->new(
+        $inst,
+        epoch => $field_h{EPOCH_MJD},
+        ra => $field_h{RA_DEG},
+        dec => $field_h{DEC_DEG},
+        timeStart => $field_h{EPOCH_MJD},
+        timeStop => $field_h{EPOCH_MJD},
+        filter => 'DD',
+        surveyMode => 'DD',
+        limitingMag => $limiting_mag,
+        raSigma => $POSITION_ERROR_DEGREES,
+        decSigma => $POSITION_ERROR_DEGREES,
+        obscode => $obscode,
+        de => \@default_de,
+    );
+    $id = $field->insert;
+    if ($id) {
+        print STDERR "created new field ID $id for field ", $field_h{EPOCH_MJD}, "\n";
+    }
+    else {
+        warn "could not insert field for ", $field_h{EPOCH_MJD}, "\n";
+        $inst->popAutocommit();
+        return;
+    }
+
+    # Now insert detections.
+    my $num = 0;
+    $field = modcf_retrieve($inst, fieldId => $id);
+    foreach my $line (@lines) {
+        next if $line =~ /^#/;   # skip comments
+
+        my %det_h = miti_parse($line);
+        next unless $det_h{MAG} < $limiting_mag;    # does not satisfy mag reqs
+
+        my $det = PS::MOPS::DC::Detection->new(
+            $inst,
+            ra => $det_h{RA_DEG},
+            dec => $det_h{DEC_DEG},
+            epoch => $det_h{EPOCH_MJD},
+            mag => $det_h{MAG},
+            filter => $field->filter,
+            s2n => $DEFAULT_S2N,
+            isSynthetic => 0,
+            orient_deg => 0,
+            length_deg => 0,
+            raSigma => $POSITION_ERROR_DEGREES,
+            decSigma => $POSITION_ERROR_DEGREES,
+            magSigma => 0,
+        ) or warn "couldn't create detection";
+        if ($det) {
+            $det->addToField($field);
+            $num++;
+        }
+    }
+    $field->status($FIELD_STATUS_NEW);
+    printf STDERR "Added %d detections.\n", $num;
+    $inst->dbh->commit;
+}
+
+
+sub _find_limiting_mag {
+    # Given a list of detections, return a limiting magnitude that
+    # results in a number of detections no greater than the specified
+    # limit.
+    my ($limit, $det_ar) = @_;  # limit, detection ARRAYREF
+    my $lm = $limiting_mag;     # provisional limiting mag for this field
+
+    while ((scalar grep { $_->{MAG} < $lm } @{$det_ar}) >= $limit) {
+        $lm -= 0.2;
+    }
+
+    return $lm;
+}
+
+
+sub process_transient_catalog {
+    my ($filename, $ref_filename) = @_;      # input MITI filename, field data
+    my $line;
+
+    # First read the ref file.  This is a test file with 
+    #   ID RA DEC EPOCH EXP
+    # tuples.  Create a hash indexed by ID.
+    my @data = read_file($ref_filename);
+    my %ref;
+    my @stuff;
+    foreach $line (@data) {
+        @stuff = split /\s+/, $line;
+        $ref{$stuff[0]} = {
+            RA_DEG => $stuff[1], 
+            DEC_DEG => $stuff[2],
+            EPOCH_MJD => $stuff[3],
+            EXP_S => $stuff[4],
+        };
+    }
+
+    # Get all fields
+    my $root = $filename;
+    $root =~ s|^.*/||;      # strip directory
+    $root =~ s/\.miti$//;   # strip suffix
+    if (!exists($ref{$root})) {
+        warn "can't find ref data for $root";
+        return;
+    }
+
+    # Get list of detection hash descriptions.
+    my @full_dets = 
+        map { { miti_parse($_) } }               # line => HASHREF
+        grep { $_ !~ /^#/ }                      # not a comment
+        read_file($filename)                     # lines from file
+        or warn "empty file $filename";
+
+    # Find a limiting mag to use for this field.  Some of the transient catalogs
+    # are washed out and have gazillions of detections.  Choose a bright enough
+    # mag so that we have at most our nominal number of detections in the field.
+    my $lm = _find_limiting_mag($max_dets, \@full_dets);
+    my @dets = grep { $_->{MAG} < $lm } @full_dets;
+
+    # Insert into DB.
+    $inst->pushAutocommit(0); # disable DC autocommit
+    my $id;
+    my $field;
+
+    $field = PS::MOPS::DC::Field->new(
+        $inst,
+        epoch => $ref{$root}->{EPOCH_MJD},
+        ra => $ref{$root}->{RA_DEG},
+        dec => $ref{$root}->{DEC_DEG},
+        timeStart => $ref{$root}->{EPOCH_MJD} - $ref{$root}->{EXP_S} / 86400 / 2,
+        timeStop => $ref{$root}->{EPOCH_MJD} + $ref{$root}->{EXP_S}  / 86400/ 2,
+        filter => 'DD',
+        surveyMode => 'DD',
+        limitingMag => $lm,
+        raSigma => $POSITION_ERROR_DEGREES,
+        decSigma => $POSITION_ERROR_DEGREES,
+        obscode => $obscode,
+        de => \@default_de,
+    );
+    $id = $field->insert;
+    if ($id) {
+        print STDERR "created new field ID $id for field ", $ref{$root}->{EPOCH_MJD}, "\n";
+    }
+    else {
+        warn "could not insert field for ", $ref{$root}->{EPOCH_MJD}, "\n";
+        $inst->popAutocommit();
+        return;
+    }
+
+    # Now insert detections.
+    my $num = 0;
+    $field = modcf_retrieve($inst, fieldId => $id);
+
+    foreach my $det_hr (@dets) {
+#        next if $line =~ /^#/;   # skip comments
+#        my %det_h = miti_parse($line);
+#        next unless $det_h{MAG} < $limiting_mag;    # does not satisfy mag reqs
+
+        my $det = PS::MOPS::DC::Detection->new(
+            $inst,
+            ra => $det_hr->{RA_DEG},
+            dec => $det_hr->{DEC_DEG},
+            epoch => $ref{$root}->{EPOCH_MJD},
+            mag => $det_hr->{MAG},
+            filter => $field->filter,
+            s2n => $DEFAULT_S2N,
+            isSynthetic => 0,
+            orient_deg => 0,
+            length_deg => 0,
+            raSigma => $POSITION_ERROR_DEGREES,
+            decSigma => $POSITION_ERROR_DEGREES,
+            magSigma => 0,
+        ) or warn "couldn't create detection";
+        if ($det) {
+            $det->addToField($field);
+            $num++;
+        }
+    }
+    $field->status($FIELD_STATUS_NEW);
+    printf STDERR "Added %d detections.\n", $num;
+    $inst->dbh->commit;
+}
+
+
+sub process_ia {
+    # We're going to slurp the entire input file and build the following
+    # structure:
+    # %fields_mjd2field
+    #   @mjd
+    #    $detection
+    my $filename = $_[0];
+    my %fields_mjd2ar;       # main table
+
+    # Get all fields.  After we grab all the fields we'll have to determine
+    # the field centers ourselves.
+    my %miti;
+    my $epoch_str;
+    my @lines = read_file($filename) or warn "empty file $filename";
+    foreach my $line (@lines) {
+        %miti = miti_parse($line);
+        $epoch_str = sprintf "%.8f", $miti{EPOCH_MJD};
+        push @{$fields_mjd2ar{$epoch_str}}, { %miti };
+    }
+
+    # Now we have a dict of lists of detections.  For each hash element:
+    # 1. Scan its list for RA/DEC of center
+    # 2. Create field record
+    # 3. Insert all detections
+    printf STDERR "Found %d fields.\n", scalar keys %fields_mjd2ar;
+    if ($debug) {
+        foreach my $mjd_str (sort { $a <=> $b } keys %fields_mjd2ar) {
+            printf STDERR "$mjd_str: %d detections\n", scalar @{$fields_mjd2ar{$mjd_str}};
+        }
+        return;
+    };
+
+    foreach my $mjd_str (sort { $a <=> $b } keys %fields_mjd2ar) {
+        my $detlist_ar = $fields_mjd2ar{$mjd_str};
+        my ($ra_center_deg, $dec_center_deg) = _find_center($detlist_ar);
+
+        # Insert into DB.
+        $inst->pushAutocommit(0); # disable DC autocommit
+        my $id;
+        my $field;
+
+        $field = PS::MOPS::DC::Field->new(
+            $inst,
+            epoch => $mjd_str,
+            ra => $ra_center_deg,
+            dec => $dec_center_deg,
+            timeStart => $mjd_str,
+            timeStop => $mjd_str,
+            filter => 'DD',
+            surveyMode => 'DD',
+            limitingMag => $limiting_mag,
+            raSigma => $POSITION_ERROR_DEGREES,
+            decSigma => $POSITION_ERROR_DEGREES,
+            obscode => $obscode,
+            de => \@default_de,
+        );
+        $id = $field->insert;
+        if ($id) {
+            print STDERR "created new field ID $id for field ", $mjd_str, "\n";
+        }
+        else {
+            warn "could not insert field for ", $mjd_str, "\n";
+            $inst->popAutocommit();
+            return;
+        }
+
+        # Now insert detections.
+        my $num = 0;
+        $field = modcf_retrieve($inst, fieldId => $id);
+        foreach my $det_hr (@{$detlist_ar}) {
+            my $det = PS::MOPS::DC::Detection->new(
+                $inst,
+                ra => $det_hr->{RA_DEG},
+                dec => $det_hr->{DEC_DEG},
+                epoch => $det_hr->{EPOCH_MJD},
+                mag => $det_hr->{MAG},
+                filter => $field->filter,
+                isSynthetic => 0,
+                orient_deg => 0,
+                length_deg => 0,
+                raSigma => $POSITION_ERROR_DEGREES,
+                decSigma => $POSITION_ERROR_DEGREES,
+                magSigma => 0,
+                objectName => $det_hr->{ID},
+            ) or warn "couldn't create detection";
+            if ($det) {
+                $det->addToField($field);
+                $num++;
+            }
+        }
+        $field->status($FIELD_STATUS_NEW);
+        printf STDERR "Added %d detections.\n", $num;
+        $inst->dbh->commit;
+    }
+}
+
+
+foreach my $filename (@ARGV) {
+    if ($ia) {
+        process_ia($filename);          # IA, multiple fields per file
+    }
+    elsif ($reffile) {
+        process_transient_catalog($filename, $reffile);
+    }
+    else {
+        process_catalog($filename);     # single catalog mosaic field
+    }
+}
+
+
+=head1 DESCRIPTION
+
+insertSpacewatchFields insert fields and detections from MITI
+files created by mosaic2miti.    The files must have a first
+line containing 
+
+FIELD EPOCH_MJD RA_DEG DEC_DEG MAG OBSCODE
+
+FIELD is the literal "FIELD"; RA and DEC are RA and DEC in degrees;
+MAG is apparent magnitude; and OBSCODE is obtained from the configuration
+file for the simulation.
+
+When FIELD is encountered, a new field is created in the current
+PSMOPS instance, then all subscquent detections in the field are
+inserted into the newly created field.
+
+If --reffile REFFILE is specified, then for each file on the command
+line, a corresponding entry is looked up in REFFILE to obtain RA, DEC
+and EPOCH for the field.  Format for the reffile should be
+
+  ID RA_DEG DEC_DEG EPOCH_MJD EXP_S
+
+where ID is something like "2005.09.30.03.01.1".
+
+=cut

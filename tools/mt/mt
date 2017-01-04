@@ -1,0 +1,1005 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+mt - MOPS tool to dump information about MOPS objects in excruciating textual detail
+
+=head1 SYNOPSIS
+
+mopstool [OPTIONS] NAME1 NAME2 ...
+
+  NAME1 NAME2 ... : names of objects to query
+  --t : show tracklet detail
+  --d : show detection detail
+  --o : show orbit detail
+  --s : show SSM detail
+  --h : show history
+  --r : show run IDs
+  --a : show all details except history
+  --xo : export orbits only in DES format for analysis (orbit determination, etc.)
+  --xd : export detections only in DES format for analysis (orbit determination, etc.)
+  --header : show DES header for --xd
+  --miti : export detections in MITI format
+  --mpc : export detections in MPC format
+  --global_oid ID : set global ID for --xd and --xo
+  --des_id : use DES IDs for --xd and --xo
+  --nofilter : don't show filter info in summary output
+  --help : show this manpage
+
+=head1 DESCRIPTION
+
+Given a list of one or more object names, mopstool displays information about these
+objects.  Object names may be prefixed with a letter to indicate the object type:
+
+  H : field ID
+  H : history event ID
+  L : derived object name 
+  S : synthetic object name
+  s : (small S) synthetic object numeric ID
+  O : orbit ID
+  T : tracklet ID
+  D : detection ID
+
+If a pure integer is specified, then it is a derived object ID.
+
+If no arguments are provided, then mt displays a summary of field
+information for the MOPS simulation, e.g.
+
+    $ mt
+    OC NN STATUS NUM
+    98 54462 L 168
+    98 54468 L 336
+    98 54471 L 660
+    98 54474 L 336
+    98 54475 L 660
+    98 54476 L 660
+    98 54478 L 168
+    99 54492 L 168
+    99 54496 L 168
+    99 54499 L 162
+    99 54500 L 168
+    99 54503 L 162
+    99 54504 L 660
+    99 54505 L 660
+    99 54507 L 162
+    99 54508 L 660
+
+=cut
+
+use strict;
+use warnings;
+use FileHandle;
+use Getopt::Long;
+use Astro::Time;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::MPC qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::Orbit;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DX;
+use PS::MOPS::DC::DerivedObject;
+use PS::MOPS::DC::History;
+use PS::MOPS::DC::History::Derivation;
+use PS::MOPS::DC::History::Attribution;
+use PS::MOPS::DC::History::Precovery;
+use PS::MOPS::DC::History::Identification;
+use PS::MOPS::DC::Known;
+
+use subs qw(
+    do_history
+    do_derivedobject
+    do_tracklet
+    do_detection
+    do_ssm
+    do_orbit
+    do_field
+    nested_print
+    _fmt
+    _ffmt
+);
+
+
+# Start program here.
+my $instance_name;
+
+# Object display options.
+my $show_all;
+my $show_tracklets;
+my $show_detections;
+my $show_ssm;
+my $show_orbits;
+my $show_history;
+my $show_runs;
+my $export_detections;
+my $header;
+my $miti;
+my $mpc;
+my $in_global_oid;
+my $des_id;
+my $export_orbits;
+
+# Field summary options.
+my $nofilter;
+my $unprocessed;
+
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    a => \$show_all,
+    t => \$show_tracklets,
+    d => \$show_detections,
+    s => \$show_ssm,
+    o => \$show_orbits,
+    h => \$show_history,
+    r => \$show_runs,
+    xd => \$export_detections,
+    header => \$header,
+    miti => \$miti,
+    mpc => \$mpc,
+    'global_oid=s' => \$in_global_oid,
+    'des_id' => \$des_id,
+    xo => \$export_orbits,
+
+    nofilter => \$nofilter,
+    unprocessed => \$unprocessed,
+
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbh = $inst->dbh;
+
+# Check if we have a runs table.
+my $have_runs = 0;
+if ($show_runs) {
+    eval {
+        $dbh->{PrintError} = 0;
+        $dbh->selectrow_array("select run_id from runs limit 1");       # will fail if table not present
+        $have_runs = 1;
+    };
+}
+
+
+my $mops_config = $inst->getConfig();
+my $gmt_offset_hours = defined($mops_config->{site}->{gmt_offset_hours}) ? $mops_config->{site}->{gmt_offset_hours} : die "can't get gmt_offset_hours";
+my $v2filt = $mops_config->{site}->{v2filt};
+my $show_derivedobjects = 1;
+
+# flag for showing DES header only once.
+my $done_header = 0;
+
+if (!@ARGV) {
+    # No arguments, so just display a summary of simulation info.
+    my $sql;
+    my $where = $unprocessed ? "where status != '$FIELD_STATUS_LINKDONE'" : '';
+
+    if ($nofilter) {    
+        unless ($have_runs) {
+            $sql = <<"SQL";
+select f.ocnum ocnum, f.nn nn, 'N/A' run_id, f.status status, count(*) ct 
+from fields f
+$where
+group by ocnum, nn, status, run_id
+order by ocnum, nn, min(epoch_mjd), run_id
+SQL
+        }
+        else {
+            $sql = <<"SQL";
+select f.ocnum ocnum, f.nn nn, if(r.run_id is null, 'N/A', r.run_id) run_id, f.status status, count(*) ct 
+from fields f left join runs r using(field_id)
+$where
+group by ocnum, nn, status, run_id
+order by ocnum, nn, min(epoch_mjd), run_id
+SQL
+        }
+
+        my $sth = $dbh->prepare($sql) or die "prep failed: $sql";
+        $sth->execute() or die "SQL failed: $sql\n";
+        my $href;
+        my @res;
+        print join(' ', qw(OC NN TJD DATE_UT RUN_ID STATUS NUM)), "\n";
+        while ($href = $sth->fetchrow_hashref()) {
+            push @res, $href;
+        }
+        $sth->finish();
+
+        # emit TJD and UT date.
+        my $nn;
+        my $mjd;
+        my $tjd;
+        my $dateut;
+        foreach $href (@res) {
+            $nn = $href->{nn};
+            $mjd = mopslib_nn2mjd($nn, $mops_config->{site}->{gmt_offset_hours});
+            $tjd = int($mjd + 0.5) - 50000;     # +0.5 to get local midnight
+            $dateut = mopslib_mjd2utctimestr($mjd + 0.5);
+            $dateut =~ s/T.*//; # strip time from date string
+
+            print join(' ', @{$href}{qw(ocnum nn)}, $tjd, $dateut, @{$href}{qw(run_id status ct)}), "\n";
+        }
+    }
+    else {
+        unless ($have_runs) {
+            $sql = <<"SQL";
+select f.ocnum, f.nn, f.filter_id, 'N/A' run_id, f.status, f.survey_mode, count(*) ct 
+from fields f 
+$where
+group by ocnum, nn, filter_id, survey_mode, status
+order by ocnum, nn, min(epoch_mjd)
+SQL
+        }
+        else {
+            $sql = <<"SQL";
+select f.ocnum, f.nn, f.filter_id, if(r.run_id is null, 'N/A', r.run_id) run_id, f.status, f.survey_mode, count(*) ct 
+from fields f left join runs r using(field_id)
+$where
+group by ocnum, nn, filter_id, survey_mode, status, run_id
+order by ocnum, nn, min(epoch_mjd), run_id
+SQL
+        }
+
+        my $sth = $dbh->prepare($sql) or die "prep failed: $sql";
+        $sth->execute() or die "SQL failed: $sql\n";
+        my $href;
+        my @res;
+        print join(' ', qw(OC NN TJD DATE_UT FILT RUN_ID STATUS NUM)), "\n";
+        while ($href = $sth->fetchrow_hashref()) {
+            push @res, $href;
+        }
+
+
+        # emit TJD and UT date.
+        my $nn;
+        my $mjd;
+        my $tjd;
+        my $dateut;
+        foreach $href (@res) {
+            $nn = $href->{nn};
+            $mjd = mopslib_nn2mjd($nn, $mops_config->{site}->{gmt_offset_hours});
+            $tjd = int($mjd + 0.5) - 50000;     # +0.5 to get local midnight
+            $dateut = mopslib_mjd2utctimestr($mjd + 0.5);
+            $dateut =~ s/T.*//; # strip time from date string
+
+            print join(' ', @{$href}{qw(ocnum nn)}, $tjd, $dateut, @{$href}{qw(filter_id run_id status survey_mode ct)}), "\n";
+        }
+    }
+
+    exit;
+}
+
+if ($show_all) {
+    # Turn on everything!
+    $show_tracklets = 1;
+    $show_detections = 1;
+    $show_ssm = 1;
+    $show_orbits = 1;
+    $show_history = 1;
+}
+if ($export_detections or $export_orbits) {
+    # Turn off everything!
+    $show_tracklets = 0;
+    $show_detections = 0;
+    $show_ssm = 0;
+    $show_orbits = 0;
+    $show_history = 0;
+    $show_derivedobjects = 0;
+}
+
+# Go!
+my $global_oid;
+my $oid_index = 0;          # for generating global OIDs
+my $nest_level = -1;
+
+# Hackish.  Rewrite a=b=c as Ta Tb Tc in args so we can process concatenated tracklets.
+for my $i (0..$#ARGV) {
+    if ($ARGV[$i] =~ /=/) {
+        splice @ARGV, $i, 1, map { "T$_" } (split /=/, $ARGV[$i]);
+    }
+}
+
+foreach my $id (@ARGV) {
+    if ($in_global_oid) {
+        $global_oid = $in_global_oid;
+    }
+    else {
+        if ($des_id) {
+            $global_oid = $id;
+        } else {
+            $global_oid = mopslib_toB62($oid_index, 'MT0000');
+        }
+    }
+
+    # Set up the global ID for any export options that are active.  This will cause all
+    # OIDs to use the same value so that a list of exported detections can be evaluated
+    # by an orbit determination tool.
+
+    # Now process our IDs.
+    if ($id =~ /^P/) {
+        # Special handling is required for submitted tracklet IDs.  There may not be
+        # a tracklet or even detections in a MOPS db for these records since they can
+        # come from external processing (e.g. outreach).  So we need to fetch something
+        # that looks like a tracklet and emit an MPC record.
+#        warn("Submitted tracklets designations are not supported yet.\n");
+
+        my $sql = <<"EOF";
+select dbname, tracklet_id from export.mpc_sub where desig=?
+EOF
+        my $href = $dbh->selectrow_hashref($sql, undef, $id);
+        if ($href) {
+            # Rewrite $inst.
+            $inst = PS::MOPS::DC::Instance->new(DBNAME => $href->{dbname}) or die "can't create DB instance for $id";
+            my $trk = modct_retrieve($inst, trackletId => $href->{tracklet_id}) or die "can't fetch tracklet for $id";
+            $export_detections = 1;
+            $show_tracklets = 1;
+            my $save_global_oid = $global_oid;
+            $global_oid = $id;
+            do_tracklet($trk);
+            $global_oid = $save_global_oid;
+        }
+    }
+    elsif ($id =~ /^F/) {
+        # Field ID
+        my $field = modcf_retrieve($inst, fieldId => substr($id, 1));
+        if (!$field) {
+            warn("Nonexistent field: $id\n");
+        }
+        else {
+            do_field($field);
+        }
+    }
+    elsif ($id =~ /^o/) {
+        # PS1 FPA ID
+        my $field = modcf_retrieve($inst, fpaId => $id);
+        if (!$field) {
+            warn("Nonexistent field: $id\n");
+        }
+        else {
+            do_field($field);
+        }
+    }
+    elsif ($id =~ /^H/) {
+        # History event
+        $show_history = 1;
+        my $event = modch_retrieve($inst, eventId => substr($id, 1));
+        if (!$event) {
+            warn("Nonexistent event: $id\n");
+        }
+        else {
+            do_history($event);
+        }
+    }
+    elsif ($id =~ /^s/) {
+        $show_orbits = 1;
+        my $ssm = modcs_retrieve($inst, ssmId => substr($id, 1));
+        if (!$ssm) {
+            warn("Nonexistent SSM object: $id\n");
+        }
+        else {
+            do_ssm($ssm);
+        }
+    }
+    elsif ($id =~ /^S/) {
+        $show_orbits = 1;
+        my $ssm = modcs_retrieve($inst, objectName => $id);
+        if (!$ssm) {
+            warn("Nonexistent SSM object: $id\n");
+        }
+        else {
+            do_ssm($ssm);
+        }
+    }
+    elsif ($id =~ /^O/) {
+        $show_orbits = 1;
+        my $orb = modco_retrieve($inst, orbitId => substr($id, 1));
+        if (!$orb) {
+            warn("Nonexistent orbit: $id\n");
+        }
+        else {
+            do_orbit($orb);
+        }
+    }
+    elsif ($id =~ /^T/) {
+        $show_tracklets = 1;
+        my $trk = modct_retrieve($inst, trackletId => substr($id, 1));
+        if (!$trk) {
+            warn("Nonexistent tracklet: $id\n");
+        }
+        else {
+            do_tracklet($trk);
+        }
+    }
+    elsif ($id =~ /^D/) {
+        my $det = modcd_retrieve($inst, detId => substr($id, 1));
+        if (!$det) {
+            warn("Nonexistent detection: $id\n");
+        }
+        else {
+            if ($export_detections) {
+                export_detection($det);
+            }
+            else {
+                $show_detections = 1;
+                do_detection($det);
+            }
+        }
+    }
+    elsif ($id =~ /^L/) {
+        my $dobj = modcdo_retrieve($inst, objectName => $id);
+        if (!$dobj) {
+            warn("Nonexistent derived object: $id\n");
+        }
+        else {
+            do_derivedobject($dobj);
+        }
+    }
+    elsif ($id =~ /^\d+$/) {
+        my $dobj = modcdo_retrieve($inst, derivedobjectId => $id);
+        if (!$dobj) {
+            warn("Nonexistent derived object: $id\n");
+        }
+        else {
+            do_derivedobject($dobj);
+        }
+    }
+    else {
+        warn("unknown ID type: $id\n");
+    }
+    $oid_index++;
+}
+
+exit;
+
+
+sub _derivation_extra {
+    my ($event) = @_;
+    my $h = modchd_retrieve($inst, eventId => $event->eventId);
+    my $tracklet_ids_ref = $h->trackletIds;
+    my $trk;
+
+    if (@{$tracklet_ids_ref}) {
+        foreach my $trk_id (@{$tracklet_ids_ref}) {
+            $trk = modct_retrieve($inst, trackletId => $trk_id);
+            do_tracklet($trk);
+        }
+    }
+}
+
+
+sub _attribution_extra {
+    my ($event) = @_;
+    my $h = modcha_retrieve($inst, eventId => $event->eventId);
+    my $tracklet_id = $h->trackletId;
+
+    my $eph_dist_arcsec = _ffmt($h->ephemerisDistance, 3);
+    my $eph_unc_arcsec = _ffmt($h->ephemerisUncertainty, 3);
+
+    if ($show_history and !$export_detections and !$export_orbits) {
+        my $stuff = <<"EOF";
+Eph Dist (arcsec):      $eph_dist_arcsec
+Eph Unc (arcsec):       $eph_unc_arcsec
+EOF
+        nested_print($stuff);
+    }
+
+    do_tracklet(modct_retrieve($inst, trackletId => $h->trackletId));
+}
+
+
+sub _precovery_extra {
+    my ($event) = @_;
+    my $h = modchp_retrieve($inst, eventId => $event->eventId);
+    my $tracklet_id = $h->trackletId;
+
+    my $eph_dist_arcsec = _ffmt($h->ephemerisDistance, 3);
+    my $eph_unc_arcsec = _ffmt($h->ephemerisUncertainty, 3);
+
+    if ($show_history and !$export_detections and !$export_orbits) {
+        my $stuff = <<"EOF";
+Eph Dist (arcsec):      $eph_dist_arcsec
+Eph Unc (arcsec):       $eph_unc_arcsec
+EOF
+        nested_print($stuff);
+    }
+
+    do_tracklet(modct_retrieve($inst, trackletId => $h->trackletId));
+}
+
+
+sub _identification_extra {
+    my ($event) = @_;
+}
+
+
+sub do_history {
+    # Given a derived object ID, output some info.
+    $nest_level++;
+    my ($event) = @_;
+    my $eventId = _fmt($event->{eventId});
+    my $eventType = _fmt($event->{eventType});
+    my $orbitId = _fmt($event->{orbitId});
+    my $classification = _fmt($event->{classification});
+    my $hist_extra = '';
+
+    my $fieldId = $event->{fieldId};
+    my $field = modcf_retrieve($inst, fieldId => $fieldId);
+    my $epoch_mjd = _ffmt($field->{epoch}, 6);
+    my $epoch_str = mopslib_mjd2utctimestr($epoch_mjd, ' ');
+    my $field_nn = $field->nn;
+    my $fpa_id = $field->fpaId;
+    my $field_str = "$fieldId ($fpa_id; $epoch_mjd; $epoch_str; $field_nn)";
+
+    my $derivedobjectId;
+    if ($event->{derivedobjectId}) {
+        my $do = modcdo_retrieve($inst, derivedobjectId => $event->{derivedobjectId});
+        $derivedobjectId = $event->derivedobjectId . ' ' . $do->{objectName};
+    }
+    else {
+        $derivedobjectId = _fmt($event->{derivedobjectId});
+    }
+
+    my $ssmId;
+    if ($event->{ssmId}) {
+        my $s = modcs_retrieve($inst, ssmId => $event->{ssmId});
+        $ssmId = $s->{objectName} . ' (' . $s->ssmId . ')';
+    }
+    else {
+        $ssmId = _fmt($event->{ssmId});
+    }
+
+    if ($show_history and !$export_detections and !$export_orbits) {
+        my $stuff = <<"EOF";
+Event ID:               $eventId
+Event Type:             $eventType
+Field ID:               $field_str
+Derived Object ID:      $derivedobjectId
+Orbit ID:               $orbitId
+SSM ID:                 $ssmId
+Classification:         $classification
+EOF
+        nested_print($stuff);
+    }
+
+    # Load extra history info based on the event type.
+    if ($eventType eq 'D') {
+        $hist_extra = _derivation_extra($event);
+    }
+    elsif ($eventType eq 'A') {
+        $hist_extra = _attribution_extra($event);
+    }
+    elsif ($eventType eq 'P') {
+        $hist_extra = _precovery_extra($event);
+    }
+    elsif ($eventType eq 'I') {
+        $hist_extra = _identification_extra($event);
+    }
+
+    if ($show_history and !$export_detections and !$export_orbits) {
+        print "\n";
+    }
+
+    if (($export_orbits or $show_orbits) and $event->orbitId) {
+        my $orb = modco_retrieve($inst, orbitId => $event->orbitId);
+        do_orbit($orb);
+    }
+
+    $nest_level--;
+}
+
+
+sub do_derivedobject {
+    # Given a derived object, output some info.
+    $nest_level++;
+    my ($dobj) = @_;
+    my $objectName = _fmt($dobj->{objectName});
+    my $derivedobjectId = _fmt($dobj->{derivedobjectId});
+    my $orbitId = _fmt($dobj->{orbitId});
+    my $mopsClassification = _fmt($dobj->{mopsClassification});
+    my $classification = _fmt($dobj->{classification});
+    my $status = $dobj->{status};
+
+    my $ssmId;
+    if ($dobj->{ssmId}) {
+        my $s = modcs_retrieve($inst, ssmId => $dobj->{ssmId});
+        $ssmId = $s->{objectName} . ' (' . $s->ssmId . ')';
+    }
+    else {
+        $ssmId = _fmt($dobj->{ssmId});
+    }
+
+    if ($show_derivedobjects) {
+        my $stuff = <<"EOF";
+Derived Object Name:    $objectName
+Derived Object ID:      $derivedobjectId
+Orbit ID:               $orbitId
+SSM ID:                 $ssmId
+MOPS Classification     $mopsClassification
+Classification:         $classification
+Status:                 $status
+
+EOF
+        nested_print($stuff);
+    }
+
+    if ($show_ssm and $dobj->ssmId) {
+        my $ssm = modcs_retrieve($inst, ssmId => $dobj->ssmId);
+        do_ssm($ssm);
+    }
+
+    if (($show_orbits or $export_orbits) and $dobj->orbitId) {
+        my $orb = modco_retrieve($inst, orbitId => $dobj->orbitId);
+        do_orbit($orb);
+    }
+
+    # If tracklets are turned on, show the tracklet composition.
+    my @tracklets = $dobj->fetchTracklets();
+    foreach my $trk (sort { $a->extEpoch <=> $b->extEpoch } @tracklets) {
+        do_tracklet($trk);
+    }
+
+
+    # If history is turned on, show it!
+    if ($show_history) {
+        my $events_ref = modch_retrieve($inst, derivedobjectId => $derivedobjectId);
+        foreach my $event (@{$events_ref}) {
+            do_history($event);
+        }
+    }
+
+    $nest_level--;
+}
+
+
+sub do_tracklet {
+    # Given a derived object ID, output some info.
+    $nest_level++;
+    my ($trk) = @_;
+    my $trackletId = _fmt($trk->{trackletId});
+    my $epoch_mjd = _ffmt($trk->{extEpoch}, 6);
+    my $epoch_str = mopslib_mjd2utctimestr($epoch_mjd, ' ');
+    my $vel_tot_degperday = _ffmt($trk->{vTot}, 3) . ' deg/day';
+    my $pos_ang_deg = _ffmt($trk->{posAng}, 3) . ' deg';
+    my $classification = _fmt($trk->{classification});
+    my $status = _fmt($trk->{status});
+
+    # If the tracklet is attributed, say to whom.
+    if ($status eq $TRACKLET_STATUS_ATTRIBUTED) {
+        my @dobjs = modcdo_retrieve($inst, trackletId => $trackletId);
+        if (@dobjs) {
+            # Append list of assigned DOs
+            $status .=  ' (' 
+                . join(', ', 
+                    map { sprintf "%s (%d)", $_->objectName, $_->derivedobjectId } @dobjs
+                )
+            . ')';
+        }
+    }
+
+    my $ssmId;
+    if ($trk->{ssmId}) {
+        my $s = modcs_retrieve($inst, ssmId => $trk->{ssmId});
+        $ssmId = $s->{objectName} . ' (' . $s->ssmId . ')';
+    }
+    else {
+        $ssmId = _fmt($trk->{ssmId});
+    }
+
+    my $known_str = '';
+    if ($trk->{knownId}) {
+        $known_str = modck_lookup($inst, knownId => $trk->{knownId})->{known_name};
+    }
+
+    my $digest_str = sprintf "%.2f", ($trk->digest || 0);
+    my $gcr_str = sprintf "%.2f", ($trk->gcr_arcsec || 0);
+    my $prob_str = sprintf "%.2f", ($trk->probability || 0);
+
+    my $stuff = <<"EOF";
+Tracklet ID:            $trackletId
+Epoch (MJD):            $epoch_mjd ($epoch_str)
+Sky-Plane Velocity:     $vel_tot_degperday 
+Position Angle:         $pos_ang_deg
+SSM ID:                 $ssmId
+Classification:         $classification
+Status:                 $status
+Known as:               $known_str
+GCR (arcsec):           $gcr_str
+Digest2:                $digest_str
+Probability:            $prob_str
+
+EOF
+
+    if (!$export_detections && $show_tracklets) {
+        nested_print($stuff);
+    }
+
+    # If tracklets are turned on, show the tracklet composition.
+    my $det_ref = $trk->detections;
+    foreach my $det (sort { $a->epoch <=> $b->epoch } @{$det_ref}) {
+        if ($export_detections) {
+            export_detection($det);
+        }
+        else {
+            do_detection($det);
+        }
+    }
+    $nest_level--;
+}
+
+
+sub do_detection {
+    # Given a derived object ID, output some info.
+    $nest_level++;
+    my ($det) = @_;
+    my $detId = _fmt($det->{detId});
+    my $detNum = _fmt($det->{detNum});
+    my $fieldId = $det->fieldId;
+    my $epoch_mjd = _ffmt($det->{epoch}, 6);
+    my $epoch_str = mopslib_mjd2utctimestr($epoch_mjd, ' ');
+    my $ra_deg = _ffmt($det->{ra}, 6);
+    my $ra_str = turn2str(deg2turn($ra_deg), 'H', 2, 'hms');
+    my $dec_deg = _ffmt($det->{dec}, 6);
+    my $dec_str = turn2str(deg2turn($dec_deg), 'D', 2, 'deg');
+    my $mag = _ffmt($det->{mag}, 3);
+    my $filt = _fmt($det->filter, ' ');
+    my $s2n = _ffmt($det->{s2n}, 3);
+    my $object_name = $det->{objectName} || $MOPS_NONSYNTHETIC_OBJECT_NAME;
+    my $procId = $det->{procId} || 'N/A';
+    my $status = $det->status;
+
+    my $stuff = <<"EOF";
+Detection ID:           $detId
+Proc ID:                $procId
+Field ID:               $fieldId
+Det Num:                $detNum
+Epoch (MJD):            $epoch_mjd ($epoch_str)
+RA (deg):               $ra_deg ($ra_str)
+Dec (deg):              $dec_deg ($dec_str)
+Mag ($filt)                 $mag
+S/N:                    $s2n
+Object Name:            $object_name
+Status:                 $status
+
+EOF
+
+    if ($show_detections) {
+        nested_print($stuff);
+    }
+    $nest_level--;
+}
+
+
+sub do_field {
+    # Given a field ID, output some info.
+    my ($field) = @_;
+    my $fieldId = _fmt($field->{fieldId}) . ' ' . $field->fpaId;
+    my $survey_mode = $field->{surveyMode};
+    my $status = $field->status;
+    my $epoch_mjd = _ffmt($field->{epoch}, 6);
+    my $epoch_str = mopslib_mjd2utctimestr($epoch_mjd, ' ');
+    my $ra_deg = _ffmt($field->{ra}, 6);
+    my $ra_str = turn2str(deg2turn($ra_deg), 'H', 2, 'hms');
+    my $dec_deg = _ffmt($field->{dec}, 6);
+    my $dec_str = turn2str(deg2turn($dec_deg), 'D', 2, 'deg');
+    my $filter = _fmt($field->filter, ' ');
+    my $exposure_time_sec = sprintf "%.2f", ($field->timeStop - $field->timeStart) * 86400;
+    my $exp_name = $field->fpaId || 'N/A';
+    my $diff_id = $field->diffId || 'N/A';
+    my $pa_deg = defined($field->pa_deg) ? (sprintf "%+.2f", $field->pa_deg) : 'N/A';
+    my $eb_deg = defined($field->eb_deg) ? (sprintf "%+.2f", $field->eb_deg) : 'N/A';
+    my $gb_deg = defined($field->gb_deg) ? (sprintf "%+.2f", $field->gb_deg) : 'N/A';
+    my $se_deg = defined($field->se_deg) ? (sprintf "%+.2f", $field->se_deg) : 'N/A';
+
+    my $stuff = <<"EOF";
+Field ID:               $fieldId
+Status:                 $status
+Exposure Name:          $exp_name
+Survey Mode:            $survey_mode
+Diff ID:                $diff_id
+Epoch (MJD):            $epoch_mjd ($epoch_str)
+RA (deg):               $ra_deg ($ra_str)
+Dec (deg):              $dec_deg ($dec_str)
+Filter:                 $filter
+Exposure Time (sec):    $exposure_time_sec
+Position Angle (deg):   $pa_deg
+Ecliptic Lat (deg):     $eb_deg
+Galactic Lat (deg):     $gb_deg
+Solar Elongation (deg): $se_deg
+
+EOF
+
+    print $stuff;
+}
+
+
+sub export_detection {
+    # Output detection in DES format.
+    my ($det) = @_;
+    my $obs_type = 'O';         # O for optical
+
+    die "V filter conversions not found in config" unless $v2filt;
+
+    if ($mpc) {
+        my $oid;
+        if ($global_oid =~ /^\d+$/ and length $global_oid > 6) {
+            $oid = mopslib_toB62($global_oid, 'Q000000');
+        }
+        else {
+            $oid = $global_oid;
+        }
+        print det2mpc($det, $oid), "\n";
+    }
+    elsif ($miti) {
+        print join(' ',
+            $global_oid,
+            $det->{epoch},
+            $det->{ra},
+            $det->{dec},
+            mopslib_filt2V($det->{mag}, $det->{filter}, $v2filt),
+            $det->{obscode},
+            ($det->{objectName} || $MOPS_NONSYNTHETIC_OBJECT_NAME),
+        ), "\n";
+    }
+    else {
+        if (!$done_header) {
+            print $PS::MOPS::DX::header_DETECTION, "\n";
+            $done_header = 1;
+        }
+        # DES
+        print join(' ',
+            $global_oid,
+            $det->{epoch},
+            $obs_type,
+            $det->{ra},
+            $det->{dec},
+            $det->{mag},
+            $det->{filter},
+            $det->{obscode},
+            $det->{raSigma} * 3600,     # arcsec per deg
+            $det->{decSigma} * 3600,    # arcsec per deg
+            $det->{magSigma},
+            $det->{s2n},
+            ($det->{objectName} || $MOPS_NONSYNTHETIC_OBJECT_NAME),
+        ), "\n";
+    }
+}
+
+
+sub do_orbit {
+    my ($orb) = @_;
+    if ($export_orbits) {
+        my $save_id = $orb->orbitId;
+        $orb->orbitId($global_oid);
+        print $orb->serialize(), "\n";
+        $orb->orbitId($save_id);
+    }
+    else {
+        # Given a derived object ID, output some info.
+        $nest_level++;
+        my $orbitId = _fmt($orb->{orbitId});
+        my $hV = _ffmt($orb->{hV}, 3);
+        my $q_AU = _ffmt($orb->{q}, 6);
+        my $e = _ffmt($orb->{e}, 3);
+        my $i_deg = _ffmt($orb->{i}, 3);
+        my $node_deg = _ffmt($orb->{node}, 6);
+        my $arg_peri_deg = _ffmt($orb->{argPeri}, 6);
+        my $time_peri_mjd = _ffmt($orb->{timePeri}, 6);
+        my $time_peri_str = mopslib_mjd2utctimestr($time_peri_mjd, ' ');
+
+        my $epoch_mjd = _ffmt($orb->{epoch}, 6);
+        my $epoch_str = mopslib_mjd2utctimestr($epoch_mjd, ' ');
+
+        my $resid_arcsec = _ffmt($orb->{residual}, 3);
+        my $arclen_days = _ffmt($orb->{arcLength_days}, 2);
+        my $conv_code = $orb->{convCode};
+        my $conv_code_str;
+        if ($conv_code eq 'D9') {
+            $conv_code_str = "$conv_code (IOD)";
+        }
+        else {
+            $conv_code_str = "$conv_code (differentially corrected)";
+        }
+
+        my $stuff = <<"EOF";
+Orbit ID:               $orbitId
+Absolute Mag (V):       $hV
+q (AU):                 $q_AU
+e:                      $e
+i (deg):                $i_deg
+Node (deg):             $node_deg
+Arg Peri (deg):         $arg_peri_deg
+Time Peri (MJD):        $time_peri_mjd ($time_peri_str)
+Epoch (MJD):            $epoch_mjd ($epoch_str)
+Residual (arcsec):      $resid_arcsec
+Arc Length (days):      $arclen_days
+Convergence code:       $conv_code_str
+
+EOF
+
+        nested_print($stuff);
+        $nest_level--;
+    }
+}
+
+
+sub do_ssm {
+    my ($ssm) = @_;
+    if ($export_orbits) {
+        my $orb = PS::MOPS::DC::Orbit->new($inst,
+            q => $ssm->{q},
+            e => $ssm->{e},
+            i => $ssm->{i},
+            node => $ssm->{node},
+            argPeri => $ssm->{argPeri},
+            timePeri => $ssm->{timePeri},
+            epoch => $ssm->{epoch},
+            hV => $ssm->{hV},
+        );
+        $orb->orbitId($global_oid);
+        print $orb->serialize(), "\n";
+    }
+    else {
+        # Given an SSM object, output some stuff.
+        $nest_level++;
+        my $ssmId = _fmt($ssm->{ssmId});
+        my $object_name = $ssm->{objectName};
+        my $q_AU = _ffmt($ssm->{q}, 6);
+        my $e = _ffmt($ssm->{e}, 3);
+        my $i_deg = _ffmt($ssm->{i}, 3);
+        my $node_deg = _ffmt($ssm->{node}, 6);
+        my $arg_peri_deg = _ffmt($ssm->{argPeri}, 6);
+        my $time_peri_mjd = _ffmt($ssm->{timePeri}, 6);
+        my $time_peri_str = mopslib_mjd2utctimestr($time_peri_mjd, ' ');
+
+        my $epoch_mjd = _ffmt($ssm->{epoch}, 6);
+        my $epoch_str = mopslib_mjd2utctimestr($epoch_mjd, ' ');
+
+        my $stuff = <<"EOF";
+SSM ID:                 $object_name ($ssmId)
+q (AU):                 $q_AU
+e:                      $e
+i (deg):                $i_deg
+Node (deg):             $node_deg
+Arg Peri (deg):         $arg_peri_deg
+Time Peri (MJD):        $time_peri_mjd ($time_peri_str)
+Epoch (MJD):            $epoch_mjd ($epoch_str)
+
+EOF
+
+        nested_print($stuff);
+        if ($show_detections) {
+            my $det;
+            my $det_i = modcd_retrieve($inst, objectName => $object_name);
+            while ($det = $det_i->next) {
+                do_detection($det);
+            }
+        }
+        $nest_level--;
+    }
+}
+
+
+sub nested_print {
+    my ($str) = @_;
+    my $nest = '    ' x $nest_level;
+    $str =~ s/^/$nest/mg;
+    print $str;
+}
+
+
+sub _fmt {
+    my ($val, $def) = @_;
+    defined($val) ? $val : ($def || 'NULL');
+}
+
+
+sub _ffmt {
+    my ($val, $dec) = @_;
+    my $foo = defined($val) ? (sprintf "%.${dec}f", $val) : 'N/A';
+    return $foo;
+}

@@ -1,0 +1,123 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use FileHandle;
+use Getopt::Long;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DX;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::DerivedObject;
+
+my $fileroot = 'insert';
+my $help;
+GetOptions(
+    'fileroot=s' => \$fileroot,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => undef);
+my @do_ids = @ARGV;
+my $id;
+my $det;
+my $fh;
+
+
+# 1. Get all SSM IDs for the detections in question by looking the field ID and
+# SSM ID of their detections.
+my %ssm_object_names;           # table of used SSMs
+my %field_ids;                  # table of used field IDs
+
+foreach $id (@do_ids)  {
+    my $do;
+    if ($id =~ /^\d+$/) {
+        $do = modcdo_retrieve($inst, derivedobjectId => $id);
+    }
+    else {
+        $do = modcdo_retrieve($inst, objectName => $id);
+    }
+    warn("can't find object $id.\n") unless $do;
+    next unless $do;
+
+    my @detections = $do->fetchDetections();
+    next unless @detections;
+    
+    foreach $det (@detections) {
+        if ($det->objectName !~ /^S/) {
+            die("detection id is nonsynthetic: " . $det->detId);
+        }
+
+        $ssm_object_names{$det->objectName} = 1;
+        $field_ids{$det->fieldId} = 1;
+    }
+}
+
+# Write the SSM stuff.
+my $ssm;
+$fh = new FileHandle ">$fileroot.ssm";
+print $fh $PS::MOPS::DX::header_ORBIT, "\n";
+foreach $id (sort keys %ssm_object_names) {
+    $ssm = modcs_retrieve($inst, objectName => $id);
+    die("can't retrieve SSM object $id") unless $ssm;
+    print $fh modx_toORBIT($ssm), "\n";
+}
+$fh->close();
+
+# Write the field stuff.
+my $field;
+my $fpa_id;
+$fh = new FileHandle ">$fileroot.fields";
+print $fh "#MIF-FS FPA_ID EPOCH_MJD RA_DEG DEC_DEG SURVEY_MODE TIME_START_MJD TIME_STOP_MJD FILTER_ID LIMITING_MAG RA_SIGMA DEC_SIGMA OBSCODE\n";
+foreach $id (sort { $a <=> $b } keys %field_ids) {
+    $field = modcf_retrieve($inst, fieldId => $id);
+    die("can't retrieve field $id") unless $field;
+    $fpa_id = $field->fpaId;
+    $fpa_id =~ s/^\s+//;
+    print $fh join(' ',
+        $fpa_id,
+        $field->epoch,
+        $field->ra,
+        $field->dec,
+        $field->surveyMode,
+        $field->timeStart,
+        $field->timeStop,
+        $field->filter,
+        $field->limitingMag,
+        $field->raSigma,
+        $field->decSigma,
+        $field->obscode,
+    ), "\n";
+}
+$fh->close();
+
+
+exit;
+
+
+=head1 NAME
+
+extractSim - MOPS tool to extract derived object information for a new simulation
+
+=head1 SYNOPSIS
+
+extractSim [options] DO_ID1 DO_ID2 ...
+
+  DO_ID1 DO_ID2 ... : names of objects to extract
+  --fileroot=NAME : generate output files NAME.ssm and NAME.fields
+  --help : show this manpage
+
+=head1 DESCRIPTION
+
+Given a list of derived object names or IDs, extractSim generates two
+files, insert.ssm and insert.fields, that can be used to run a MOPS
+simulation that includes all fields and detections for the specified
+objects.
+
+=cut

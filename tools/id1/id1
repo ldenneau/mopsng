@@ -1,0 +1,198 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+id1 - stage 1 orbit identification
+
+=head1 SYNOPSIS
+
+id1 [options] orbits_file1.mif orbits_file2.mif > new_orbits_file
+
+  --help : show this manual page
+
+=head1 DESCRIPTION
+
+id1 performs first-stage orbit identification management that arbitrates
+among conflicting tracks+orbits in a nightly linking pass.  The typical
+scenario will be tracks that share common tracklets from previous nights
+and differ only in the last tracklet.  The reason this is the common
+mode of conflict is that a night's linking pass is divided into "target
+fields", thus if an object appears in two different fields on the night
+of the linking pass, two differt subjobs will generate a correct linkage.
+Note that these are both correct linkages.
+
+id1 operates by collecting all conflicting tracks+orbits into a table
+where each key is a tracklet ID that is found in multiple tracks,
+and the value for the key is a list of all tracks using the tracklet.
+
+Then all tracks are sorted in decreasing quality, and for each track,
+its tracklets are checked for existence in the conflict table, and 
+if there is a conflict for the tracklet, an evaluation function is
+executed to determine which of the tracks using the tracklet should
+survive.  The non-survivors are marked as dead for the remainder of
+the id1 run.  Thus the end result is a subset of the original list
+of tracks, with no conflicts.
+
+Note that in the normal case of two available correct tracklets, when
+a survivor is chosen, the other correct tracklet(s) are later assigned
+correctly via precovery, so no data is lost.
+
+=cut 
+
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Temp qw(tempfile);
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Orbit;
+
+
+use subs qw(
+    evaluate_group
+);
+
+
+# Globals.
+my $inst;
+my $instance_name;
+my $help;
+my $debug;
+GetOptions(
+    'instance=s' => \$instance_name,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+
+# MOPS Configuration.
+my $disable_id1 = $mops_config->{debug}->{disable_id1} || 0;
+if ($disable_id1 == 2) {
+    # Special code for don't process instead of passthrough
+    $mops_logger->info("ID1 disabled; skipping.");
+    exit;
+}
+elsif ($disable_id1) {
+    print while (<>);
+    exit;
+}
+
+my $id1_resid_threshold_arcsec = 
+    $mops_config->{dtctl}->{id1_resid_threshold_arcsec} ||
+    $mops_config->{dtctl}->{diffcor_threshold_arcsec};
+
+
+
+my %tracklet_groups;        # main table of all groups
+my @multi_group_ids;        # list of IDs in %tracklet_groups having >1 members
+my @unfound;                # "unfound" tracks that we need to append to output
+
+#my ($dummy, $link_id, $classification, $object_name, $orbit_code, $orbit_els);
+my $dummy;
+my $link_id;
+my $group_id;
+my $classification;
+my @tracklet_ids;
+my $leading_id;
+my $line;
+my $rest;
+
+while ($line = <>) {
+    chomp $line;
+    next if $line =~ /^#/;  # skip comments
+    ($dummy, $link_id, $classification, $rest) = split (/\s+/, $line, 4);
+
+    if ($classification eq $MOPS_EFF_UNFOUND) {
+        push @unfound, $line;
+        next;
+    }
+
+    # Get the "leading" tracklets from the link_id.
+    @tracklet_ids = split /=/, $link_id;
+    if (scalar @tracklet_ids <= 2) {
+        $mops_logger->logwarn("short link_id $link_id");
+    }
+    $leading_id = join('=', @tracklet_ids[0..$#tracklet_ids - 1]);  # join first N-1 IDs
+
+    push @{$tracklet_groups{$leading_id}}, {
+        LINK_ID => $link_id,
+        LINE => $line,
+    };
+}
+# Get a list of all multi groups.  These are the ones we care about.  The others
+# do not conflict with anything so they will just be re-emitted.
+@multi_group_ids = grep { scalar @{$tracklet_groups{$_}} > 1 } keys %tracklet_groups;
+if ($debug) {
+    printf STDERR "Found %d groups:\n", scalar @multi_group_ids;
+    foreach $group_id (@multi_group_ids) {
+        print STDERR $group_id, "\n";
+        print STDERR '  ',  $_->{LINK_ID}, "\n" foreach @{$tracklet_groups{$group_id}};
+    }
+}
+
+# Now our input lines have been arranged in groups.  Now we execute some
+# function on the group that produces a new track (which may of
+# course be identical to one of old ones in the group.
+foreach $group_id (@multi_group_ids) {
+    $tracklet_groups{$group_id} = [ evaluate_group($group_id, $tracklet_groups{$group_id}) ];   # one-item list
+}
+
+
+# We're done, so emit the LINE attributes of each member of the group.
+foreach $group_id (keys %tracklet_groups) {
+    # Sanity check.
+    if (scalar @{$tracklet_groups{$group_id}} > 1) {
+        $mops_logger->logdie("unprocessed group: $group_id");
+        next;
+    }
+    print $tracklet_groups{$group_id}->[0]->{LINE}, "\n";
+}
+
+# Now emit our leftovers.
+foreach $line (@unfound) {
+    print $line, "\n";
+}
+
+exit;
+
+
+sub evaluate_group {
+    # A basic group evaluation function that returns the member
+    # with the lowest RMS residual.  For derived objects that
+    # appear twice on the link night, this means we will only
+    # link one of them -- precov will have to mop up the others.
+    my ($group_id, $group_data_aref) = @_;
+
+    # Re-read the MIF-TRACK data for each group member and get some info.
+    my $track_id;
+    my $best_resid;
+    my $best;
+    my $orb;
+
+    foreach my $group_data (@{$group_data_aref}) {
+        my ($dummy, $link_id, $classification, $object_name, $orbit_code, $orbit_els) = 
+            split (/\s+/, $group_data->{LINE}, 6);
+        $orb = modco_deserialize($inst, $orbit_els);
+
+        if (!defined($best_resid)) {
+            $best_resid = $orb->residual;
+            $best = $group_data;
+        }
+        elsif ($orb->residual < $best_resid) {
+            $best = $group_data;
+        }
+    }
+
+    return $best;
+}

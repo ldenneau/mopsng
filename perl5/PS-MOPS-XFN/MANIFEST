@@ -1,0 +1,6 @@
+Changes
+Makefile.PL
+MANIFEST
+README
+t/PS-MOPS-XFN.t
+lib/PS/MOPS/XFN.pm

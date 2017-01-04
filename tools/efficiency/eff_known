@@ -1,0 +1,108 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+eff_known - Generate efficiency histogram
+
+=head1 SYNOPSIS
+
+eff_known [options] FILE
+
+  FILE : output of compare_known
+  --start_mag=MAG : start mag bin (bin is MAG to MAG+0.25)
+  --end=MAG : end mag
+  --binsize=SIZE : width of bins in mags
+  --max_radius_deg=R : max radius from field center to consider
+  --max_search_arcsec=R : max distance from nominal position to consider
+  --extend : extend end bins to 0 and 40 respectively
+  --out FILENAME : write output to FILENAME instead of STDOUT
+  --help : show manpage
+
+=head1 DESCRIPTION
+
+Analyzes output of compare known, producing a histogram table where each row
+is a V mag bin and the columns are
+
+V mag | # sim | # found
+
+empty bins are not reported.  Optionally a maximum radius in degrees
+from the center may be specified.
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+use FileHandle;
+
+use PS::MOPS::DC::Instance;
+
+
+my $file;
+my $start_mag = 16;
+my $end_mag = 23.75;
+my $binsize = 0.25;
+my $max_radius_deg = 1.0;
+my $max_search_arcsec = 20;
+my $extend;
+my $out;
+my $help;
+GetOptions(
+    'start_mag=f' => \$start_mag,
+    'end_mag=f' => \$end_mag,
+    'binsize=f' => \$binsize,
+    'max_radius_deg=f' => \$max_radius_deg,
+    'max_search_arcsec=f' => \$max_search_arcsec,
+    extend => \$extend,
+    'out=s' => \$out,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$file = shift || pod2usage(-message => 'No source file specified.');
+my $outfh;
+if ($out) {
+    $outfh = new FileHandle ">$out" or die "can't create filehandle for $out";
+}
+else {
+    $outfh = *STDOUT;
+}
+
+my $fh = new FileHandle $file or die "can't open $file";
+my @lines = grep { !/^#/ } <$fh>;
+$fh->close;
+
+my $mag = $start_mag;
+my $max_radius_arcsec = $max_radius_deg * 3600;
+print $outfh "MAG1 MAG2 NK NF PCT\n";
+while ($mag <= $end_mag) {
+    my $nk = 0;
+    my $nf = 0;
+    my @foo;
+
+    my $min_mag = $mag;
+    if ($extend and $mag == $start_mag) {
+        $min_mag = 0;
+    }
+    my $max_mag = $mag + $binsize;
+    if ($extend and $mag >= $end_mag) {
+        $max_mag = 40;
+    }
+
+    #object_name det_id fpa_id epoch_mjd orig_ra_deg orig_dec_deg orig_mag orig_filt fc_dist_arcsec near_det_id near_ra_deg near_dec_deg near_mag near_filt near_s2n near_proc_id dist_arcsec
+    #SK184909 84736 o5889g0314o 55889.45832708 91.1614519622235 37.6498762481052 20.0668 w 5348.6465778239 17211 91.1615672467308 37.6498444178041 20.5932 w 23.3936 11971713 0.34800560851691
+
+    for my $line (@lines) {
+        @foo = split /\s+/, $line;
+        if ($foo[6] > $min_mag and $foo[6] < $max_mag and $foo[8] < $max_radius_arcsec) {
+            $nk++;
+            if ($foo[9] ne 'NONE' and $foo[-1] < $max_search_arcsec) {
+                $nf++;
+            }
+        }
+    }
+    printf $outfh "%.2f %.2f %d %d %.2f\n", $mag, $mag + $binsize, $nk, $nf, $nf / $nk * 100 if $nk > 0;
+    $mag += $binsize;
+}

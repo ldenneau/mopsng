@@ -1,0 +1,158 @@
+#!/usr/bin/env perl 
+
+use strict;
+use warnings;
+
+use Carp;
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Copy;
+use File::Basename;
+use File::Temp qw(tempfile tempdir);
+
+use PS::MOPS::DataStore::table;
+use PS::MOPS::DataStore::dbclient;
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+
+use subs qw(
+    dump_file
+    submit_to_datastore
+);
+
+
+my $instance_name;
+my $inst;
+my $group_by_epoch;
+my $group_by_filename;
+my $nofilter;
+my $pairwise;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    group_by_epoch => \$group_by_epoch,
+    group_by_filename => \$group_by_filename,
+    nofilter => \$nofilter,
+    pairwise => \$pairwise,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => 'No files specified.') unless @ARGV;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+
+
+my @files = @ARGV;
+my %filesets;       # keys => MJD-OBS, vals => list of filenames
+my $key;
+
+foreach my $file (@files) {
+    my $epoch_mjd;
+    my $key;
+
+    if ($group_by_epoch) {
+        my $table = new PS::MOPS::DataStore::table;
+        $table->openskycellfile($file);
+        $epoch_mjd = $table->keyval('MJD-OBS');
+        if (!defined($epoch_mjd)) {
+            warn "Couldn't get MJD-OBS from $file.  Skipping.\n";
+            next;
+        }
+        $key = sprintf "%.6f", int($epoch_mjd * 100000 + 0.5) / 100000;
+        $table->closefile();
+    }
+    elsif ($group_by_filename) {
+        if ($file =~ m|mops\.(\d+)|) {
+            $key = $1;
+        }
+        else {
+            warn "Unmatchable filename: $file\n";
+            next;
+        }
+    }
+    else {
+        die "Unspecified grouping method (use --group_by_epoch or --group_by_filename).\n";
+    }
+
+    push @{$filesets{$key}}, $file;
+    print STDERR '.';
+}
+print STDERR "\n";
+
+# Report what we've found.
+printf STDERR "Found %d exposures in %d skycell files.\n", (scalar keys %filesets), (scalar @files);
+
+# Now schwing em.
+
+if ($pairwise) {
+    # Pairwise is not selected, so preserve the output FITS file from
+    # mergeSkyCells then remove stationaries.  This is mitigation for
+    # the large number of bad subtractions we are seeing.
+    if (2 != scalar keys %filesets) {
+        $mops_logger->logdie("Cannot do pairwise processing, number of filesets is not 2");
+    }
+
+    my $cmd;
+    my $idx = 1;
+    for $key (sort {$a <=> $b} keys %filesets) {
+        my @file_list = @{$filesets{$key}};
+        my $nofilter_str = $nofilter ? '--nofilter' : '';
+        my $cmd = <<"EOF";
+mergeSkycells --ignore_filenames $nofilter_str --out MERGE.$idx.fits --fits @file_list
+EOF
+
+        system($cmd) == 0 or warn "$cmd failed";
+        $idx += 1;
+    }
+
+    # Now remove stationaries from the pair.
+    my $stationrad_thresh_deg = $mops_config->{ingest}->{stationrad_thresh_deg} || (2 / 3600);
+    $cmd = <<"EOF";
+removeStationaries --stationrad_thresh_deg=$stationrad_thresh_deg MERGE.1.fits MERGE.2.fits
+EOF
+    $mops_logger->info("Executing: $cmd");
+    system($cmd) == 0 or warn "$cmd failed";
+
+    # Finally, ingest the files.
+    my $res;
+    my $file;
+
+    $file = 'MERGE.1.REMOVE.fits';
+    $res = PS::MOPS::DataStore::dbclient::insert($inst, $file);  # chummy w/filenames
+    $mops_logger->logdie("insert of $file failed") unless $res;
+
+    $file = 'MERGE.2.REMOVE.fits';
+    $res = PS::MOPS::DataStore::dbclient::insert($inst, $file);  # chummy w/filenames
+    $mops_logger->logdie("insert of $file failed") unless $res;
+}
+else {
+    # Pairwise is not selected, so process files individually.
+    for $key (sort {$a <=> $b} keys %filesets) {
+        my @file_list = @{$filesets{$key}};
+        my $nofilter_str = $nofilter ? '--nofilter' : '';
+        my $cmd = <<"EOF";
+mergeSkycells --ignore_filenames --insert $nofilter_str @file_list
+EOF
+
+        system($cmd) == 0 or warn "$cmd failed";
+    }
+}
+
+
+exit;
+
+=head1 SYNOPSIS
+
+ingestSkycells FILES
+
+=head1 DESCRIPTION
+
+Analyze a set of skycell FITS files and organize them into exposures by
+peeking at their MJD-OBS.  For each fileset corresponding to a single
+exposure, execute mergeSkycells on the set to put them in the ingest
+datastore.
+
+=cut

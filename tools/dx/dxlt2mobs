@@ -1,0 +1,154 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DX;
+use PS::MOPS::DC::Tracklet;
+
+use subs qw(
+    _out_track
+);
+
+
+my $inst;
+my $instance_name;
+my $twopass;
+my $oid = 'A000000';                # OID for attr/precov
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    twopass => \$twopass,
+    'oid=s' => \$oid,               # hard-coded OID for single-orbit evals (attribution/precovery)
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+
+my $in_filename;
+my $out_fileroot;
+my $template = '00000000';          # B62 name template
+
+$in_filename = (shift or '-');      # filename from command-line or use stdin
+if ($in_filename eq '-') {
+    $out_fileroot = 'stdin';        # looks like stdin
+}
+else {
+    $out_fileroot = $in_filename;   # copy input filename
+    $out_fileroot =~ s/\.sum$//g;   # strip '.sum' suffix if present
+}
+
+
+# Input file handle.
+my $sum_fh = new FileHandle($in_filename);
+
+# Loop through lines in the summary file until we've read
+# an entire track.  Then fetch each of the detections for
+# the track and write out a detracklet using the link ID
+# as the det ID.  We'll pass this on for orbit determination.
+# Write out the detracklet as MOBS.
+
+my ($track_id, $tracklet_id, $line_no);
+my $line;
+my @stuff;              # accumulated stuff for this track.
+my %trk_tracklet_ids;   # tracklet IDs making up current track
+my $last_track_id = '';
+
+my $num_tracks_processed = 0;
+my $ntrk = 1;           # count of tracks for ID manufacturation
+my $ntrk_id;
+
+while (defined($line = <$sum_fh>)) {
+    chomp $line;
+    ($track_id, $tracklet_id, $line_no) = split /\s+/, $line, 3;
+
+    if ($last_track_id and ($track_id ne $last_track_id)) {
+        $ntrk_id = mopslib_toB62($ntrk++, $template);      # manufacture ID
+        _out_track($ntrk_id, keys %trk_tracklet_ids);
+        $num_tracks_processed += 1;
+        %trk_tracklet_ids = ();
+    }
+    else {
+        $trk_tracklet_ids{$tracklet_id} = 1;
+    }
+    $last_track_id = $track_id;
+}
+if (keys %trk_tracklet_ids > 0) {
+    $ntrk_id = mopslib_toB62($ntrk++, $template);      # manufacture ID
+    _out_track($ntrk_id, keys %trk_tracklet_ids);
+    $num_tracks_processed += 1;
+}
+
+exit;
+
+sub _count_nights {
+    my ($daref) = @_;           # detections array ref
+    return 0; 
+}
+
+
+sub _out_track {
+    my ($track_id, @tracklet_ids) = @_;
+    my @tracklets = map { modct_retrieve($inst, trackletId => $_) } @tracklet_ids;  # fetch all tracklets
+    my @detections; # flattened detection list
+    my $nobs;       # number observations
+    my $ntrk;       # number of tracklets
+    my $nn;         # number of nights observed
+    my $d;
+
+    @tracklets = sort { $a->extEpoch <=> $b->extEpoch } @tracklets;     # sort by tracklet central time
+    foreach my $trk (@tracklets) {
+        my $oid = $track_id;                    # tracklet ID, will become temporary detId
+        foreach $d (@{$trk->detections}) {
+#            $d->detId($trk->trackletId);       # hijack detId for tracklet listing
+            $d->detId($track_id);       # hijack detId for tracklet listing
+
+            #XXX hello
+            $d->objectName('NS') unless $d->objectName;                          # nonsynthetic => 'NS'
+        }
+
+        push @detections, @{$trk->detections};  # all all dets to list for this track
+    }
+    print scalar @detections, "\n";
+    foreach $d (sort { $a->epoch <=> $b->epoch } @detections) {
+        print modx_toMOBS_D($d), "\n";
+    }
+}
+
+
+=head1 NAME
+
+dxlt2mobs - Create DX-formatted IOD requests from LinkTracklets output
+
+=head1 SYNOPSIS
+
+dxlmobs [options] INFILE
+dxlmobs [options] < INFILE
+
+  --help : show manpage
+
+=head1 DESCRIPTION
+
+Converts LinkTracklets .sum output into a set of files constituting
+a MOBS IOD request.  The resulting track data is written to STDOUT.
+
+The format for MOBS data is
+
+NUM_DETS_TRACK_1
+ID  EPOCH   RA_DEG  DEC_DEG MAG RA_SIGMA_ARCSEC DEC_SIGMA_ARCSEC MAG_SIGMA S2N OBSCODE
+ID  EPOCH   RA_DEG  DEC_DEG MAG RA_SIGMA_ARCSEC DEC_SIGMA_ARCSEC MAG_SIGMA S2N OBSCODE
+ID  EPOCH   RA_DEG  DEC_DEG MAG RA_SIGMA_ARCSEC DEC_SIGMA_ARCSEC MAG_SIGMA S2N OBSCODE
+...
+NUM_DETS_TRACK_2
+ID  EPOCH   RA_DEG  DEC_DEG MAG RA_SIGMA_ARCSEC DEC_SIGMA_ARCSEC MAG_SIGMA S2N OBSCODE
+ID  EPOCH   RA_DEG  DEC_DEG MAG RA_SIGMA_ARCSEC DEC_SIGMA_ARCSEC MAG_SIGMA S2N OBSCODE
+ID  EPOCH   RA_DEG  DEC_DEG MAG RA_SIGMA_ARCSEC DEC_SIGMA_ARCSEC MAG_SIGMA S2N OBSCODE
+...
+
+=cut

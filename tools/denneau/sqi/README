@@ -1,0 +1,26 @@
+Attempt to ingest an SMF file by extracting all the detections, stationary
+or not, and executing findTracklets on the input set.  Our hope is that
+by invoking findTracklets with a lower rate limit, we will in effect
+find all transient detections of inner solar system objects.
+
+Ideally we would like to identify out SS transients, but this will
+require a bonafide star catalog to identify stationary sources.  Even more
+ideally, this filtering would be performed upstream by image processing
+so that the SMF catalog contains only transients.
+
+
+For each chip in SMF, create list of detections with 
+
+ID numeric chip num (e.g. 01) and chip det_num, sprintf("%02d%08d", chip_num, det_num)
+EPOCH_MJD can be artificial, but must have accurate deltas across the SMF quad set
+RA_DEG
+DEC_DEG
+FOM figure of merit, 1/PSF_QUALITY
+
+
+OUTLINE
+
+1. Perform stationary filtering to reduce detections by ~75%
+2. Ingest remaining detections
+3. postclean each field to remove linear artifacts and clumps
+

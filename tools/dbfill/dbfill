@@ -1,0 +1,358 @@
+#!/usr/bin/env perl
+# $Id: identifyOrbits 1639 2007-06-20 00:15:50Z denneau $
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+#use File::Temp qw(tempfile);
+#use File::Slurp;
+#use Params::Validate;
+#use Data::Dumper;
+#use Time::HiRes qw ( time );
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::DerivedObject;
+use PS::MOPS::DC::Orbit;
+
+
+use subs qw(
+    get_max_id
+    do_ocnum
+    do_nn
+    do_field
+    make_dets
+    get_max_ocnum
+);
+
+
+# Globals.
+#use constant NIGHTS_PER_LUNATION => 12;
+#use constant TUPLES_PER_NIGHT => 500;
+#use constant DETECTIONS_PER_FIELD => 1000;
+#use constant TRACKLETS_PER_TUPLE => 1000;
+#use constant DOBJS_PER_LUNATION => 100000;
+use constant NIGHTS_PER_LUNATION => 12;
+use constant TUPLES_PER_NIGHT => 500;
+#use constant DETECTIONS_PER_FIELD => 5000;
+use constant DETECTIONS_PER_FIELD => 2000;
+use constant TRACKLETS_PER_TUPLE => 1000;
+use constant DOBJS_PER_LUNATION => 200000;
+#my $start_ocnum = 84;
+#my $num_ocs = 48;
+my $num_ocs = (shift || 1);
+my $det_num = 0;
+my $trk_num = 0;
+my $obj_num = 0;
+my @default_de = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+
+my $inst;
+my $instance_name;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+$mops_logger->info("DBFILL starting");
+my $start_ocnum = get_max_ocnum($inst) + 1;
+
+
+foreach my $ocnum (0..$num_ocs-1) {
+    do_ocnum($inst, $start_ocnum + $ocnum);
+}
+
+$mops_logger->logdie($@) if $@;
+exit 0;
+
+
+sub do_ocnum {
+    my ($inst, $ocnum) = @_;
+    print STDERR "Processing OC $ocnum.\n";
+
+    my $start_nn = mopslib_ocnum2mjd($ocnum);
+    my @fields;
+    my @oc_tracklets;       # all tracklets this OC (big!)
+    foreach my $nn (1..NIGHTS_PER_LUNATION) {
+        push @fields, do_nn($inst, $start_nn + $nn * 2, TUPLES_PER_NIGHT, \@oc_tracklets);
+    }
+
+    # After all the nights are processed, manufacture some derived objects.
+    print STDERR "Manufacturing derived objects.\n";
+    my $t0 = time;
+    my $dbh = $inst->dbh();
+#    $inst->atomic($dbh, sub {
+
+    $dbh->{AutoCommit} = 0;
+        foreach my $do_num (1..DOBJS_PER_LUNATION) {
+            my $orbit = make_orbit($inst);
+            my $do = make_do($inst, $orbit->orbitId, mopslib_toB62($orbit->orbitId, 'Q00000000'), \@oc_tracklets);
+        }
+#    });
+    $mops_logger->info(
+        mopslib_formatTimingMsg(
+	    subsystem => 'DO_OCNUM',
+	    subsubsystem => 'DERIVEDOBJECTS',
+	    time_sec => (time - $t0),
+	    nn => $t0,
+	)
+    );
+    $dbh->commit();
+    printf STDERR "Inserted %d derived objects.\n", DOBJS_PER_LUNATION;
+}
+
+
+sub do_nn {
+    my ($inst, $nn, $num_tuples, $tracklet_bag) = @_;
+    print STDERR "Processing night $nn.\n";
+
+    # Just create random fields separated by TTI.
+    my $epoch_mjd;
+    my $tti_mjd = 30 / 1440;                # one TTI in days (30 minutes)
+    my $exp_mjd = 30 / 86400;               # exposure time in days (30 seconds)
+    my $inc_mjd = 35 / 86400;               # delta between fields in days (35 seconds)
+    my $det_count = 0;
+    my $trk_count = 0;
+
+    foreach my $fnum (1..$num_tuples) { 
+        $epoch_mjd = $nn + $fnum * $inc_mjd;
+
+        my ($ra_deg, $dec_deg) = (rand() * 360, rand() * 360 - 180);
+        my $f1 = PS::MOPS::DC::Field->new($inst,
+            fpaId => 'foo',
+            epoch => $epoch_mjd,
+            ra => $ra_deg,
+            dec => $dec_deg,
+            surveyMode => 'DD',
+            timeStart => $epoch_mjd - $exp_mjd / 2,
+            timeStop => $epoch_mjd + $exp_mjd / 2,
+            filter => 'r',
+            limitingMag => 22.7,
+            raSigma => .1,
+            decSigma => .1,
+            obscode => '566',
+            de => \@default_de,
+        );
+        $f1->insert() or die "couldn't insert field";
+
+        my $f2 = PS::MOPS::DC::Field->new($inst,
+            fpaId => 'foo',
+            epoch => $epoch_mjd + $tti_mjd,
+            ra => $ra_deg,
+            dec => $dec_deg,
+            surveyMode => 'DD',
+            timeStart => $epoch_mjd - $exp_mjd / 2,
+            timeStop => $epoch_mjd + $exp_mjd / 2,
+            filter => 'r',
+            limitingMag => 22.7,
+            raSigma => .1,
+            decSigma => .1,
+            obscode => '566',
+            de => \@default_de,
+        );
+        $f2->insert() or die "couldn't insert field";
+
+        # Populate with detections.  Save the list of det IDs so we
+        # can randomly generate tracklets.
+	my $t0 = time;
+        $inst->pushAutocommit(0);
+        my @detections1;
+        foreach my $d (1..DETECTIONS_PER_FIELD) {
+            push @detections1, make_det($inst, $f1->fieldId, $f1->epoch, $d, $ra_deg, $dec_deg);
+            $det_count++;
+        }
+        $f1->addDetections(@detections1);
+        printf STDERR "Inserted %d detections.\n", $det_count;
+
+        my @detections2;
+        foreach my $d (1..DETECTIONS_PER_FIELD) {
+            push @detections2, make_det($inst, $f2->fieldId, $f2->epoch, $d, $ra_deg, $dec_deg);
+            $det_count++;
+        }
+        $f2->addDetections(@detections2);
+        printf STDERR "Inserted %d detections.\n", $det_count;
+        $inst->dbh->commit();
+        $inst->popAutocommit();
+	$mops_logger->info(
+	    mopslib_formatTimingMsg(
+		subsystem => 'DO_NN',
+		subsubsystem => 'DETECTIONS',
+		time_sec => (time - $t0),
+		nn => $t0,
+	    )
+        );
+
+        # Create lots of tracklets.
+	$t0 = time;
+        my $dbh = $inst->dbh;
+        my @new_tracklets;
+        foreach my $t (1..TRACKLETS_PER_TUPLE) {
+            my @dets = (
+                $detections1[rand() * (scalar @detections1)],
+                $detections2[rand() * (scalar @detections2)],
+            );
+            push @new_tracklets, PS::MOPS::DC::Tracklet->new($inst, 
+                detections => \@dets,
+                classification => $MOPS_EFF_NONSYNTHETIC,
+                fieldId => $f2->fieldId,
+            );
+            $trk_count++;
+        }
+	$inst->atomic($dbh, sub {
+            foreach my $trk (@new_tracklets) {
+                $trk->insert();
+            }
+        });
+	$mops_logger->info(
+	    mopslib_formatTimingMsg(
+		subsystem => 'DO_NN',
+		subsubsystem => 'TRACKLETS',
+		time_sec => (time - $t0),
+		nn => $t0,
+	    )
+        );
+        printf STDERR "Inserted %d tracklets.\n", scalar @new_tracklets;
+
+	if (scalar @{$tracklet_bag} < 10000) {
+		push @{$tracklet_bag}, @new_tracklets;
+	}
+    }
+}
+
+
+sub get_max_id {
+    my ($inst, $table_name, $id_name) = @_;
+    my $dbh = $inst->dbh();
+    my $stuff = $dbh->selectrow_array(<<"SQL") or die $dbh->errstr;
+select max($id_name) from $table_name
+SQL
+    die "got empty result for max($id_name) from $table_name" unless $stuff;
+    return $stuff->[0];
+}
+
+
+sub make_det {
+    my ($inst, $field_id, $epoch_mjd, $det_num, $ra_deg, $dec_deg) = @_;
+    return PS::MOPS::DC::Detection->new($inst,
+        ra => $ra_deg + (rand() * 3.5 - 1.75),
+        dec => $dec_deg + (rand() * 3.5 - 1.75),
+        epoch => $epoch_mjd,
+        mag => 15 + rand() * 10,
+        filter => 'r',
+        isSynthetic => 'Y',
+        detNum => $det_num,
+        s2n => rand() * 10 + 5,
+        raSigma => .1,
+        decSigma => .1, 
+        orient_deg => rand() * 360,
+        length_deg => rand() * .01,
+        objectName => 'NS',
+        fieldId => $field_id,
+        obscode => 566,
+    );
+}
+
+
+sub make_orbit {
+    my ($inst) = @_;
+    my $orbit = PS::MOPS::DC::Orbit->new($inst,
+        q => 2.5 + rand() * 10,
+        e => rand(),
+        i => rand() * 180,
+        node => rand() * 360,
+        argPeri => rand() * 360,
+        timePeri => 50000 + rand() * 10000,
+        epoch => 54000 + rand() * 1000,
+        hV => 12 + rand() * 15,
+        residual => rand() * .1 + .1,
+    );
+    $orbit->insert();
+    return $orbit;
+}
+
+
+sub make_do {
+    my ($inst, $orbit_id, $link_id, $tbucket) = @_;
+
+    # Select 3 tracklets from the bucket.
+    my $num_in_bucket = scalar @{$tbucket};        # num in master list for lunation
+    my @tracklets = (
+        $tbucket->[int(rand() * $num_in_bucket)],
+        $tbucket->[int(rand() * $num_in_bucket)],
+        $tbucket->[int(rand() * $num_in_bucket)],
+    );
+    my $dobj = PS::MOPS::DC::DerivedObject->new(
+        $inst,
+        orbitId => $orbit_id,
+        objectName => $link_id,
+    );
+    $dobj->insert();
+    $dobj->attributeTracklets(
+        TRACKLETS_AREF => \@tracklets,
+    );
+    return $dobj;
+}
+
+
+sub get_max_ocnum {
+    my ($inst) = @_;
+    my $dbh = $inst->dbh();
+    my $stuff = $dbh->selectrow_array(<<"SQL") or die $dbh->errstr;
+select max(ocnum) from `fields`
+SQL
+    return $stuff;
+}
+
+
+=head1 NAME
+
+dbfill - write lots of MOPS-style database stuff to satisfy requirements verification
+
+=head1 SYNOPSIS
+
+dbfill [options]
+
+  --help : show this manual page
+
+=head1 DESCRIPTION
+
+dbfill writes tons of mostly artificial data to a database in order to
+consume space to the level mandated by MOPS requirements verification.
+Approximately, these values are
+
+  2M fields
+  10B detections
+  10T LSDs
+  100M orbits (derived objects)
+  1M shape definitions
+  10B tracklets
+
+dbfill will operate by looping over OCs, with nested loops
+to create other DB objects, essentially as follows
+
+Before running this script, you should install a full SSM.
+
+=code
+
+write SSM
+foreach OC
+  foreach night
+     foreach field
+       write detections
+     create tracklets
+  create orbits
+
+=cut
+

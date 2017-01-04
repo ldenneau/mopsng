@@ -1,0 +1,113 @@
+#!/usr/bin/env perl
+# $Id$
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::EONQueue;
+use PS::MOPS::DC::DerivedObject;
+use PS::MOPS::DC::Orbit;
+use PS::MOPS::DC::Residuals;
+use PS::MOPS::JPLEPH;
+
+
+use subs qw(
+);
+
+
+my $inst;
+my $instance_name;
+my $eon_status = $EONQUEUE_STATUS_PRECOVERED;
+my $nodb;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    nodb => \$nodb,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mc = $inst->getConfig;
+my $ml = $inst->getLogger;
+my $dbh = $inst->dbh();
+my $queue_item;
+
+my $objList = modcq_retrieve($inst, $EONQUEUE_STATUS_PRECOVERED);
+$ml->info('POSTFIT: ' . scalar @{$objList} . ' orbits to process.');
+
+# Loop through our derived objects.  For each object, fetch
+# its orbit and detections, and compute positions for each 
+# detection time.  Then store residuals objects for each
+# detection.
+foreach $queue_item (@{$objList}) {
+    my $dobj = modcdo_retrieve($inst, derivedobjectId => $queue_item->derivedobjectId)
+        or die $ml->logdie("can't retrieve DO for ID " . $queue_item->derivedobjectId);
+    my $orbit = modco_retrieve($inst, orbitId => $dobj->orbitId)
+        or die $ml->logdie("can't retrieve orbit for ID " . $dobj->orbitId);
+
+    my @tracklets = $dobj->fetchTracklets();
+    my %detid2trk;
+    my %detid2det;
+    my @dets;
+    my $trk_id;
+    my $det_id;
+    foreach my $trk (@tracklets) {
+        $trk_id = $trk->trackletId;
+        push @dets, @{$trk->detections};                      # add all dets for this trk
+        $detid2trk{$_->detId} = $trk_id foreach @{$trk->detections};  # save trk IDs for each det
+        $detid2det{$_->detId} = $_ foreach @{$trk->detections};  # save trk IDs for each det
+    }
+
+    # Got everything.
+    my $resids = jpleph_calcDetectionResiduals(
+        orbit => $orbit,
+        detections_ref => \@dets,
+    );
+
+    my $det;
+    my $resid;
+    while (($det_id, $resid) = each %{$resids}) {
+        # Create residuals objects for each resid, and store.
+        $det = $detid2det{$det_id};
+        $resid = PS::MOPS::DC::Residuals->new($inst,
+            detId => $det_id,
+            trackletId => $detid2trk{$det_id},
+            raResid_deg => $resid->{dra},
+            decResid_deg => $resid->{ddec},
+            raError_deg => $det->raSigma,
+            decError_deg => $det->decSigma,
+            astReject => 0,
+        );
+        $resid->insert();
+    }
+
+    modcq_update($inst, $queue_item->derivedobjectId, $EONQUEUE_STATUS_POSTFIT);
+}
+
+exit 0;
+
+=head1 NAME
+
+postfit - Store postfit residuals for EON objects
+
+=head1 SYNOPSIS
+
+postfit [options]
+
+  --help : show this manual page
+
+=head1 DESCRIPTION
+
+postfit queries the EON queue for modified derived objects and stores
+postfit residuals for the detections currently owned by each derived
+object.
+
+=cut
+

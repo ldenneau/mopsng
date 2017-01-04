@@ -1,0 +1,26 @@
+[all]
+oAuth_filename:twitter_all
+
+[comets]
+oAuth_filename: twitter_comets
+
+[hildas]
+oAuth_filename: twitter_hildas
+
+[light]
+oAuth_filename: twitter_curve
+
+[hyperbolics]
+oAuth_filename: twitter_hyperbolics
+
+[impactors]
+oAuth_filename: twitter_impactors
+
+[centaurs]
+oAuth_filename: twitter_centaurs
+
+[planets]
+oAuth_filename: twitter_planets
+
+[sednas]
+oAuth_filename: twitter_sednas

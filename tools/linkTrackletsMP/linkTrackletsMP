@@ -1,0 +1,327 @@
+#!/usr/bin/env perl
+
+# $Id: linkTrackletsMP 1197 2006-07-28 03:56:47Z fpierfed $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Temp qw(tempfile tempdir);
+use File::Slurp;
+
+use PS::MOPS::Lib;
+use PS::MOPS::MITI;
+use PS::MOPS::DC::Instance;
+
+
+# Runtime parameters.
+my $rtd = {
+    'in' => {},         # input into current pass
+    'out' => {},        # output of current pass
+    'results' => [],    # accumulated results
+    'opts' => {},       # all cmd-line options
+};
+
+
+my @LIN_THRESH = qw(.05 .1 .2);
+my @QUAD_THRESH = qw(.02 .05 .1);
+my @MINV = (0, .5);
+my @MAXV = (0.6, 100);
+
+
+my %mapargs = (
+    file => 'file',
+    trackFile => 'trackfile',
+    summaryFile => 'summaryfile',
+    idsFile => 'idsfile',
+    linThresh => 'lin_thresh',
+    quadThresh => 'quad_thresh',
+    fitThresh => 'fit_thresh',
+    maxHyp => 'max_hyp',
+    minV => 'minV',
+    maxV => 'maxv',
+    maxMatch => 'max_match',
+    minObs => 'min_obs',
+    minDays => 'mindays',
+    maxMean => 'max_mean',
+    'eval' => 'eval',
+    fitOrbs => 'fit_orbs',
+    rocThresh => 'roc_thresh',
+    keepBadOrbits => 'keep_bad_orbits',
+    removeSubsets => 'remove_subsets',
+    indivFiles => 'indiv_files',
+    removeOverlaps => 'remove_overlaps',
+    allowConflicts => 'allow_conflicts',
+    minOverlap => 'min_overlap',
+    plateWidth => 'plate_width',
+);
+
+
+GetOptions($rtd->{opts}, qw(
+    instance=s
+    trackFile=s
+    summaryFile=s
+    idsFile=s
+    linThresh=f
+    quadThresh=f
+    fitThresh=f
+    maxHyp=i
+    minV=f
+    maxV=f
+    maxMatch=i
+    minObs=i
+    minDays=i
+    maxMean=f
+    eval
+    fitOrbs
+    rocThresh=f
+    keepBadOrbits
+    removeSubsets=s
+    indivFiles
+    removeOverlaps=s
+    allowConflicts
+    minOverlap=f
+    plateWidth=f
+
+    cheat
+    iterations=i
+    noCleanup
+    help
+)) or pod2usage(2);
+pod2usage(-verbose => 2) if $rtd->{opts}->{help};
+pod2usage(3) unless @ARGV;
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $rtd->{opts}->{instance});
+my $mops_logger = $inst->getLogger;
+
+# Clean up opts.
+$rtd->{opts}->{iterations} ||= 2;
+$rtd->{opts}->{removeSubsets} ||= 'true';
+$rtd->{opts}->{removeOverlaps} ||= 'true';
+
+my $file = shift;
+my $tempdir = tempdir('ltXXXXXX', DIR => '/tmp', CLEANUP => !$rtd->{opts}->{noCleanup});
+
+
+# Globals.
+my $LINK_TRACKLETS = "$ENV{MOPS_HOME}/bin/linkTracklets";
+
+
+# Verify execution environment.
+-x $LINK_TRACKLETS or $mops_logger->logdie("can't locate linkTracklets executable");
+
+
+sub makeMasterTable {
+    # Read lines of input file, store them by key so we can remove after a run.
+    my @lines = read_file(shift);
+    my %tbl;
+    my $key;
+    my @toks;
+    foreach my $line (@lines) {  
+        @toks = split /\s+/, $line;     # MITI tokens
+        $key = $toks[0];                # ID
+        push @{$tbl{$key}}, $line;      # add line to table for this tracklet ID; autovivify
+    }
+    return \%tbl;
+}
+
+
+sub filterTracks {
+    my ($rtd, $href) = @_;      # runtime data, ref to found tracks table
+    my @keep;                   # list of tracks to keep
+
+    my ($track_id, $tracklet_list);
+    my $keep;
+    while (($track_id, $tracklet_list) = each %{$href}) {
+        $keep = 0;
+        if ($rtd->{opts}->{cheat}) {
+            # Check that all tracklets have same ground-truth object.
+            my %objs;               # ground-truth objs for this track
+            my $line_aref;
+            foreach my $tracklet_id (keys %{$tracklet_list}) {
+                $line_aref = $rtd->{master}->{$tracklet_id};    # list of tracklet defs
+                $objs{(split /\s+/, $_)[6]} = 1 foreach @{$line_aref};
+            }
+            $keep = 1 if keys %objs == 1;    # keep if only one object associated
+        }
+        else {
+            $keep = 1;  # do orbit tests here
+        }
+            
+
+        push @keep, $track_id if $keep;
+    }
+
+    return @keep;
+}
+
+
+sub buildInputFiles {
+    # Build input file from the master table.  If 'in' is empty, populate 
+    # it from the master table.  Return the number of tracklets in the
+    # current input file, so we can stop in the rare case there are no
+    # more tracklets to link.
+    my $rtd = shift;
+    my $key;
+    
+    if (!%{$rtd->{in}}) {
+        # First pass: copy from master
+        $rtd->{in} = { map { $_ => 1 } keys %{$rtd->{master}} };
+    }
+    else {
+        # Subsequent pass: toss stuff from previous run ('out')
+        foreach $key (keys %{$rtd->{out}}) {
+            delete ${$rtd->{in}}{$key} if exists ${$rtd->{in}}{$key};
+        }
+    }
+
+    # Create input files for LinkTracklets.  Compile all input tracklets
+    # into a single file.
+    my $fh;
+    my $filename = "$tempdir/tracklets." . $rtd->{iteration};
+    my $num_tracklets;
+
+    open $fh, ">$filename" or $mops_logger->logdie("can't write tracklets file $filename");
+    foreach $key (keys %{$rtd->{in}}) {
+        print $fh $_ foreach @{$rtd->{master}->{$key}}; # write tracklet line
+        $num_tracklets++;
+    }
+    close $fh;
+    $rtd->{opts}->{file} = $filename;
+
+    $rtd->{opts}->{trackFile} = "$tempdir/tracks." . $rtd->{iteration};
+    $rtd->{opts}->{summaryFile} = "$tempdir/summary." . $rtd->{iteration};
+    $rtd->{opts}->{idsFile} = "$tempdir/ids." . $rtd->{iteration};
+
+    return $num_tracklets;
+}
+
+
+sub messWithOptions {
+    my $rtd = shift;
+##    if (exists(${$rtd->{opts}}{linThresh})) {
+##        ${$rtd->{opts}}{linThresh} *= 2;
+##    }
+##    if (exists(${$rtd->{opts}}{quadThresh})) {
+##        ${$rtd->{opts}}{quadThresh} *= 2;
+##    }
+
+    my $i = $rtd->{iteration} - 1;      # zero-indexed
+#    ${$rtd->{opts}}{linThresh} = $LIN_THRESH[$i];
+#    ${$rtd->{opts}}{quadThresh} = $QUAD_THRESH[$i];
+#    ${$rtd->{opts}}{minV} = $MINV[$i];
+#    ${$rtd->{opts}}{maxV} = $MAXV[$i];
+}
+
+
+sub execute {
+    my $rtd = shift;
+    my @cmd = (
+        $LINK_TRACKLETS,    # executable
+        map { exists($mapargs{$_}) and defined(${$rtd->{opts}}{$_}) ?       # build options string
+            ( $mapargs{$_} => $rtd->{opts}->{$_}) : () } keys %{$rtd->{opts}}
+    );
+    my $cmd = join ' ', @cmd;
+    print STDERR '#', $cmd, "\n";
+    print STDERR qx{$cmd};
+}
+
+
+sub accumulate {
+    # Read summary file.  Accumulate result, and toss linked stuff
+    # from input.
+    my $rtd = shift;
+    my ($orbit_id, $tracklet_id, $input_lineno);
+    my %trktbl;
+    my $line;
+
+    $rtd->{out} = {};   # initialize output table
+
+    # Each line of the summary file contains an per-pass orbit_id, global tracklet_id,
+    # and input lineno.  We will discard the orbit ID and renumber later.  Simply
+    # aggregate the tracklet lists.
+    open my $fh, $rtd->{opts}->{summaryFile} or $mops_logger->logdie("can't open summaryFile: " . 
+        $rtd->{opts}->{summaryFile});
+    while (defined($line = <$fh>)) {    # read MITI line
+        ($orbit_id, $tracklet_id, $input_lineno) = split /\s+/, $line, 3;
+        ${$trktbl{$orbit_id}}{$tracklet_id} = 1;   # add tracklet for this orbit ID (autovivify)
+    }
+    close $fh;
+
+    # Filter the tracks.  Normally this will be by quality of fit of the
+    # orbit, and perhaps other parameters, but in evaluating LT we
+    # will filter out "non-clean" tracks to see how LT handles the
+    # returned tracks.
+    my @keep_trackids = filterTracks($rtd, \%trktbl);
+
+    # Now accumulate tracks into running result list and output list.
+#    push @{$rtd->{results}}, values %trktbl;
+    push @{$rtd->{results}}, @trktbl{@keep_trackids};    # values of all keys in @keep
+    foreach my $tracklet_id (map { keys %{$_} } @trktbl{@keep_trackids}) {
+        $rtd->{out}->{$tracklet_id} = 1;    # mark as used in output
+    }
+}
+
+
+sub writeResults {
+    my $rtd = shift;
+
+    my $key;
+    my $t;
+    my $line;
+    my $obsnum = 0;
+    my @toks;
+    foreach $key (sort @{$rtd->{results}}) {    # each orbit in result
+        foreach $t (sort keys %{$key}) {             # each tracklet for orbit
+            foreach $line (@{$rtd->{master}->{$t}}) {      # indiv detections
+                @toks = split /\s+/, $line;
+                $toks[0] = mopslib_toB62($obsnum, 'L000000');
+                print join("\t", @toks), "\n";
+            }
+        }
+        $obsnum++;
+    }
+}
+
+
+# Plan: 
+# 1. Generate input file
+# 2. Run linkTracklets
+# 3. Read output .sum file; accumulate results
+# 4. Remove linked tracklets from input
+# 5. Re-run
+# 6. Accumulate results
+# 7. Lather, rinse, repeat
+
+# Read master input file.
+$rtd->{master} = makeMasterTable($file);
+
+foreach my $iter (1..$rtd->{opts}->{iterations}) {
+    $rtd->{iteration} = $iter;
+    if (buildInputFiles($rtd)) {
+        messWithOptions($rtd);
+        execute($rtd);
+        accumulate($rtd);
+    }
+}
+
+writeResults($rtd);
+
+=head1 NAME
+
+linkTrackletsMP - Multi-pass LinkTracklets
+ 
+=head1 SYNOPSIS
+ 
+linkTrackletsMP [--options] [--help] inputfile
+
+  --help : show help
+
+=head1 DESCRIPTION
+
+linkTrackletsMP performs multi-pass linkTracklets analysis of tracklet data.
+Each pass attempts to link progressively faster-moving objects.  After each
+pass, the link tracklets are removed from the input file.
+
+=cut
+

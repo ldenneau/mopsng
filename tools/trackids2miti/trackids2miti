@@ -1,0 +1,128 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use PS::MOPS::MITI;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use FileHandle;
+
+
+use subs qw(
+    _make_miti
+);
+
+
+# Options.
+my $inst;
+my $instance_name;
+my $tracklets_file;             # file of tracklets in DES format
+my $trackids_file;              # file of LinkTracklets track IDs
+my $help = 0;
+
+# Start program here.
+GetOptions(
+    'instance=s' => \$instance_name,
+    'tracklets_file=s' => \$tracklets_file,
+    'trackids_file=s' => \$trackids_file,
+    help => \$help,
+) or pod2usage(2);
+
+pod2usage(-message => "Tracklets file $tracklets_file does not exist.") unless $tracklets_file;
+pod2usage(-message => "Track IDs file $trackids_file does not exist.") unless $trackids_file;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+
+
+my $line;
+my $id;
+my $rest;
+my %tracklets;
+my $miti;
+
+# First, read in the tracklets file and create a table where the keys
+# are tracklet IDs and the values are lists of DES detection lines.
+my $tracklets_fh = new FileHandle $tracklets_file;
+while (defined($line = <$tracklets_fh>)) {
+    next if (!$line or $line =~ /^!!/ or $line =~ /^#/);    # skip if empty or comment
+    chomp $line;
+    ($id, $rest) = split /\s+/, $line, 2;
+
+    $miti = _make_miti($rest);
+    push @{$tracklets{$id}}, $miti;     # append line with ID stripped
+}
+close $tracklets_fh;
+
+# Now read the track IDs.  For each track ID encountered, emit all detections from the
+# constituent tracklets.
+my @ids;
+my $trackids_fh = new FileHandle $trackids_file;
+while (defined($line = <$trackids_fh>)) {
+    next if (!$line or $line =~ /^!!/ or $line =~ /^#/);    # skip if empty or comment
+    chomp $line;
+    @ids = split '=', $line; 
+
+    # Emit all detections.
+    print $line . ' ' . $_, "\n" foreach map { @{$tracklets{$_}} } sort { $a <=> $b } @ids;
+}
+close $trackids_fh;
+
+exit;
+
+
+sub _make_miti {
+    # Take input DES string, get MITI vals, return MITIfied version.  Note that
+    # input string already has leading ID stripped.
+    my ($epoch_mjd, $obs_type, $ra_deg, $dec_deg, $mag, $filter,
+        $obscode, $sigma_ra_arcsec, $sigma_dec_arcsec, $sigma_mag, $s2n, $object_name) = split /\s+/, $_[0];
+    my @stuff = ($epoch_mjd, $ra_deg, $dec_deg, $mag, $obscode);
+    if ($object_name ne $MOPS_NONSYNTHETIC_OBJECT_NAME) {
+        push @stuff, $object_name;
+    }
+
+    return join(' ', @stuff);
+}
+
+=head1 NAME
+
+trackids2miti - Program to convert DES tracklets file and LinkTracklets track output to MOPS MITI format
+for differential orbit determination (until we support reading DES format).
+
+=head1 SYNOPSIS
+
+trackids2miti --tracklets_file=FILE1 --trackids_file=FILE2 > tracks.miti
+
+=head1 DESCRIPTION
+
+trackids2miti takes a DES tracklet file of the form
+
+!!OID TIME OBS_TYPE RA DEC APPMAG FILTER OBSERVATORY RMS_RA RMS_DEC RMS_MAG S2N Secret_name
+188 54079.2431036111 O 327.941357355596 -11.6386840984222 21.5234155176692 r 566 0.02906 0.02906 0.06099 18.36002 S172rl4
+188 54079.2514636111 O 327.943907270721 -11.6377885534749 21.4841158455965 r 566 0.02839 0.02839 0.06099 19.03676 S172rl4
+432 54083.2437836111 O 329.190983057315 -11.2072657465059 21.4418017690862 r 566 0.02768 0.02768 0.06220 19.79332 S172rl4
+432 54083.2521536111 O 329.193603742271 -11.2063489101864 21.5944946755739 r 566 0.03035 0.03035 0.06220 17.19656 S172rl4
+678 54087.2456136111 O 330.474161511362 -10.7560016509593 21.452867907561 r 566 0.02786 0.02786 0.06328 19.59261 S172rl4
+678 54087.2539736111 O 330.476847038994 -10.755010646581 21.5644644283042 r 566 0.02980 0.02980 0.06329 17.67884 S172rl4
+
+and a track IDs file of the form
+
+188=432=678
+
+and produces a MITI tracks file of the format
+
+88=432=678 54079.2431036111 327.941357355596 -11.6386840984222 21.5234155176692 566 S172rl4
+188=432=678 54079.2514636111 327.943907270721 -11.6377885534749 21.4841158455965 566 S172rl4
+188=432=678 54083.2437836111 329.190983057315 -11.2072657465059 21.4418017690862 566 S172rl4
+188=432=678 54083.2521536111 329.193603742271 -11.2063489101864 21.5944946755739 566 S172rl4
+188=432=678 54087.2456136111 330.474161511362 -10.7560016509593 21.452867907561 566 S172rl4
+188=432=678 54087.2539736111 330.476847038994 -10.755010646581 21.5644644283042 566 S172rl4
+
+The entire input tracklets file is read into memory, then the track IDs are read out
+and emitted as tracks.
+
+=cut
+

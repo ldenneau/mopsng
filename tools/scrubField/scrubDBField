@@ -1,0 +1,191 @@
+#! /usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Carp;
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Copy;
+use File::Basename;
+use File::Temp qw(tempfile tempdir);
+
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+
+use subs qw(
+    scrub
+);
+
+
+my $instance_name;
+my $inst;
+
+my $stationrad_thresh_deg = 0.00026;            # default, about 1.0 arcsec
+my $min_s2n = 5.0;                              # min S/N to accept file
+my $density_perdeg2 = 10000;                    # for density filtering
+my $radius_deg = .010;                          # local radius deg
+my $suffix = 'REMOVED';
+my $fom_sel = 'psf_quality';                        # or 'psf_chi2', or 's2n'
+my $debug;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'min_s2n=f' => \$min_s2n,
+    'density_perdeg2=f' => \$density_perdeg2,
+    'radius_deg=f' => \$radius_deg,
+    'fom=s' => \$fom_sel,
+    'stationrad_thresh_deg=f' => \$stationrad_thresh_deg,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+my @field_ids = @ARGV or pod2usage(-msg => 'No field_ids were specified');
+
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbh = $inst->dbh;
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+
+
+for my $field_id (@field_ids) {
+    my $field;
+
+    if ($field_id =~ /^\d+$/) {
+        $field = modcf_retrieve($inst, fieldId => $field_id);
+    }
+    elsif ($field_id =~ /^o\d+/) {
+        $field = modcf_retrieve($inst, fpaId => $field_id);
+    }
+    else {
+        die "weird field ID: $field_id\n";
+    }
+
+    # Get detections.
+    my $fom_col_str;
+    if ($fom_sel eq 'psf_quality') {
+        $fom_col_str = 'dr.psf_quality';
+    }
+    elsif ($fom_sel eq 'psf_chi2') { 
+        $fom_col_str = 'dr.psf_chi2';
+    }
+    elsif ($fom_sel eq 's2n') {
+        $fom_col_str = 'd.s2n';
+    }
+    else {
+        die "Unknown FOM selector: $fom_sel\n";
+    }
+
+    my @dets;
+    my $ddata = $dbh->selectall_arrayref(<<"SQL", undef, $field->fieldId) or die $dbh->errstr;
+select d.det_id det_id, d.epoch_mjd epoch_mjd, d.ra_deg ra_deg, d.dec_deg dec_deg, d.mag_sigma mag_sigma, $fom_col_str fom
+from detections d join det_rawattr_v2 dr using(det_id)
+where d.field_id=?
+and is_synthetic != 1
+and status in ('I', 'F') /* found or previously removed as dipole */
+SQL
+
+    printf STDERR "Cleaning %s with density %.2f and radius %.2f deg.\n", $field->fpaId, $density_perdeg2, $radius_deg;
+    my $keep = scrub($ddata, $density_perdeg2, $radius_deg);
+    printf STDERR "Filtered %d of %d detections.\n", (scalar @{$ddata} - scalar keys %{$keep}), scalar @{$ddata};
+
+    # Update detections in field.  Loop through all detections, filtered to 'I', otherwise 'F'.
+    my $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+update detections set status=? where det_id=?
+SQL
+
+    # Transactional update of field.
+    $dbh->begin_work or die "can't start transaction: " . $dbh->errstr;
+    eval {
+        my $det_id;
+        foreach my $det (@{$ddata}) {
+            $det_id = $det->[0];
+            if (exists(${$keep}{$det_id})) {
+                $sth->execute('F', $det_id) or die $sth->errstr;
+            }
+            else {
+                $sth->execute('I', $det_id) or die $sth->errstr;
+            }
+        }
+    };
+    if ($@) {
+        $dbh->rollback;
+        die $@;
+    }
+    else {
+        $dbh->commit;
+    }
+}
+exit;
+
+
+sub scrub {
+    # Process the current set of detections in $stuff, send it to the cleaners, and
+    # remove anything that was scrubbed by astroclean.
+    my ($ddata, $density_perdeg2, $radius_deg) = @_;
+
+    # Scrubbage.
+    my $dir = tempdir(CLEANUP => ($debug ? 0 : 1), DIR => '/tmp');
+    chdir $dir or die "can't chdir to $dir";
+    if ($debug) {
+        print STDERR "Working in $dir.\n";
+    }
+
+
+    my ($ac_infh, $ac_infilename) = tempfile(DIR => $dir);
+    my $invfom;     # reciprocal of FOM (figure of merit), for astroclean which selects on "brightness"
+    my %keep;
+    my $det;
+
+    # Note that we pass mag_sigma as the mag.  This is because astroclean selects the "brightest" 
+    # in reducing density, meaning smaller mags.  But we want our FOM to be a quality selector,
+    # so we'll select based on smallest mag_sigma.
+    my ($det_id, $epoch_mjd, $ra_deg, $dec_deg, $obscode, $mag_sigma, $fom);
+    foreach $det (@{$ddata}) {
+        # See query above.
+        ($det_id, $epoch_mjd, $ra_deg, $dec_deg, $obscode, $mag_sigma, $fom) = @{$det};
+        $invfom = 1 / ($fom || 1);                 # high FOM => smaller "brightness"
+        print $ac_infh join(' ', $det_id, $epoch_mjd, $ra_deg, $dec_deg, $invfom, $obscode), "\n";
+    }
+    $ac_infh->close();
+
+    my $OUTTYPE_MITI = 1;
+    my ($ac_outfh, $ac_outfilename) = tempfile(DIR => $dir);
+    $ac_outfh->close();                         # just need filename, not fh
+
+#astroclean file $ac_infilename outtype 1 density 1000 Dradius .0010 proxrad $proxrad_thresh_deg clean_file $ac_outfilename
+    my $cmd = <<"EOF";
+astroclean file $ac_infilename outtype $OUTTYPE_MITI density $density_perdeg2 Dradius $radius_deg clean_file $ac_outfilename > $dir/ac.log
+EOF
+    system($cmd) == 0 or die "command failed: $? : $cmd";
+
+
+    # Read output file into table, return table.
+    $ac_outfh = new FileHandle $ac_outfilename;
+    my $line;
+    my $remainder;
+    my $prefix;
+    while (defined($line = <$ac_outfh>)) {
+        next if $line =~ /^(!|#)/;   # comment, skip
+        chomp $line;
+        ($det_id, $remainder) = split /\s+/, $line, 2;
+        $keep{$det_id} = 1;     # strip leading character to get det ID
+    }
+    $ac_outfh->close();
+
+    unless ($debug) {
+        unlink $ac_infilename;
+        unlink $ac_outfilename;
+        unlink "$dir/ac.log";
+        rmdir $dir or die "can't remove dir $dir";
+    }
+
+    return \%keep;
+}
+
+
+1;

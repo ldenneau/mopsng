@@ -1,0 +1,45 @@
+#!/bin/bash
+
+# Verification test for CR 4.2.4.7 (integration)
+# Mikael Granvik  07/24/2008
+
+USERNAME="granvik"
+TMPDIR="/home/${USERNAME}/tmp"
+STUB="cr_4247_verification"
+
+echo "1..1"
+
+# Make sure all orbits have the same starting epoch:
+if ! propagateOrbits --epoch_mjd=54466 --outfile=$TMPDIR/prop0.tmp < /home/MOPS_DATA/ssm/orbits/testing/cr_4.2.4.7_verification/1000.ssm 2>&1 > /dev/null
+    then
+    echo "not ok 1 - ${STUB}"
+    exit 0    
+fi
+# Propagate orbits and measure CPU time:
+if ! eval time -p propagateOrbits --epoch_mjd=54831 --outfile=$TMPDIR/prop1.tmp < $TMPDIR/prop0.tmp 2> $TMPDIR/cpuusage.tmp
+    then
+    echo "not ok 1 - ${STUB}"
+    exit 0    
+fi
+# Extract user time in sec:
+if ! str=`grep user $TMPDIR/cpuusage.tmp`
+    then
+    echo "not ok 1 - ${STUB}"
+    exit 0
+fi
+#rm -f $TMPDIR/prop[01].tmp $TMPDIR/cpuusage.tmp
+secs=${str:4}
+# Extrapolate CPU time need for the complete population:
+extrap=$((10000 * ${secs/.*}))
+secDAY=86400
+echo Measured $secs secs which was extrapolated to $(($extrap / 86400 )) DAYs
+# Check whether requirement is met:
+if (( "$extrap" < "$secDAY" )) 
+    then
+    echo "ok 1 - ${STUB}"
+    exit 0
+else
+    echo "not ok 1 - ${STUB}"
+    exit 0
+fi
+

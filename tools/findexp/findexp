@@ -1,0 +1,128 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+findexp - Find all occurrences of exposures in all MOPS databases
+
+=head1 SYNOPSIS
+
+findexp [--from_file=FILE] [EXPNAME1 EXPNAME2 ...]
+
+  --from_file=FILE : get exposures from this file instead of command line
+
+=head1 DESCRIPTION
+
+Finds occurrences of exposures in known MOPS databases.
+
+=cut
+
+use strict;
+use warnings;
+use FileHandle;
+use Getopt::Long;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+
+use subs qw(
+);
+
+
+# Start program here.
+my $from_file;
+my $help;
+GetOptions(
+    'from_file=s' => \$from_file,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+
+# Get exposures to search for.
+my @expnames = @ARGV;
+if ($from_file) {
+    my $line;
+    my $fh = new FileHandle $from_file or die "can't open $from_file";
+    while ($line = <$fh>) {
+        next if $line =~ /^#/;      # skip comment
+        push @expnames, split /\s+/, $line;
+    }
+}
+pod2usage(-msg => "No exposures specified.\n") unless @expnames;
+printf STDERR "%d exposures to locate.\n", scalar @expnames;
+
+
+# Setup connect to MOPS DB.
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => 'psmops_export');
+my $dbh = $inst->dbh();
+
+
+# Get list of databases to search.
+my @dbs = <DATA>;
+chomp @dbs;
+
+
+# Now query each DB for exposures.  Make a silly SQL query string for it.
+# For each exposure name, we will make a list of DBs it's in.
+my $sql;
+my $frag = '(' . join(',', map {qq{"$_"}} @expnames) . ')';     # A, B, C => ("A", "B", "C")
+my %expmap;
+my $fpa_id;
+
+foreach my $dbname (@dbs) {
+    $sql = <<"SQL";
+select fpa_id from $dbname.fields where fpa_id in $frag
+SQL
+    my $stuff = $dbh->selectcol_arrayref($sql) or die $dbh->errstr;
+    foreach $fpa_id (@{$stuff}) {
+        push @{$expmap{$fpa_id}}, $dbname;  # add dbname to list for this exposure (FPA_ID)
+    }
+    printf STDERR "Found %d in $dbname.\n", scalar @{$stuff};
+}
+
+
+# Now emit our output.
+foreach $fpa_id (sort keys %expmap) {
+    print join(' ', $fpa_id, @{$expmap{$fpa_id}}), "\n";
+}
+
+exit;
+
+__DATA__
+psmops_ps1_1n4
+psmops_ps1_1n4_sim
+psmops_ps1_1n5
+psmops_ps1_1n5_sim
+psmops_ps1_cnp
+psmops_ps1_comet
+psmops_ps1_demonight_comets
+psmops_ps1_ess_3sigma
+psmops_ps1_lap
+psmops_ps1_m31sts
+psmops_ps1_mdrm
+psmops_ps1_mdrm136
+psmops_ps1_mdrm136_2
+psmops_ps1_mdrm137
+psmops_ps1_mdrm137_09jul
+psmops_ps1_mdrm137_lows2n
+psmops_ps1_mdrm137_lows2n3
+psmops_ps1_mdrm137_magic
+psmops_ps1_mdrm2
+psmops_ps1_mdrm2_sim
+psmops_ps1_mdrm3
+psmops_ps1_mdrm3_sim
+psmops_ps1_nomagic
+psmops_ps1_nomagic_known
+psmops_ps1_nomagic_mss
+psmops_ps1_nomagic_mss2
+psmops_ps1_nomagic_nofilt
+psmops_ps1_nomagic_nofilt_sim
+psmops_ps1_nomagic_oss_cj
+psmops_ps1_nomagic_sim
+psmops_ps1_sas2
+psmops_ps1_sts
+psmops_ps1_v5
+psmops_ps1_v6
+psmops_ps1_v7

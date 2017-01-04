@@ -1,0 +1,61 @@
+Hi Gene and Chris,
+
+I attached a file containing a set of "ground truth" objects to test the trail fitting at the IPP level.
+
+Some columns (IPP) are extracted from the IPP, some (IDL) from Peter's IDL code (and these are what we would like the IPP to achieve), some (MOPS) are the theoretical values we should expect from a perfect observation (the values are obtained through a trail-fitting algorithm).
+
+The columns are the following:
+* fpa_id  - exposure ID (IPP)
+* ra_deg - right ascension as reported by IPP from the PSF fit (IPP diff cmf output)
+* dec_deg - declination as reported by IPP from the PSF fit (IPP diff cmf output)
+* survey_mode - mode of the survey (IPP)
+* filter_id - id of the filter (IPP)
+* PA - position angle in degrees (MOPS), expected position angle of the trail
+* newRA_deg - RA of the centroid from Veres trail fit (IDL)
+* dRA_arcsec - error on RA from Veres trail fit (IDL)
+* newDEC_deg -  DEC of the centroid from Veres trail fit (IDL)
+* dDec_arcsec - error on DEC from Veres trail fit (IDL)
+* flux_fit - flux in the trail by Veres trail fitting  (IDL)
+* flux_error - error on flux_fit by Veres (IDL)
+* L_pix_expected - expected length of the trail (the target of the trail fitting) in pixels (MOPS)
+* Lveres_pix - length of the trailed derived by Veres (IDL)
+* Lerror_pix - error on length by Veres (IDL)
+* theta - position angle of the trail by Veres in degrees (IDL). Note that this could be rotated w/r to PA by 90/180 deg.
+* thera_err - error on theta (IDL)
+* fwhm_fitted - width of the trail (IDL) multiplied by 2.35 (=FWHM)
+* aperture_flux (IDL) - flux measured in a rectangle aperture around the trail minus the total noise in the aperture (modeled from the background from the trail fitting). Length of the aperture = fitted trail length + 3 sigma on both sides of the trails (from width), width of the aperture =  3 sigma of the trail width above and below the trail.
+* nb_bad_pixels - number of blank pixels in the aperture (aperture_flux). Non-zero number means that there are masked pixels on the trail and/or the trail is truncated (IDL).
+* chisq_reduced - reduced chi squared of Veres trail fitting (IDL)
+* mag - magnitude derived by Veres trail fitting (IDL), by using IPP zero point and exposure time
+
+We expect the IPP code to produce the same values as the IDL code. So far, only the IPP position angle approximates the IDL code. In a first stage, to make the comparisons easier, we would like to have the following values (text file please. FITS files will come later):
+* fpa_id  - exposure ID (IPP)
+* ra_deg - right ascension as reported by IPP from the PSF fit (IPP diff cmf output)
+* dec_deg - declination as reported by IPP from the PSF fit (IPP diff cmf output)
+* survey_mode - mode of the survey (IPP)
+* filter_id - id of the filter (IPP)
+* newRA_deg
+* dRA_arcsec
+* newDEC_deg
+* dDec_arcsec
+* flux_fit
+* flux_error
+* Lveres_pix
+* Lerror_pix
+* theta
+* thera_err
+* fwhm_fitted
+* aperture_flux
+* nb_bad_pixels
+* chisq_reduced
+* mag
+We will perform the matching on fpa_id, ra_deg, dec_deg, survey mode, and filter_id so please make sure that your values match ours (if there is any discrepancy, please add a column named "new_<old name>". Please document the columns that you will provide (the best would be to use the same designation as ours).
+I guess that we will have a few iterations (iteration: IPP fixes code; IPP runs code; IPP sends data back; MOPS look at them; MOPS internal discussion; Discussion with IPP). Would you have an estimate on the time required for one iteration (for the steps where the IPP is involved)? We would like to get rid of the trail-fitting problem as soon as possible (and I guess the IPP team would like too).
+If you have any questions or comments about the data, please feel free to ask by e-mail. However, please make sure that all of the members of MOPS (Richard, Larry, Peter, Alan, and me) are in the list of recipients. Same on our side: Keep Gene, Chris, and Ken in the loop. If I forgot anyone, please let me know.
+
+Note: The ground truth data and this e-mail are in configuration under:
+svn+ssh://svnuser@mopshq2.ifa.hawaii.edu/svn/src/trunk/doc/TrailFitting
+Best,
+Serge
+
+

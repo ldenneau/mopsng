@@ -1,0 +1,53 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use FileHandle;
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+
+use PS::MOPS::DataStore::table;
+
+use subs qw(
+);
+
+
+# Start program here.
+my $header;
+my $dump;
+my $help;
+GetOptions(
+    header => \$header,
+    dump => \$dump,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-verbose => 3) unless @ARGV;
+
+my $file;
+foreach $file (@ARGV) {
+    my $t = new PS::MOPS::DataStore::table;
+    $t->openfile($file);
+
+    if ($header) { 
+        print Dumper($t);
+        next;
+    }
+
+    my @stuff;
+
+    unless ($dump) {
+        print join(" ", qw(RA_DEG RA_SIG DEC_DEG DEC_SIG FLUX FLUX_SIG ANG ANG_SIG LEN LEN_SIG)), "\n";
+    }
+
+    while (@stuff = $t->readrecord()) {
+        if ($dump) {
+            print Dumper(\@stuff);
+        }
+        else {
+            print join(" ", map { sprintf "%.3g", $_ } @stuff ), "\n";
+        }
+    }
+}
+

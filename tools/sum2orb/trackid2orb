@@ -1,0 +1,73 @@
+#!/usr/bin/perl
+# quickie to convert .sum linking files to an orbit file.
+
+use strict;
+use warnings;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::Tracklet;
+
+my $inst = new PS::MOPS::DC::Instance DBNAME => undef;
+
+my %linked;
+my %clean;
+my $track_id;
+my @stuff;
+
+
+while (defined($track_id = <>)) {
+    chomp $track_id;
+    my @tracklet_ids = split '=', $track_id;
+    $linked{$track_id}->{$_} = 1 foreach @tracklet_ids;     # add to table tracklets for this track
+}
+
+# Scan all tracks.  Output only clean ones.
+my $orb;
+foreach my $tid (keys %linked) {
+    if ($orb = clean_orb(keys %{$linked{$tid}})) {
+        print join(" ",
+            $orb->q,
+            $orb->e,
+            $orb->i,
+            $orb->node,
+            $orb->argPeri,
+            $orb->timePeri,
+            $orb->hV,
+            $orb->epoch,
+            $tid,
+            '0.000001',
+            'D0',
+        ), "\n";
+    }
+}
+
+
+exit;
+
+
+sub clean_orb {
+    my @tids = @_;
+    my %cleantest;
+
+    # If the list contains only clean tracks, fetch the SSM orbit and return it.
+    my @tracklets = map { modct_retrieve($inst, trackletId => $_) } @tids;
+    # Test cleanliness.
+    my $ssmId;
+    foreach my $t (@tracklets) {
+        $ssmId = $t->ssmId;
+        if (!defined($ssmId)) {
+            return undef;
+        }
+        $cleantest{$ssmId} = 1;
+    }
+
+    if (scalar keys %cleantest == 1) {
+        my $orb = modcs_retrieve($inst, ssmId => $ssmId);
+        return $orb;
+    }
+    
+    return undef;
+}

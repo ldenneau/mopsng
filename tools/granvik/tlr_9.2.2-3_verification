@@ -1,0 +1,123 @@
+#!/bin/bash
+
+username="granvik"
+scriptdir="/home/granvik/scripts"
+gnuplotscript="tlr_9.2.2-3_verification.gp"
+tmpdir="/home/${username}/tmp"
+stub="tlr_922_3_verification"
+instance_name="psmops_${username}_${stub}_$1"
+success=0
+
+#echo $PATH
+#echo $username
+#echo $scriptdir
+#echo $tmpdir
+#echo $stub
+#echo $instance_name
+#exit
+
+echo "1..1"
+
+# Perform MOPS simulation
+
+if ! source /home/${username}/bin/mops_dev \
+    $instance_name &> /dev/null ; then
+#    echo "Cannot initiate database."
+    echo "not ok 1 - ${stub}_$1"
+    exit 0
+fi
+#echo "Initiated database..."
+
+
+
+if ! buildInstance --model=testing/${stub}/$1 \
+    --noprompt --description=${stub}_${1} &> /dev/null; then
+#    echo "Cannot insert synthetic orbits into database."
+    echo "not ok 1 - ${stub}_$1"
+    exit 0
+fi
+#echo "Inserted synthetic orbits to database..."
+
+if ! editConfig --install &> /dev/null ; then
+#    echo "Cannot install config file."
+    echo "not ok 1 - ${stub}_$1"
+    exit 0
+fi
+#echo "Inserted configuration file to database..."
+
+if ! insertSyntheticFields \
+    --rootdir=/usr/local/MOPS_DEV/data/ssm/surveys/main \
+    --filefilt=2008-01-2,2008-0[23] --objfilt=ss &> /dev/null ; then
+#    echo "Cannot insert synthetic sweetspot fields."
+    echo "not ok 1 - ${stub}_$1"
+    exit 0
+fi
+#echo "Inserted synthetic sweetspot fields to database..."
+
+if ! insertSyntheticFields \
+    --rootdir=/usr/local/MOPS_DEV/data/ssm/surveys/main \
+    --filefilt=2008-01-2,2008-0[23] --objfilt=op &> /dev/null ; then
+#    echo "Cannot insert synthetic opposition fields."
+    echo "not ok 1 - ${stub}_$1"
+    exit 0
+fi
+##echo "Inserted synthetic oppostion fields to database..."
+
+#echo "Starting mopper..."
+if ! mopper &> /dev/null ; then
+#    echo "mopper failed."
+    echo "not ok 1 - ${stub}_$1"
+    exit 0
+fi
+#echo "mopper done..."
+
+# Add column first_visible (the first date that an object fulfills the
+# visibility criteria) to table ssm:
+if ! ${scriptdir}/objectsVisible_db --instance=${instance_name} \
+    &> /dev/null ; then
+    echo "not ok 1 - ${stub}_$1"
+    exit 0
+fi
+
+# Calculate number of objects visible/detected as a function of time,
+# and return a data file for plotting and the ratio between objects
+# detected and objects visible at the final date.
+ratio=`$scriptdir/tlr_9.2.2-3_verification.pl --instance=${instance_name} \
+--datafile=${tmpdir}/${stub}_$1_plot.dat`
+if (( ! $? == 0 )) ; then 
+    echo "not ok 1 - ${stub}_$1" 
+    exit 0
+fi
+
+# Delete existing plotting data file
+if ! cp -f ${tmpdir}/${stub}_$1_plot.dat \
+    ${tmpdir}/${stub}_plot.dat &> /dev/null ; then
+    echo "not ok 1 - ${stub}_$1"
+    exit 0
+fi
+
+# Make plot (Note: requires that tlr_922-3_verification_plot.dat be
+#found in ~/tmp/) 
+if ! gnuplot ${scriptdir}/${gnuplotscript} > \
+    ${tmpdir}/${stub}_$1.ps 2> /dev/null ; then
+    echo "not ok 1 - ${stub}_$1"
+    exit 0
+fi
+
+# Delete temporary plotting data file
+if ! rm -f ${tmpdir}/${stub}_plot.dat &> /dev/null ; then
+    echo "not ok 1 - ${stub}_$1"
+    exit 0
+fi
+
+# Show plot
+#ggv $tmpdir/${stub}_$1.ps &
+
+#echo "ratio: $ratio"
+if (( $ratio >= $2 )) ; then
+    echo "ok 1 - ${stub}_$1"
+else
+    echo "not ok 1 - ${stub}_$1"
+fi
+
+exit

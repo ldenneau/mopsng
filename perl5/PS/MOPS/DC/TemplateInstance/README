@@ -1,0 +1,22 @@
+PS/MOPS/DC/TemplateInstance version 0.01
+==================================
+
+This module provides database manipulation services for a
+MOPS Template database.
+
+INSTALLATION
+
+To install this module type the following:
+
+   perl Makefile.PL LIB=$MOPS_HOME/lib/perl5 PREFIX=$MOPS_HOME
+   make
+   make test
+   make install
+
+DEPENDENCIES
+
+    DBD::mysql
+
+COPYRIGHT AND LICENCE
+
+Copyright (C) 2008 Institute for Astronomy, University of Hawaii

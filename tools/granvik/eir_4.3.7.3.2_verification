@@ -1,0 +1,85 @@
+#!/bin/bash
+ 
+# Verification test for EIR 4.3.7.3.2 (ssm shapes size)
+# Mikael Granvik  07/25/2008
+
+USERNAME="granvik"
+STUB="eir_43732_verification"
+INSTANCE_NAME="psmops_granvik_emptysim"
+NSHAPES=1000000
+MYSQLHOST="mops00"
+MYSQLUSER="mops"
+MYSQLPASSWD="mops"
+
+echo "1..1"
+
+# Initialize empty MOPS DB
+source $HOME/bin/mops_env $INSTANCE_NAME
+buildInstance --description "Empty sim" &> /dev/null
+
+# Remove foreign key for field 'ssm_id' from table 'shapes', because
+# it is time consuming to produce a proper table:
+echo \
+"
+drop table if exists shapes;
+create table shapes(
+    shape_id bigint not null auto_increment     comment 'Auto-generated shape ID',
+    ssm_id bigint not null                      comment 'SSM ID of described object',
+    g real                                      comment 'Slope parameter g (dimensionless)',
+    p real                                      comment 'Albedo (dimensionless)',
+    period_d real                               comment 'Period, days',
+    amp_mag real                                comment 'Maximum amplitude (dimensionless)',
+    a_km real                                   comment 'Triaxial diameter a, km',
+    b_km real                                   comment 'Triaxial diameter b, km',
+    c_km real                                   comment 'Triaxial diameter c, km',
+    beta_deg real                               comment 'Rotational pole orientation, deg',
+    lambda_deg real                             comment 'Rotational pole orientation, deg',
+    ph_a real                                   comment 'Phase parameter a (dimensionless)',
+    ph_d real                                   comment 'Phase parameter d (dimensionless)',
+    ph_k real                                   comment 'Phase parameter k (dimensionless)',
+    PRIMARY KEY (shape_id),
+    index(ssm_id)
+) type=InnoDB;
+" | mysql -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME
+
+# Write more than NSHAPES SQL insertion commands to a single string
+str="INSERT INTO shapes() VALUES(); "
+a=1
+while (( a <= $NSHAPES ))
+  do
+  str="$str$str"
+  let a=a*2
+done
+
+# Write the stuff into the table
+echo \
+"
+SET AUTOCOMMIT=0;
+$str
+COMMIT;
+" | mysql -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME
+
+# Count rows in table after insertion
+rows=`echo \
+"
+select
+ count(*)
+from
+ shapes;
+" | mysql -N -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME`
+if [[ $1 == "--result" ]]
+    then
+    echo $rows
+fi
+
+# Check whether the size req is met:
+if (( $rows >= $NSHAPES )) ; then
+    echo "ok 1 - ${STUB}"
+else
+    echo "not ok 1 - ${STUB}"
+fi
+
+# Delete temporary MOPS DB
+buildInstance --remove $INSTANCE_NAME &> /dev/null
+
+exit

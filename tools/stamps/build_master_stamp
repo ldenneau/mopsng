@@ -1,0 +1,136 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+build_master_stamp - populate master stamp table from stamp files
+
+=head1 SYNOPSIS
+
+build_master_stamp [options] [OBJECT_NAMES]
+
+  --help : show this manpage
+
+=head1 DESCRIPTION
+
+Do stuff.
+
+=cut
+
+
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Slurp;
+use FileHandle;
+use Pod::Usage;
+
+# Just a stub for quick debugging.
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::Stamp;
+use PS::MOPS::IPPDB;
+
+
+# Start program here.
+my $instance_name;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => undef);
+my $dbh = $inst->dbh;
+my $inst_dbname = $inst->dbname;
+
+my $lookup_sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select f.fpa_id fpa_id, f.epoch_mjd epoch_mjd, d.ra_deg ra_deg, d.dec_deg dec_deg 
+from detections d join fields f using(field_id) 
+where d.det_id=?
+SQL
+
+my $slookup_sth = $dbh->prepare(<<"SQL") or die $dbh->errstr; 
+select sm.stamp_type stamp_type, sm.status status
+from stamp_master sm
+where dbname=? and det_id=? and stamp_type=?
+SQL
+
+my $insert_sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+insert into stamp_master (
+    stamp_type,
+    status,
+    fpa_id,
+    dbname,
+    det_id,
+    epoch_mjd,
+    ra_deg,
+    dec_deg,
+    path
+)
+values (
+    ?, ?, ?, ?, ?, ?, ?, ?, ?
+)
+SQL
+
+my @stamp_files = <>;
+chomp @stamp_files;
+
+# Loop through all files.
+my ($dbname, $nn, $type, $det_id);
+my $path;
+my $status_success = 'S';
+my $found;
+
+for my $file (@stamp_files) {
+    # Schmush everything in front of "psmops_", then look up detection.
+    $path = $file;
+    $path =~ s|^.*/psmops|psmops|;
+    ($dbname, $nn, $type, $det_id) = $path =~ m|(psmops\w+).*?/(\d+)/([CDW])(\d+)|;
+
+    if ($dbname ne $inst_dbname) {
+        warn "Not processing $det_id, wrong db ($dbname)\n";
+        next;
+    }
+
+    $lookup_sth->execute($det_id) or die $lookup_sth->errstr;
+    my $schtuff = $lookup_sth->fetchrow_hashref;
+    if (!$schtuff) {
+        warn "Didn't find detection for $inst_dbname/$det_id\n";
+        next;
+    }
+
+    # See if we already have a record for this stamp.
+    $slookup_sth->execute($inst_dbname, $det_id, $type) or die $slookup_sth->errstr;
+    $found = $slookup_sth->fetchrow_hashref;
+    if (!$found) {
+        $insert_sth->execute(
+            $type, 
+            $status_success, 
+            $schtuff->{fpa_id}, 
+            $inst_dbname,
+            $det_id,
+            $schtuff->{epoch_mjd}, 
+            $schtuff->{ra_deg}, 
+            $schtuff->{dec_deg},
+            $path,
+        ) or die "Insert failed: " . $insert_sth->errstr;
+        warn "Inserted stamp record for $inst_dbname/$det_id.\n";
+    }
+}
+
+$lookup_sth->finish;
+$slookup_sth->finish;
+$insert_sth->finish;
+
+exit;
+
+
+__DATA__
+/data/mops13.0/stamp-store/stamps/special-stamps/psmops_denneau_test3-auto/55477/D355064.fits
+/data/mops13.0/stamp-store/stamps/special-stamps/psmops_denneau_test3-auto/55477/D149574.fits
+/data/mops13.0/stamp-store/stamps/special-stamps/psmops_denneau_test3-auto/55477/D216740.fits
+/data/mops13.0/stamp-store/stamps/special-stamps/psmops_denneau_test3-auto/55477/D289322.fits
+/data/mops13.0/stamp-store/stamps/special-stamps/psmops_denneau_test3-auto/55477/D163440.fits

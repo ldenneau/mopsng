@@ -1,0 +1,78 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+eff_suite - Generate efficiency data for a night in all filters and stuff in DB.
+
+=head1 SYNOPSIS
+
+eff_suite [options] 
+
+  --nn NN : MOPS night number
+
+=head1 DESCRIPTION
+
+Stuff.
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+use FileHandle;
+
+use PS::MOPS::DC::Instance;
+
+
+my $instance_name;
+my $nn;
+my $sim = 'psmops_ps1_efficiency';      # known sim to compare against
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    'sim=s' => \$sim,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => '--nn NN not specified.') unless $nn;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbname = $inst->dbname();
+my $cfg = $inst->getConfig();
+my $dbh = $inst->dbh();
+
+
+# Get list of filters for the night.
+my @filts = @{$dbh->selectcol_arrayref("select distinct filter_id from fields f where f.nn=$nn")};
+my @cmd;
+foreach my $filt (@filts) {
+    my $dir = $inst->makeNNDir(NN => $nn, SUBSYS => 'efficiency');
+    my $root;
+    chdir $dir or die "can't chdir to $dir";
+
+    $root = "$dbname.$filt.det";
+    cmd("compare_known_dets --instance=$instance_name --nn $nn --filter_match $filt --out $root.compare $sim");
+    cmd("eff_known $root.compare --out $root.eff");
+    cmd("insert_eff --instance=$instance_name --nn $nn --filter $filt --eff_type=DETECTION $root.eff");
+
+    if ($filt eq 'w') {
+        # For w, do tracklet eff and det eff.
+        $root = "$dbname.$filt.trk";
+        cmd("compare_known_tracklets --instance=$instance_name --nn $nn --filter_match $filt --out $root.compare $sim");
+        cmd("eff_known $root.compare --out $root.eff");
+        cmd("insert_eff --instance=$instance_name --nn $nn --filter $filt --eff_type=TRACKLET $root.eff");
+    }
+
+}
+exit;
+
+
+sub cmd {
+    my $cmd_str = shift;
+    my @cmd = split /\s+/, $cmd_str;
+    system(@cmd) == 0 or die "$cmd_str: $?";
+}

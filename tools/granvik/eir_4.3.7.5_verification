@@ -1,0 +1,69 @@
+#!/bin/bash
+ 
+# Verification test for EIR 4.3.7.5 (ssm write access)
+# Mikael Granvik  07/24/2008
+
+USERNAME="granvik"
+STUB="eir_4375_verification"
+TMPDIR="/home/${USERNAME}/tmp"
+INSTANCE_NAME="psmops_granvik_emptysim"
+SCRIPTDIR="/home/granvik/MOPS/granvik"
+NSSM=10000
+MYSQLHOST="mops00"
+MYSQLUSER="mops"
+MYSQLPASSWD="mops"
+
+echo "1..1"
+
+# Initialize empty MOPS DB
+source $HOME/bin/mops_env $INSTANCE_NAME
+buildInstance --description "Empty sim" &> /dev/null
+
+# Write $NSSM SQL insertion commands to a single string
+str=" "
+for ((a=1 ; a <= $NSSM ; a++))
+  do
+  substr="INSERT INTO ssm(object_name) VALUES($a); "
+  str="$str$substr"
+done
+
+# Write the stuff into the ssm table and time the process
+tim1=`date +"%s.%N"`
+echo \
+"
+SET AUTOCOMMIT=0;
+$str
+COMMIT;
+" | mysql -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME
+tim2=`date +"%s.%N"`
+
+# Count rows in table after insertion
+rows=`echo \
+"
+select
+ count(*)
+from
+ ssm;
+" | mysql -N -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME`
+
+# Compute output time and convert to integer so that poor Bash
+# understands what we want:
+tim=`echo "$tim2 - $tim1" | bc`
+speed=`echo "$rows / $tim" | bc`
+speed=${speed/.*/}
+if [[ $1 == "--result" ]]
+    then
+    echo $speed
+fi
+
+# Check whether the all/s criterion is met:
+if (( $speed > "1000" )) ; then
+    echo "ok 1 - ${STUB}"
+else
+    echo "not ok 1 - ${STUB}"
+fi
+
+# Delete temporary MOPS DB
+buildInstance --remove $INSTANCE_NAME &> /dev/null
+
+exit

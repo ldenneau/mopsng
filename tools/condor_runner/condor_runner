@@ -1,0 +1,12 @@
+#!/bin/sh
+
+# This is a utility shell script for use in a Condor environment that simply
+# executes the specified input file.  For why, you say? Well, when we are
+# distributing a pile of shell scripts that have slightly different invocations
+# (e.g., different field ID for each script), then this is how we do it.
+#
+# The master program, e.g. LODCTL, writes out N files (0..N-1), each containing
+# the script to be run.  condor_runner becomes the Condor command, then each of
+# the 0..N-1 files as file args.
+
+/bin/sh $1

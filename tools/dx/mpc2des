@@ -1,0 +1,87 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+ 
+mpc2des - Convert MPC observation files to DES
+ 
+=head1 SYNOPSIS
+ 
+mpc2des [options] < FILE.MPC > FILE.DES
+
+  --sigma=SIGMA_ARCSEC : specify RA/DEC uncertainties in arcsec; 1.0 is default
+
+=head1 DESCRIPTION
+
+Converts MPC-formatted files to OrbFit DES format.
+
+=cut
+
+use strict;
+use warnings;
+
+use Pod::Usage;
+use Getopt::Long;
+
+use Astro::Time;
+use PS::MOPS::DX;
+use PS::MOPS::MPC qw(:all);
+
+my $pos_sigma_arcsec = 1.0;
+my $mag_sigma = 0.1;
+my $s2n = 5;
+my $help;
+GetOptions(
+    'pos_sigma_arcsec=f' => \$pos_sigma_arcsec,
+    'mag_sigma=f' => \$mag_sigma,
+    's2n=f' => \$s2n,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+
+
+my $detn = 1;
+my $NO_SECRET_NAME = 'NONE';
+my $line;
+my $done_header;
+my $last_id;
+while ($line = <>) {
+    # Convert a MPC hash into miti, converting the time, RA and DEC
+    # representations.  Return a hashref containing the MITI fields.
+    my $href = mpc_split($line);
+
+    my %stuff = %{$href};
+    my ($d, $m, $y, $ut) = PS::MOPS::MPC::_datestr2dmyu($stuff{DATE});
+    my $ID = $stuff{DESIGNATION} || $stuff{NUMBER};
+    my $EPOCH_MJD = cal2mjd($d, $m, $y, $ut);
+    my $RA_DEG = PS::MOPS::MPC::_rastr2ra_deg($stuff{RA});
+    my $DEC_DEG = PS::MOPS::MPC::_decstr2dec_deg($stuff{DEC});
+    my $MAG = $stuff{MAG};
+    my $FILT = $stuff{BAND};
+    my $OBSCODE = $stuff{OBSERVATORY};
+
+    if (!$last_id or $ID ne $last_id) {
+        $last_id = $ID;
+    }
+
+    if (!$done_header) {
+        print $PS::MOPS::DX::header_DETECTION, "\n";
+        $done_header = 1;
+    }
+
+    print join(' ', 
+        $ID,
+#        (sprintf "S%06d", $detn++),
+        $EPOCH_MJD,
+        $PS::MOPS::DX::OBS_TY_OPTICAL,
+        $RA_DEG,
+        $DEC_DEG,
+        $MAG,
+        $FILT,
+        $OBSCODE,
+        $pos_sigma_arcsec,
+        $pos_sigma_arcsec,
+        $mag_sigma,
+        $s2n,
+        $NO_SECRET_NAME,
+    ), "\n";
+}   

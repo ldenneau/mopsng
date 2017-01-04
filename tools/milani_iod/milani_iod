@@ -1,0 +1,242 @@
+#!/usr/bin/env python
+#
+# milani_iod
+# F. Pierfederici <fpierfed@lsst.org>
+#
+#
+# Prepare input files for Milani's code and then invoke it on those files. This
+# is written to be a drop-in replacement for mops_iod.
+#
+# Usage: milani_iod tracksFile
+#
+import os
+import re
+import sys
+
+
+def execute(cmd, quiet=True):
+    """
+    Given a shell command, execute it. Raise IOError exception if the status
+    code of the command is anything but 0 (zero).
+    If quiet=True then all output from the command is sent to /dev/null
+    """
+    # TODO: implement process monitoring.
+    sys.stderr.write('Executing %s\n' % cmd)
+    if(quiet):
+        cmd += ' >& /dev/null'
+    err = os.system(cmd)
+    if(err):
+        raise(IOError('Execution of "%s" failed (status code %d).' % (cmd,
+                                                                      err)))
+    return
+
+def miti2dxIOD(root):
+    """
+    Given a set of IOD input files in MITI format and root name @param root,
+    convert them in DX format sitable as input to Milani's IOD code.
+    """
+    # FIXME: Make sure that all the necessary files are there.
+    EXE = 'dxlt2iodreq'
+    execute('%s %s.sum' % (EXE, root))
+    return
+
+def doIOD(root):
+    """
+    Given the root name of input files in DX format, invoke Milani's IOD code on
+    those.
+    """
+    # FIXME: Make sure that all the necessary files are there.
+    EXE = 'orbit_server.x'
+    execute('echo %s | %s' % (root, EXE))
+    return
+
+def getResiduals(root):
+    """
+    Given the root name of input files in DX format, read the .ident_header file and
+    load residuals for identifications with PRELIM orbits.
+
+    There may be multiple residuals for a single ID, corresponding to multiple
+    solutions.  So we need to construct a table that stores each residual
+    in the order that the orbits appear in the .orbit file.  For each solution
+    in .orbit, the residuals appear in the same order in the .ident_header
+    file, but left-to-right in the PARAMS section.
+    """
+    # FIXME: Make sure that all the necessary files are there.
+    ident_data = file('%s.out.ident_header' % (root)).readlines()
+    resids_tbl = {}
+    best_resid_tbl = {}
+
+    for line in ident_data:
+        if re.match(r'!!', line):
+            continue        # comment, skip
+        if re.search(r'\bORBIT\b', line):    # want ORBIT opcode out indicating successful computation
+            fields = line.split()
+            id = fields[0]
+            resids = map(lambda x: float(x), filter(lambda x: float(x), fields[-4:]))        # non-zero residuals 4th from last to end (all PARAMS values)
+            resids_tbl[id] = resids     # store entire list
+
+            # Now locate the lowest resid and store its index as the best resid for this orbitID.
+            best_idx = 0
+            best_resid = resids[0] 
+            idx = 1
+            for r in resids[1:]:
+                if r < best_resid: 
+                    best_resid = r
+                    best_idx = idx
+                idx += 1
+
+            best_resid_tbl[id] = best_idx                   # store index of best resid for this ID in table 
+        
+    return resids_tbl, best_resid_tbl
+
+def dx2mitiIOD(root, writeToFile=False, residsTable={}, bestResidTable={}):
+    """
+    Given the root name of the output of Milani's IOD code in DX format, convert
+    those files into MITI format.
+
+    writeToFile=False means write to STDOUT, otherwise write to root.iods
+    """
+    # TODO: Use the perl libraries that Larry wrote for the conversion.
+    # We are interested in the root.out.orbit file and we want to produce a
+    # root.iods file with the same content, but in MITI MIF-O format.
+    dxData = file('%s.out.orbit' % (root)).readlines()
+    mitiData = []
+
+
+    """
+    Scan the input.  We should already have a table of the residuals
+    obtained from getResiduals().  We will need to keep a temporary
+    index for each ID so that we can fetch the correct residual from
+    the residuals table.  See the above note in getResiduals() regarding the format
+    of residuals in the .ident_header file.
+    """
+    last_id = ''            # to test when we scan a new OID
+    tmp_idx =  0            # enumerator for each orbit per ID
+    for line in dxData:
+        if(line[:2] == '!!'):
+            # It is a comment!
+            continue
+
+        if re.search(r'\*\*', line):
+            # constrained orbit, can't handle for now
+            continue
+
+        # Split the line into space separated tokens.
+        (orbitID,
+         orbit_type,        # 'COM' or 'COT'; can only handle 'COM' for now
+         q,
+         e,
+         i,
+         Omega,
+         argPeri,
+         tPeri,
+         absMag,
+         epoch,
+         orb_index,
+         n_par,
+         moid,
+         compcode) = line.strip().split()
+
+        if orbit_type != 'COM':
+            raise RuntimeError("got an unknown orbit type: " + orbit_type)
+
+        # Test the orbit ID.  If it's a new ID, reset tmp_idx to zero, otherwise 
+        # increment tmp_idx so we can look up the correct residual in resids_tbl.
+        if orbitID != last_id:
+            tmp_idx = 0
+        else:
+            tmp_idx += 1
+        last_id = orbitID
+
+        # Create the corresponding MITI MIF-O line.
+        # FIXME:
+        convCode = 'I'
+
+        # Get the residual from the resids table.  If it's not there, punt.
+        best_idx = bestResidTable.get(orbitID, -1)
+        if best_idx >= 0 and best_idx == tmp_idx:
+            residual = residsTable[orbitID][best_idx]
+        else:
+            continue                            # no info in resids tables, so don't emit anything
+
+
+        # Prep some values before writing out orbit.
+        chiSquared = 'undef'                    # IOD, so don't have this
+        arcLength_days = 'undef'                # don't have this either
+
+        mitiOrbit = ['MIF-O',
+                     orbitID,
+                     q,
+                     e,
+                     i,
+                     Omega,
+                     argPeri,
+                     tPeri,
+                     epoch,
+                     absMag,
+                     "%.10f" % residual,
+                     chiSquared,
+                     moid,
+                     arcLength_days,
+                     convCode]
+        mitiLine = ' '.join((mitiOrbit)) + '\n'
+        mitiData.append(mitiLine)
+
+    # Write everything to the root.iods file or STDOUT depending on writeToFile.
+    if(writeToFile):
+        out = file('%s.iods' % (root), 'w')
+        map(lambda x: out.write(x), mitiData)
+        out.close()
+    else:
+        print(''.join(mitiData)),               # trailing comma => no ending newline
+    return
+
+
+
+
+
+
+
+if(__name__ == '__main__'):
+    import optparse
+
+
+    # Get user input (tracks file) and make sure that it exists.
+    parser = optparse.OptionParser('usage: milani_iod JOBNAME')
+    (options, args) = parser.parse_args()
+    if(len(args) != 1):
+        parser.error('incorrect number of arguments')
+
+
+    # Previous usage required JOBNAME.tracks as the file argument.  If our
+    # JOBNAME has '.tracks' appended, support this usage.
+    if re.search(r'\.tracks$', args[0]):
+        tracksFile = args[0]
+    else:
+        # Determine working directory and tracksFile root name.
+        tracksFile = args[0] + '.tracks'
+    if not os.path.isfile(tracksFile):
+        parser.error('%s: no such file or directory' % tracksFile)
+
+    workingDirectory = os.path.dirname(tracksFile)
+    (rootName, extension) = os.path.splitext(os.path.basename(tracksFile))
+
+    # Move to the working directory.
+    if(workingDirectory not in ('', '.')):
+        os.chdir(workingDirectory)
+
+    # Convert the MITI files into DX (i.e. Milani's) format.
+# Skip, DES manifest written by precov/attr now.
+#    miti2dxIOD(rootName)
+
+    # Invoke Milani's IOD code
+    doIOD(rootName)
+
+    # Get residuals from .ident_header file.
+    residsTable, bestResidTable = getResiduals(rootName)
+
+    # Convert the output back into MITI format.
+    dx2mitiIOD(rootName, residsTable=residsTable, bestResidTable=bestResidTable)
+
+    # Cleanup and exit.
+# <-- end if

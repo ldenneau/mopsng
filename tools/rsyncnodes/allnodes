@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# Execute a command on all MOPS cluster nodes.
+
+
+# Get the list of Condor nodes from the Condor configuration, as follows:
+# 1. Get the hosts listed in HOSTALLOW_WRITE in the Condor configuration.  This line
+#   will have the format 'HOSTALLOW_WRITE=host1, host2, host3'
+# 2. Strip leading whitespace
+# 3. Strip trailing whitespace
+# 4. Strip everything through the assigment operator
+# 5. Strip commas
+# 6. Convert whitespace to returns
+# 7. Remove the master host from the list
+MASTER_HOST=`hostname`
+NODES=`grep '^HOSTALLOW_WRITE ' /etc/condor/condor_config | sed 's/^ *//; s/ *$//; s/^.*=//; s/,/ /g; s/  */\n/g' | grep -v $MASTER_HOST`
+
+for node in $NODES
+do
+    ssh mops@${node} $*
+done

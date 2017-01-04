@@ -1,0 +1,130 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Efficiency;
+
+# Start program here.
+my $inst;
+my $instance_name;
+my $category = 'A';
+my $epoch_mjd;
+my $ocnum;
+my $binsize = 0.1;
+my $terminal = '';
+my $xrange = 10.0;
+my $xsize = 1024;
+my $ysize = 768;
+my $title = "";
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'category=s' => \$category,
+    'epoch_mjd=f' => \$epoch_mjd,
+    'ocnum=f' => \$ocnum,
+    'binsize=f' => \$binsize,
+    'terminal=s' => \$terminal,
+    'title=s' => \$title,
+    'xrange=f' => \$xrange,
+    'xsize=s' => \$xsize,
+    'ysize=s' => \$ysize,
+    help => \$help,
+) or pod2usage(2);
+
+# Scrub opts.
+$terminal = 'postscript solid' 
+    if ($terminal eq 'postsscript' or $terminal eq 'eps');
+$terminal = 'postscript enhanced color solid' 
+    if ($terminal eq 'postscriptc' or $terminal eq 'epsc');
+
+my $size_str = '';
+if ($terminal eq 'png') {
+    $size_str = "size $xsize, $ysize font arial 12"
+}
+
+
+print <<"EOF" if $terminal;
+set fontpath "/usr/lib/X11/fonts/TTF"
+set terminal $terminal $size_str
+EOF
+
+my $buf = '';
+my $numclean = 0;
+my $numunfound = 0;
+my $x0;
+my $n;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $stuff = modce_retrieve($inst, 
+    category => $category, 
+    attrEphemerisDistances => 1, 
+    epoch_mjd => $epoch_mjd,
+    ocnum => $ocnum,
+)
+;
+my $clean_hist = mopslib_histogram(data => $stuff->{CLEAN}, binsize => $binsize, hmax => $xrange);
+#my $unfound_hist = mopslib_histogram(data => $stuff->{UNFOUND}, binsize => 0.1);
+my $unfound_hist = mopslib_histogram(data => $stuff->{UNFOUND}, binsize => $clean_hist->{binsize}, hmax => $xrange);
+
+$x0 = $unfound_hist->{min};
+$n = 0;
+foreach my $x (@{$unfound_hist->{hist}}) {
+    $buf .= join(" ", $x0 + $n * $unfound_hist->{binsize}, $x) . "\n";
+    $n++;
+}
+$numunfound = scalar @{$stuff->{UNFOUND}};
+$buf .= "e\n";
+
+$x0 = $clean_hist->{min};
+$n = 0;
+foreach my $x (@{$clean_hist->{hist}}) {
+    $buf .= join(" ", $x0 + $n * $clean_hist->{binsize}, $x) . "\n";
+    $n++;
+}
+$numclean = scalar @{$stuff->{CLEAN}};
+$buf .= "e\n";
+
+#set terminal postscript enhanced color solid
+    my $date_str = "";
+    if ($epoch_mjd) {
+        $date_str = ", $epoch_mjd";
+    }
+    elsif ($ocnum) {
+        $date_str = ", OC $ocnum";
+    }
+
+    print <<"EOF";
+set title '${title}Attribution Ephemeris Distance Summary$date_str
+set xrange [0:$xrange]
+set xlabel 'Attribution Ephemeris Distance, arcseconds'
+set ylabel 'Number'
+plot \\
+"-" using 1:2 title 'Fail Attribution ($numunfound)' with boxes,\\
+"-" using 1:2 title 'Pass Attribution ($numclean)' with boxes
+EOF
+
+print $buf;
+
+
+=head1 NAME
+
+effhistplot - Plot historgrams of orbit residuals from a specified
+period of efficiency data
+
+=head1 SYNOPSIS
+
+effhistplot [options]
+
+  category C : select D/A/P/I/R data, default D (derivations)
+  epoch_mjd EPOCH : use only data from night of EPOCH_MJD, otherwise all
+
+=head1 DESCRIPTION
+
+Obtains residual data for specified category and period of efficiency
+data, and plots simultaneous histograms.
+
+=cut

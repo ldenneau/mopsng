@@ -1,0 +1,329 @@
+#!/usr/bin/env perl
+# $Id$
+
+=pod
+
+=head1 NAME
+
+synth - Generate synthetic detections for newly ingested MOPS fields
+
+=head1 SYNOPSIS
+
+synth --nn=NIGHTNUM [--help]
+
+  --nn NIGHTNUM : process night NIGHTNUM
+  --nobuild : don't execute makefiles
+  --debug : test mode; don't modify DB, don't execute makefiles, dump stuff
+  --help : show man page
+  --run : id of the run that synth is a part of. This parameter is used by the 
+          mopper script and should not be specified when manually running synth
+          unless you know the run id that should be used.
+
+=head1 DESCRIPTION
+
+SYNTH retrieves newly ingested fields (status 'N') from the MOPS database
+and generates synthetic detections for those fields.  Generation of 
+synthetic detections is a multi-stop process:
+
+  * Retrieve SSM definitions
+  * Compute "coarse" ephemerides + fieldProximity
+  * Compute "fine" ephemerides + insert
+  * Detectability (live-pixel server) query
+
+=head1 EXIT VALUE
+
+SYNTH exits as follows:
+
+  0 - successfully processed some fields
+  other - internal failure
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Slurp;
+use Cwd;
+use Params::Validate;
+
+#use PS::MOPS::MITI;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+
+
+use subs qw(
+    get_fields
+    make_makefile
+    run_makefile
+    mark_fields
+    clean_up
+);
+
+
+my $inst;
+my $instance_name;
+my $nn;
+my $nobuild;
+my $debug;
+my $run_id;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    'run=i' => \$run_id,
+    nobuild => \$nobuild,
+    debug => \$debug,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => '--nn=NIGHTNUM must be specified.') unless $nn;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+
+# Cluster concurrency.  If config concurrency is set, specify --num for nsplit; otherwise
+# let nsplit decide.
+my $concurrency = $mops_config->{synth}->{concurrency} || $mops_config->{cluster}->{concurrency} || 8;
+my $concurrency_str = $concurrency ? "--num $concurrency" : "";
+
+# High-confidence S2N cutoff.  There may be synthetic low confidence data in the
+# database, which we'll ignore.
+my $s2n_cutoff = $mops_config->{site}->{limiting_s2n} || die "can't get site->limiting_s2n";
+my $low_confidence_s2n = $mops_config->{site}->{low_confidence_s2n} || $s2n_cutoff; # default to HC S/N for now
+#my $low_confidence_s2n = $mops_config->{site}->{low_confidence_s2n} || die "can't get site->low_confidence_s2n";
+#
+my $gmt_offset_hours = $mops_config->{site}->{gmt_offset_hours};
+$mops_logger->logdie("can't determine gmt_offset_hours") unless defined($gmt_offset_hours);
+my $nightnum;
+my $ocnum;
+my $dir;
+my $makefile;
+my $t0 = time;
+
+$mops_logger->info("Starting SYNTH $nn.");
+
+eval {
+    my @fields = get_fields($nn);
+    if (@fields) {
+        $ocnum = $fields[0]->ocnum;
+
+        $mops_logger->info(sprintf "Fetched %d fields for night $nn.", scalar @fields);
+
+        ($dir, $makefile) = make_makefile(
+            ocnum => $ocnum, 
+            nightnum => $nn,
+            fields => \@fields,
+            run => $run_id
+        );
+
+        # Update process status.
+        $0 = sprintf "SYNTH %s %03d %.6f", $inst->dbname, $ocnum, $nn;
+
+        if (run_makefile($dir, $makefile)) {
+            die "Processing failed for night $nn";
+        }
+        clean_up();
+    }
+    else {
+        # Update process status.
+        $0 = sprintf "SYNTH %s (idle)", $inst->dbname;
+        $mops_logger->info("No fields to process.");
+    }
+};
+
+$mops_logger->logdie($@) if $@;
+$mops_logger->info(
+    mopslib_formatTimingMsg(
+        subsystem => 'SYNTH',
+        time_sec => (time - $t0),
+        nn => $nn,
+    )
+);
+exit;
+
+
+sub get_fields {
+    my $field;
+    my @fields;
+
+    my $field_i = modcf_retrieve($inst, nn => $nn, status => $FIELD_STATUS_READY);
+    while ($field = $field_i->next()) {
+        push @fields, $field;
+    }
+    return @fields;
+}
+
+
+sub make_makefile {
+    # Create makefile; return path to this file.
+    my %args = validate(@_, {
+        ocnum => 1,
+        nightnum => 1,
+        fields => 1,
+        run => 0,
+    });
+
+    my ($ocnum, $nightnum, $run) = @args{qw(ocnum nightnum run)};
+    my $model = $inst->dbname;
+
+    my $coarse_method = $mops_config->{synth}->{method} || 'perturbed';
+    my $obscode = $mops_config->{site}->{obscode} 
+        or $mops_logger->logdie("observatory code unspecified");
+    my $limiting_mag = $mops_config->{site}->{limiting_mag} 
+        or $mops_logger->logdie("site limiting_mag unspecified");
+    my $field_size_deg2 = $mops_config->{site}->{field_size_deg2} 
+        or $mops_logger->logdie("couldn't get field_size_deg2");
+    my $field_shape = $mops_config->{site}->{field_shape} || 'circle';
+    my $fov_deg;
+    if ($field_shape eq 'circle') {
+        $fov_deg = 2 * sqrt($field_size_deg2 / $PI) * 1.2;       # 1.2 = "extra" factor
+    }
+    else {
+        $fov_deg = sqrt($field_size_deg2) * 1.44 * 1.2;         # 1.4 = diagonal dist; 1.2 = slop factor
+    }
+
+    my $lm1 = $limiting_mag + 1.0;          # cutoff mag for coarse ephem calc
+    if ($low_confidence_s2n) {
+        $lm1 += 1.0;                        # include lots extra for 3-sigma dets
+    }
+
+    my $dir = $inst->makeNNDir(NN => $nightnum, SUBSYS => 'synth', FORCE_EMPTY => 1);
+
+    my $file = join('/', $dir, "Makefile.$nightnum");
+    my $objectsdir = $inst->getEnvironment('OBJECTSDIR');
+    system("mkdir -p '$objectsdir'") == 0 or $mops_logger->logdie("mkdir -p $objectsdir failed: $?");
+    my $ssm_sentinel = "$objectsdir/sentinel";
+
+    # Determine MJDs for coarse ephems.
+    my $mjd = mopslib_nn2mjd($nightnum, $gmt_offset_hours) + 0.5;     # midnight MJD of night $nightnum
+    my ($e0, $e1, $e2) = ($mjd - 1, $mjd, $mjd + 1);
+
+    # Determine where to read SSM from.
+    my $ssm_dir;
+    if (-e join('/', $objectsdir, "current", "sentinel")) {
+        $ssm_dir = join('/', $objectsdir, "current");
+    } else {
+        $ssm_dir = $objectsdir;
+    }
+    # Set up run options used for updating runs table
+    my $run_opt = ($run) ? "--run $run" : "";
+    my $MAKEFILE_TEMPLATE = <<"EOF_MAKEFILE";
+# Auto-generated makefile by SYNTH 
+# Edit at your own peril!
+#
+# This makefile will:
+#   1. retrieve the Solar System Model (SSM) from the target simulation and write 
+#      it to disk if ssm_sentinel file does not exist.
+#
+#   2. create a file that lists all of the fields that were imaged during the
+#      night.
+#
+#   3. using the SSM and the list of fields imaged during the night as input 
+#      calculate an coarse ephemeris of all of the SSM object and determine
+#      which of those objects fall close to an imaged field. The field proximity
+#      file will list all of the fields that may contain an object from the SSM
+#
+#   4. merges all low-significance detections (LSDs) into the LSD archive for 
+#      the current night.
+#
+#   5. calls syntheph which uses the field proximity file which consists of 
+#      field ID-object name pairs indicating which synthetic objects appear near 
+#      various fields to compute precise positions for these synthetic objects at 
+#      the time the image of the field was made and inserts those synthetic 
+#      objects that actually lie within their near-fields into the simulation 
+#      database.
+.PHONY : all
+.SUFFIXES : .dets .syn .trk .pairs
+
+# Night number that we are processing.
+NIGHTNUM = $nightnum
+
+# .trk = database insert of tracklets
+# .syn = database insert of synthetic detections
+# .fd = database insert of false detections
+#all : $nightnum.ins $nightnum.fd
+$nightnum.done : $nightnum.lsdexport
+
+$nightnum.lsdexport : $nightnum.syn
+	lsd --nn $nightnum merge
+
+
+# Synthetic detections.  Requires FieldProximity files which lists the Solar 
+# System Model objects that are close to a particular field.
+$nightnum.syn : $nightnum.fp
+# Now this is done in ephem_pipeline.
+	syntheph $nightnum $nightnum.fp $nightnum.fields $run_opt
+	touch $nightnum.syn
+
+
+# List of fields for the night.
+# The format of the fields file is as follows:
+#   Field_ID    Epoch   Right Accension     Declination     Field_Radius_Degrees(optional)
+$nightnum.fields :
+	catFields --status=N --nn $nightnum --radius_deg $fov_deg > $nightnum.fields
+
+# Generate coarse ephemerides and fieldProximity for the night.
+# The format of the fields proximity file is as follows:
+#   Field_Id    Solar_System_Model_Object_Name
+$nightnum.fp : $ssm_sentinel $nightnum.fields
+	ln -s -f $ssm_dir/ssm.* .
+	coarse \\
+		--fieldsfile=$nightnum.fields \\
+        --method $coarse_method \\
+		--epoch $mjd --obscode $obscode --delta_mjd 1.0 --limiting_mag $lm1 --out $nightnum.fp \\
+		ssm.*
+
+
+# Solar system model.  Usually generated only once, but check anyway.
+$ssm_sentinel:
+	catOrbits --format=MITI --ssm | nsplit --basename $objectsdir/ssm --num $concurrency && touch $ssm_sentinel
+EOF_MAKEFILE
+
+
+    write_file($file, $MAKEFILE_TEMPLATE);
+    $mops_logger->info("Created makefile $file.");
+
+    return $dir, $file;
+}
+
+
+sub run_makefile {
+    return if $debug or $nobuild;
+
+    my ($dir, $makefile) = @_;
+    my $oldwd = getcwd;
+    my $ret;                # return code
+
+    eval {
+        chdir $dir or die "can't chdir to $dir";
+        $ret = system('make', '--quiet', '-f', $makefile);
+    };
+
+    $mops_logger->die($@) if $@;
+    chdir $oldwd;
+
+    return $ret;
+}
+
+
+sub mark_fields {
+    return if $debug;
+
+    my ($fref, $status) = @_;
+    $mops_logger->info("Marking fields as $status.");
+    foreach my $field (@$fref) {
+        $field->status($status, $run_id);
+    }
+}
+
+
+sub clean_up {
+    # Cleanup old files.
+    $mops_logger->info("Cleaning up.");
+}

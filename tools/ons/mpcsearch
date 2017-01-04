@@ -1,0 +1,110 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+use Pod::Usage;
+use FileHandle;
+use Astro::SLA;
+use Math::Trig;
+
+=head1 NAME
+
+mpcsearch - Search MPC orbits for asteroids near a position
+
+=head1 SYNOPSIS
+
+mpcsearch ORBITS.DES ID OBSCODE EPOCH_MJD_UTC RA_DEG DEC_DEG RADIUS_ARCSEC
+
+  ORBITS.DES : DES file containing orbits to search
+  ID : identifier for this ONS tracklet
+  OBSCODE : observatory for prediction
+  EPOCH_MJD_UTC, RA_DEG, DEC_DEG : time and position to search
+  RADIUS_ARCSEC : search radius in arcseconds
+
+mpcsearch ORBITS.DES FILE RADIUS_ARCSEC
+
+  ORBITS.DES : DES file containing orbits to search
+  FILE : single file containing output of filterons
+  RADIUS_ARCSEC : search radius in arcseconds
+
+=head1 DESCRIPTION
+
+Search the specified catalog (numbered + multiopp usually) for objects close to a specified
+position and radius.  The output is the
+
+  TRACKLET_ID
+  ASTEROID_DESIG
+  OBSCODE
+  EPOCH
+  RA_DEG
+  DEC_DEG
+  VMAG
+  DISTANCE_ARCSEC
+
+of objects falling within the search radius for the specified time and position.
+
+If the second invocation option is used (ORBITS.DES FILE), then the time, obscode
+and position are obtained from the first line of the file.
+
+=cut
+
+
+my $cmd;
+my ($orbits_file, $tid, $obscode, $epoch_mjd_utc, $ra_deg, $dec_deg, $radius_arcsec);
+my $done_header = 0;
+
+if (@ARGV == 3) {
+    my $onsfile;
+    ($orbits_file, $onsfile, $radius_arcsec) = @ARGV;
+    # Get from file.
+    my $foo = new FileHandle $onsfile or die "can't open $onsfile";
+    my $line = <$foo>;
+    my @stuff = split /\s+/, $line;
+    # SW4001 52584.357020 49.12575 14.94556 16.5 V 691 -24.9 173.0 0.397
+    ($tid, $epoch_mjd_utc, $ra_deg, $dec_deg, $obscode) = @stuff[0, 1, 2, 3, 6];
+}
+elsif (@ARGV == 7) {
+    ($orbits_file, $tid, $obscode, $epoch_mjd_utc, $ra_deg, $dec_deg, $radius_arcsec) = @ARGV;
+}
+else {
+    pod2usage(-verbose => 2);
+}
+
+my $search_ra_rad = deg2rad($ra_deg);
+my $search_dec_rad = deg2rad($dec_deg);
+my $radius_rad = deg2rad($radius_arcsec / 3600);
+
+# Temp file name for elements propagation.
+my $proptmp = sprintf("prop.%.6f.des", $epoch_mjd_utc);
+
+# First propogate our orbits to the specified UTC MJD.
+$cmd = "oorb --conf=/home/mops/MOPS_DEVEL/config/oorb.conf --task=propagation --epoch-mjd-utc=$epoch_mjd_utc --orb-in=$orbits_file --orb-out=$proptmp";
+print STDERR "Executing: ", $cmd, "\n";
+system($cmd) == 0 or die "$?: $cmd";
+
+# Get ephemerides for propagated orbits.  For each ephemeris we get, scan for proximity to
+# our search position.  If the prediction is within the radius, emit some information.
+$cmd = "oorb --conf=/home/mops/MOPS_DEVEL/config/oorb.conf --task=ephemeris --obscode=F51 --orb-in=$proptmp";
+print STDERR "Executing: ", $cmd, "\n";
+my $fh = new FileHandle "$cmd|" or die "can't create filehandle for $cmd";
+my ($out_desig, $out_obscode, $out_epoch_mjd, $out_ra_deg, $out_dec_deg, $out_mag);
+my $dist_rad;
+
+while (my $line = <$fh>) {
+    next if $line =~ /^#/;  # comment line
+    chomp $line;
+    my @stuff = split /\s+/, $line;
+
+    # Only care about RA, DEC, MAG.
+    ($out_desig, $out_obscode, $out_epoch_mjd, $out_ra_deg, $out_dec_deg, $out_mag) = @stuff[0, 1, 2, 4, 5, 9];
+    $dist_rad = slaDsep($search_ra_rad, $search_dec_rad, deg2rad($out_ra_deg), deg2rad($out_dec_deg));
+    if ($dist_rad < $radius_rad) {
+        print "#TRACKLET_ID ASTEROID_DESIG OBSCODE EPOCH_MJD_UTC RA_DEG DEC_DEG MAG DIST_ARCSEC\n" unless $done_header++;
+        print join(' ', $tid, $out_desig, $out_obscode, $out_epoch_mjd, $out_ra_deg, $out_dec_deg, $out_mag, rad2deg($dist_rad) * 3600), "\n";
+    }
+}
+
+# Done, cleanup.
+$fh->close();
+unlink $proptmp or die "can't remove $proptmp";
+exit(0);

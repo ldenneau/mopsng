@@ -1,0 +1,174 @@
+#!/usr/bin/env perl
+# $Id: create_psmops 5775 2015-09-28 22:12:41Z mops $
+
+# Script to automate the creation of a PSMOPS instance
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Temp qw(tempfile);
+use File::Slurp;
+use PS::MOPS::Config;
+
+
+my $grants;
+my $quiet;
+my $help;
+GetOptions(
+    grants => \$grants,
+    quiet => \$quiet,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+
+my $suffix;             # PSMOPS suffix
+my $instance;           # full instance name (psmops_XXXX)
+
+# Scrub the name of our instance.
+$suffix = shift || pod2usage(3);
+$suffix =~ s/^psmops_//i;       # strip leading PSMOPS_ if provided
+die "invalid instance name: $suffix" unless $suffix =~ /^\w+$/;
+$instance = 'psmops_' . $suffix;
+
+my $mops_backend = PS::MOPS::Config->new('backend');
+my $mops_hostname = $mops_backend->{hostname} || die "no hostname configured";
+my $mops_port = $mops_backend->{port} || 3306;
+my $mops_rootuser = $mops_backend->{rootuser} || 'mopsroot';
+
+my $mops_username = 'mops';
+my $mops_password = 'mops';
+
+my $mopspipe_username = $mops_backend->{password} || 'mopspipe';
+my $mopspipe_password = $mops_backend->{password} || 'epip';
+
+
+# mysql root passwd.
+my $mops_rootpwfile;
+if ($ENV{USER} eq 'mguest') {
+    $mops_rootpwfile = "$ENV{MOPS_HOME}/schema/.psmops_rootpw";
+    $suffix = 'mguest';
+    $instance = 'psmops_mguest';
+}
+else {
+    $mops_rootpwfile = "$ENV{HOME}/.psmops_rootpw";
+}
+my $mops_rootpw = (-f $mops_rootpwfile && -r $mops_rootpwfile) ? read_file($mops_rootpwfile) : "";
+chomp $mops_rootpw;
+
+my $root_cmd = "mysql -u$mops_rootuser -p$mops_rootpw -h $mops_hostname -P $mops_port";     # connect to mysql as root user; pwd from console
+my $mops_cmd = "mysql -u$mops_username -p$mops_password -h $mops_hostname -P $mops_port" ;      # connect as mops user
+
+
+if ($grants) {
+    # Grant privileges to an existing database.
+    print STDERR "Granting privileges on '$instance' on $mops_hostname.\n";
+    my ($grant_fh, $grant_filename) = tempfile('/tmp/grant_psmopsXXXXXX', UNLINK => 1);
+    print $grant_fh <<"EOF";
+grant select on $instance.* to 'mops'\@'%' identified by '$mops_password';
+grant select on $instance.* to 'mops'\@'localhost' identified by '$mops_password';
+grant select, insert, update, delete on $instance.* to 'mopspipe'\@'%' identified by '$mopspipe_password';
+grant select, insert, update, delete on $instance.* to 'mopspipe'\@'localhost' identified by '$mopspipe_password';
+flush privileges;
+EOF
+    close $grant_fh;
+    system("$root_cmd < $grant_filename") == 0 or die "failed to grant privileges on instance: $?";
+    exit;
+}
+else {
+    # Create the instance.
+    print STDERR "Creating database instance '$instance' on $mops_hostname.\n" unless $quiet;
+    #my ($create_fh, $create_filename) = tempfile('/tmp/create_psmopsXXXXXX');
+    my ($create_fh, $create_filename) = tempfile('/tmp/create_psmopsXXXXXX', UNLINK => 1);
+    print $create_fh <<"EOF";
+drop database if exists $instance;
+create database $instance;
+
+grant select on $instance.* to 'mops'\@'%' identified by '$mops_password';
+grant select on $instance.* to 'mops'\@'localhost' identified by '$mops_password';
+grant select, insert, update, delete, create temporary tables on $instance.* to 'mopspipe'\@'%' identified by '$mopspipe_password';
+grant select, insert, update, delete, create temporary tables on $instance.* to 'mopspipe'\@'localhost' identified by '$mopspipe_password';
+flush privileges;
+EOF
+    close $create_fh;
+    print STDERR "Running: $root_cmd < $create_filename";
+    system("$root_cmd < $create_filename") == 0 or die "failed to create instance: $?";
+}
+
+
+# Create the schema.
+print STDERR "Building schema.\n" unless $quiet;
+my ($schema_fh, $schema_filename) = tempfile('/tmp/create_psmopsXXXXXX', UNLINK => 1);
+print $schema_fh <<"EOF";
+# Build all PSMOPS
+use $instance;
+source filter_info.sql;
+source ssm_desc.sql;
+source ssm.sql;
+source known.sql;
+source shapes.sql;
+source fields.sql;
+source detections.sql;
+source det_rawattr_v2.sql;
+source det_rawattr_v3.sql;
+source tracklets.sql;
+source tracklet_attrib.sql;
+source orbits.sql;
+source derivedobjects.sql;
+source residuals.sql;
+source derivedobject_attrib.sql;
+source history.sql;
+source history_identifications.sql;
+source history_attributions.sql;
+source history_derivations.sql;
+source history_precoveries.sql;
+source history_removals.sql;
+source ingest_status.sql;
+source eon_queue.sql;
+source moid_queue.sql;
+#source aqueue.sql;
+source config.sql;
+source runtime.sql;
+source deteff.sql;
+source locks.sql;
+#source alerted_tracklets.sql;
+source mpc-import-export.sql;
+source runs.sql;
+source manual_detections.sql;
+#source jknowns.sql;
+EOF
+close $schema_fh;
+system("$root_cmd < $schema_filename") == 0 or die "failed to create schema: $?";
+
+printf STDERR "Done.\n" unless $quiet;
+
+
+=head1 NAME
+
+create_psmops - Create a psmops_instance
+
+=head1 SYNOPSIS
+
+create_psmops [options] SUFFIX
+
+  --grants : just grant privileges, don't modify DB (for maintenance)
+  --quiet : don't print anything to STDERR while we do stuff
+  --help : show manpage
+  SUFFIX : suffix for psmops_SUFFIX name; e.g. "100a"
+
+=head1 DESCRIPTION
+
+Generates two mysql scripts to create a database and build its
+schema.  First script runs as mysql root user to create the
+database; second runs as mops user to generate the scheme.
+
+After this script is run, you still need to put data in it my by
+installing orbits then running sch2obs to insert synthetic fields.
+
+=head1 BUGS
+
+Don't use this script directly.  Use buildInstance instead.  Thanks.
+
+=cut
+

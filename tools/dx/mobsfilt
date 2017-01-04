@@ -1,0 +1,45 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+
+my $last_id = '';
+my @track_lines;
+my $line;
+my $track_id;
+my $stuff;
+
+my $fh = new FileHandle (shift or "-");
+
+@track_lines = ();
+while ($line = <$fh>) {
+    ($track_id, $stuff) = split ' ', $line, 2;
+    push @track_lines, $line;
+    if ($last_id && ($last_id ne $track_id)) {
+        print scalar @track_lines, "\n", @track_lines;
+        @track_lines = ();
+    }
+    $last_id = $track_id;
+}
+
+=head1 NAME
+
+mobsfilt - massage a MOBS-D file for MOBS input by preceding each group
+of associated detections with a line containing the count in the group
+
+=head1 SYNOPSIS
+
+mobsfilt < stuff > more_stuff
+
+=head1 DESCRIPTION
+
+MOBS wants a count of the number of lines it will be reading for each
+track.  So scan a MOBS file and insert lines containing the detection
+count for each track before each track.
+
+=cut

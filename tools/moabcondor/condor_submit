@@ -1,0 +1,48 @@
+#!/usr/bin/env python
+"""
+Moab-Condor compatibility layer
+
+condor_submit: emulate the tool of the same name in the Condor distribution by 
+taking a condor job description file, parsing it and submitting the equivalent 
+job to Moab.
+
+Usage
+  condor_submit jobfile
+"""
+import MOPS.Instance as Instance
+import MOPS.Torque as Torque
+
+
+
+
+
+if(__name__ == '__main__'):
+    import os
+    import sys
+
+
+    # Get the command like input.
+    if(len(sys.argv) != 2):
+        # Ops! missing arg.
+        sys.stderr.write('usage: condor_submit jobfile\n')
+        sys.exit(1)
+    # <-- end if
+
+    # Get a hold of the current MOPS instance.
+    inst = Instance.Instance(dbname=os.environ['MOPS_DBINSTANCE'])
+    
+    # Parse the input Condor job file.
+    job = Torque.fromCondorJobFile(inst, fileName=sys.argv[1])
+
+    # Test
+    job.set_sub_file('testtest.job')
+    job.write_sub_file()
+
+    # Submit the job and quit.
+    jobIds = Torque.submit(job)
+    print('%d job(s) submitted to cluster %d.' %(job.queue,
+                                                 int(jobIds[0].split('.')[0])))
+    sys.exit(0)
+# <-- end if
+
+    

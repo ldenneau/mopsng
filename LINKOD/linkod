@@ -1,0 +1,389 @@
+#!/usr/bin/env perl
+# $Id: linkod 4937 2012-04-10 20:24:33Z dgreen $
+
+=pod
+
+=head1 NAME
+
+linkod - MOPS pipeline stage for linking and orbit determination 
+
+=head1 SYNOPSIS
+
+linkod [--help]
+
+  --test : test mode; don't modify DB, don't execute makefiles
+  --help : show man page
+  --run  : id of the run that linkod is a part of. This parameter is used by the 
+           mopper script and should not be specified when manually running linkod.  
+
+=head1 DESCRIPTION
+
+LINKOD performs MOPS linking and orbit determination on a MOPS
+cluster using a simple scatter-gather method.
+
+=head1 EXIT VALUE
+
+LINKOD exits with the following values:
+
+  0 - successful completion
+  other - internal failure
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+use File::Slurp;
+use FileHandle;
+use Params::Validate;
+
+use Astro::SLA;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Tracklet;
+
+# Utility queue class.
+package queue;
+
+sub new {
+    my ($pkg, $mops_inst, $nn) = @_;
+    my $self = {
+        QUEUE => [],
+        INST => $mops_inst,
+        NN => $nn,
+    };
+    bless $self, $pkg;
+    return $self;
+}
+
+sub add {
+    my ($self, $field, $minv_degperday, $maxv_degperday, $grouped_radius_deg, $link_status, $mark_status, $link_opts) = @_;
+
+    push @{$self->{QUEUE}}, {
+        TARGET_FIELD_ID => $field->fieldId,
+        JOB_LABEL => $field->fieldId . $mark_status,
+        COMMAND => join(' ',
+            'linkod_worker',
+            '--target_field_id=' . $field->fieldId,
+            '--job_label=' . ($field->fieldId . $mark_status),
+            qq{--link_opts='$link_opts'},
+            '--minv_degperday=' . $minv_degperday,
+            '--maxv_degperday=' . $maxv_degperday,
+            '--done_status=' . $mark_status,
+        ),
+    };
+}
+
+sub _waitForFiles {
+    # Little routine snaked from FP's Python version to wait for Condor files to appear.
+    # Apparently condor_wait can say it's done before all the files are copied.
+    my @files = @_;
+    my $polling_time = 1.0;
+    my $i;
+    my $n;
+
+    $n = scalar(@files);
+    while ($n > 0) {
+        my @tmp;
+        for($i = 0; $i < $n; $i++) {
+            if(!-e $files[$i]) {
+                push(@tmp, $files[$i]);
+            }
+        }
+        @files = @tmp;
+        $n = scalar(@files);
+        sleep($polling_time);
+    }
+}
+
+sub execute {
+    # Submit the queued LINKOD passes as a single Condor job.
+    my ($self, $mark_status, $run_id) = @_;
+    my $inst = $self->{INST};
+    my $nn = $self->{NN};
+
+    my $num_jobs = scalar @{$self->{QUEUE}};
+
+    my $label = $nn . $mark_status;
+    my $logger = $inst->getLogger();
+    my $config = $inst->getConfig();
+
+    # Extract the environment the remote jobs run in.
+    my $remote_mops_home = $config->{cluster}->{MOPS_HOME} || $ENV{'MOPS_HOME'};
+    my $remote_path = $config->{cluster}->{PATH} || $ENV{'PATH'};
+    my $remote_perl5lib = $config->{cluster}->{PERL5LIB} || "$remote_mops_home/lib/perl";
+    my $remote_pythonpath = $config->{cluster}->{PYTHONPATH} || "$remote_mops_home/lib/python";
+    my $remote_ld_library_path = $config->{cluster}->{LD_LIBRARY_PATH} || "$remote_mops_home/lib";
+    my $remote_caet_data = $config->{cluster}->{CAET_DATA} || $ENV{'CAET_DATA'};
+    my $remote_oorb_data = $config->{cluster}->{OORB_DATA} || $ENV{'OORB_DATA'};
+    my $remote_orbfit_data = $config->{cluster}->{ORBFIT_DATA} || $ENV{'ORBFIT_DATA'};
+    my $environment = "MOPS_HOME=$remote_mops_home CAET_DATA=$remote_caet_data OORB_DATA=$remote_oorb_data ORBFIT_DATA=$remote_orbfit_data PATH=$remote_path PERL5LIB=$remote_perl5lib PYTHONPATH=$remote_pythonpath LD_LIBRARY_PATH=$remote_ld_library_path";
+
+    if (!$num_jobs) {
+        $logger->info("LINKOD: no $mark_status jobs to process for night $nn");
+        return;
+    }
+
+    $logger->info(sprintf "LINKOD: Executing link job for night $nn (%d fields)", scalar @{$self->{QUEUE}});
+
+    eval {
+        my $dbname = $inst->dbname;
+
+        # Major bleh.  We want to be able to use OrbFit's opts file templates, but
+        # these need to be passed around the cluster.  So do it here.
+        my $orbfit_master_opts_file = $inst->getEnvironment('CONFIGDIR') . "/orbfit.opt";
+
+        # Create Condor files.
+        my $dir = Cwd::getcwd();
+        my $job_str = <<"JOB";
+universe = vanilla
+executable = $ENV{'MOPS_HOME'}/bin/condor_runner
+arguments = $label.remotecmd.\$(Process)
+environment = "$environment MOPS_DBINSTANCE=$dbname"
+# Dummy memory line to prevent vacate due to large process size
+#requirements = Memory > 1024
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+transfer_input_files = $label.remotecmd.\$(Process),$orbfit_master_opts_file
+initialdir = $dir
+log = $label.condorlog
+error = $label.stderr.\$(Process)
+output = $label.stdout.\$(Process)
+input = /dev/null
+notification = Error
+queue $num_jobs
+JOB
+        my $job_fh = new FileHandle ">$label.cmd";
+        print $job_fh $job_str;
+        $job_fh->close;
+
+        # Write one file for each LINKOD job.
+        my $num = 0;
+        foreach $num (0..$num_jobs - 1) {
+            my $fh = new FileHandle ">$label.remotecmd.$num";
+            print $fh $self->{QUEUE}->[$num]->{COMMAND}, "\n";
+            $fh->close;
+        }
+
+        open CONDUH, "condor_submit $label.cmd|" or $logger->logdie("$label: condor_submit failed");
+        my @submit_stuff = <CONDUH>;
+        close CONDUH;
+
+        # Suss out the Condor job ID.
+        my $job_id = '';
+        if ($submit_stuff[-1] =~ /submitted to cluster (\d+)/) {
+            $job_id = $1;
+        }
+        
+        # Sleep for a fraction of a second to give condor_submit the time to 
+        # create the log file. Is this necessary?
+        sleep(0.5);
+
+        $logger->info("LINKOD: monitoring $label.condorlog (job ID $job_id)");
+        system("condor_wait $label.condorlog $job_id") == 0 or $logger->logdie("$label: condor_wait failed: $?");
+
+        # Run the insert and efficiency parts of the scripts on the master.
+        my $cmd;
+        my $job_label;
+        my $target_field_id;
+
+        # Create a string of all files in this job to pass to id1.
+        my @all_mif = map { $_->{TARGET_FIELD_ID} . "$mark_status.mif" } @{$self->{QUEUE}};
+        my $insert_file = "INSERT.$nn$mark_status.mif";
+
+        # Wait for all the output files to appear.
+#        _waitForFiles(@all_mif);
+
+        # ID1 => MIF consolidation
+        $cmd = "/bin/rm -f $insert_file";
+        system($cmd) == 0 or $logger->logdie("LINKOD: $cmd failed");
+
+        $cmd = "id1 @all_mif > $insert_file.unnormalized";     # XXXX @all_mif = pure cheese
+        $logger->info("LINKOD: executing $cmd");
+        system($cmd) == 0 or $logger->logdie("LINKOD: $cmd failed");
+
+        $cmd = "id1a --detection $insert_file.unnormalized > $insert_file";
+        $logger->info("LINKOD: executing $cmd");
+        system($cmd) == 0 or $logger->logdie("LINKOD: $cmd failed");
+
+        # Insert objects in one batch.
+        $cmd = "insertNewDerivedObjects $insert_file";
+        $logger->info("LINKOD: executing $cmd");
+        system($cmd) == 0 or $logger->logdie("LINKOD: $cmd failed");
+
+        # Clean up.
+        my $target_field;
+        foreach $num (0..$num_jobs - 1) {
+            $target_field = PS::MOPS::DC::Field::modcf_retrieve($inst, fieldId => $self->{QUEUE}->[$num]->{TARGET_FIELD_ID});
+            $target_field->status($mark_status, $run_id);        # insertNDO should do this transactionally
+        }
+    };
+    $logger->logdie($@) if $@;
+}
+
+# Main.
+package main;
+
+# Globals.
+my $t0 = time;                          # for timing
+
+# Forward sub declarations.
+use subs qw(
+    queue_pass
+);
+
+my $inst;
+my $instance_name;
+my $nn;
+my $run_id;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'run=i' => \$run_id,        
+    'nn=i' => \$nn,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => '--nn is required') unless $nn;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+# Look for hakey to skip linking.
+if ($mops_config->{debug}->{disable_linking}) {
+    exit 0;     # 1 => nothing to do
+}
+
+# Configuration.  Most of this stuff could probably be moved to linkod_worker.
+my $linkod_config = $mops_config->{linkod};
+
+my $slow_grouped_radius_deg = 0.1;
+my $slow_link_opts = $linkod_config->{slow_link_opts} || '';
+
+my $fast_grouped_radius_deg = 0.1;
+my $fast_link_opts = $linkod_config->{fast_link_opts} || '';
+
+my $fallback_iod = $linkod_config->{fallback_iod};
+my $fallback_iod_str = $fallback_iod ? "--fallback_iod $fallback_iod" : '';
+
+$mops_logger->info("Starting LINKOD.");
+
+# Update process status.
+$0 = sprintf "LINKOD %s", $inst->dbname;
+
+eval {
+    my @fields;             # A fields, READYTOLINK
+    my $field;
+    my $oldest_field;
+    my $field_i;
+    my $queue;
+
+
+    # Create our working directory, and go there.
+    my $dir = $inst->makeNNDir(NN => $nn, SUBSYS => 'linkod', FORCE_EMPTY => 1);
+    chdir $dir or die "can't chdir to $dir";
+
+
+    # Slow pass.
+    $queue = queue->new($inst, $nn);
+    $field_i = modcf_retrieve($inst,
+        nn => $nn,
+        status => $FIELD_STATUS_READYTOLINK,
+    );
+
+    while ($field = $field_i->next()) {
+        if (modct_countInField($inst, $field->fieldId) == 0) {
+            # Field has no tracklets.
+            $field->status($FIELD_STATUS_LINK1, $run_id);
+        }
+        else {
+            $queue->add(
+                $field,
+                $linkod_config->{slow_minv_degperday},
+                $linkod_config->{slow_maxv_degperday},
+                $slow_grouped_radius_deg,
+                $FIELD_STATUS_READYTOLINK,
+                $FIELD_STATUS_LINK1,
+                $slow_link_opts,
+            );
+        } 
+    }
+    $queue->execute($FIELD_STATUS_LINK1, $run_id);
+
+    # Fast pass.
+    $inst->{_DBH} = undef;              # force re-acquire of DBH in case last pass took very long
+    $queue = queue->new($inst, $nn);
+    $field_i = modcf_retrieve($inst,
+        nn => $nn,
+        status => $FIELD_STATUS_LINK1,
+    );
+
+    while ($field = $field_i->next()) {
+        if (modct_countInField($inst, $field->fieldId) == 0) {
+            # Field has no tracklets.
+            $field->status($FIELD_STATUS_LINKDONE, $run_id);
+        }
+        else {
+            $queue->add(
+                $field,
+                $linkod_config->{fast_minv_degperday},
+                $linkod_config->{fast_maxv_degperday},
+                $fast_grouped_radius_deg,
+                $FIELD_STATUS_LINK1,
+                $FIELD_STATUS_LINKDONE,
+                $fast_link_opts,
+            );
+        }
+    }
+    $queue->execute($FIELD_STATUS_LINKDONE, $run_id);
+
+    # Processed some fields, so do a lost pass.
+    do_lost($nn);
+};
+
+$mops_logger->logdie($@) if $@;
+$mops_logger->info(
+    mopslib_formatTimingMsg(
+        subsystem => 'LINKOD',
+        time_sec => (time - $t0),
+        nn => $nn,
+    )
+);
+
+# Finally, run MOID.
+system('moid') == 0 or $mops_logger->logdie('LINKOD/MOID failed');
+
+exit;
+
+
+sub do_lost {
+    my ($nn) = @_;
+    
+    my $oldwd = Cwd::getcwd;
+    eval {
+        # Create makefile; return path to this file.
+        my $shfile = "$nn.lost.sh";
+        my $tmpl = <<"TMPL";
+#!/bin/sh
+# Create dummy file to keep cat command quiet if there are no .avail files.
+#touch dummy.avail
+#cat *.avail | cut -f1 | sort -u > $nn.avail
+effFindAvailableTracks --nn=$nn > $nn.avail
+effFindLostTracks --nn=$nn --avail_file=$nn.avail
+TMPL
+        write_file($shfile, $tmpl);
+        $mops_logger->info("Wrote efficiency script $shfile for lost tracks.");
+
+        # Execute the linker.
+        (system("sh $shfile") == 0) or $mops_logger->logwarn($?);
+    };
+
+    $mops_logger->logwarn($@) if $@;
+    chdir $oldwd || $mops_logger->logwarn("can't restore wd: $oldwd");
+}

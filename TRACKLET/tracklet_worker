@@ -1,0 +1,1284 @@
+#!/usr/bin/env perl
+# $Id$
+
+=pod
+
+=head1 NAME
+
+tracklet_worker - Find tracklets in specified fields
+
+=head1 SYNOPSIS
+
+tracklet_worker --method=METHOD --outfile FIELD_ID1 FIELD_ID2 ...
+
+  FIELD_ID1 FIELD_ID2 : field IDs of tuple to process
+  --method=METHOD : "TTI" or "DEEP"
+  --inst=INSTANCE_NAME : MOPS instance 
+  --outfile=FILENAME : write MIF-TRACKLET output to FILENAME
+  --help : show man page
+
+=head1 DESCRIPTION
+
+Given a list of field IDs, find tracklets in the fields using the appropriate
+method.  Write output MIF-TRACKLET lines to the output file.
+
+=head1 BUG
+
+As of 15 OCT 2012 we have discovered that for synthetics, different
+exposure times within a tracklet cause search problems for fast-moving
+objects.  Down in the guts of the MHT/PHT code, the mismatch in detection
+lengths due to different exposure times is not handled correctly.
+For now I do not want to try to rework that code, so instead, we will
+rewrite normalize relevant values to a standard exposure time so that
+all detections use the same exposure time (likely to be 30 seconds).
+
+--Larry
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use List::Util qw(min max sum);
+use POSIX qw(fmod);
+use Math::Trig;
+use Astro::SLA;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+
+
+# Forward sub declarations.
+use subs qw(
+    run
+    cmd
+    cmd_timeout
+    select_detections
+    write_tracklets
+    do_tti_tuple
+    do_deep_stack
+);
+
+
+# For fast tracklet processing.
+our %morph_memo;
+our %det_memo;
+our %field_memo;
+our $ALIGN_THRESH_DEG = 15.0;       # degrees
+our $FAST_VEL_THRESH_DD = 1.2;      # deg/day
+#our $FAST_PX_THRESH = 5.25;
+#our $VERY_FAST_PX_THRESH = 6.0;
+our $SEL_EXTENDED = 1;              # selector for extended PSFs in select_extended_detections()
+our $MIN_S2N = 10;
+our $ON_SPIKE = 0x0000_0008;        # detection is on spike
+our $ON_STARCORE = 0x0000_0010;     # detection is on star core
+our $min_score = 0.7;
+
+# Detection vartest parameters.
+our $SUPERCLEAN = 1;
+our $CLEAN = 2;
+our $UGLY = 3;
+our $ALL = 99;
+
+# Tracklet exposure time normalization (see POD above).
+our $STD_EXPOSURE_TIME = 30;        # seconds
+
+
+my $inst;
+my $instance_name;
+my $method;
+my $outfile;
+my $debug;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'method=s' => \$method,
+    'outfile=s' => \$outfile,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => '--outfile=OUTFILE must be specified') unless $outfile;
+pod2usage(-msg => '--method=METHOD must be "TTI", "DEEP", or "CHUNK"') unless $method;
+pod2usage(-msg => 'no fields specified') unless @ARGV;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+if ($method eq 'TTI') {
+    do_tti_tuple($outfile, @ARGV);
+}
+elsif ($method eq 'CHUNK') {
+    if ($mops_config->{tracklet}->{atlas_chunk}) {
+        do_atlas_chunk($outfile, @ARGV);
+    } else {
+        do_chunk($outfile, @ARGV);
+    }
+}
+elsif ($method eq 'DEEP') {
+    my $deep_method = $mops_config->{tracklet}->{deep_method} || 'findtracklets';
+    if ($deep_method eq 'findtracklets') {
+        do_deep_stack_findtracklets($outfile, @ARGV);
+    }
+    else {
+        do_deep_stack_collapsetracklets($outfile, @ARGV);
+    }
+}
+
+exit 0;
+
+
+sub _fetch_memoized_field {
+    my ($id) = @_;
+    my $field;
+    if (exists($field_memo{$id})) {
+        $field = $field_memo{$id};
+    }
+    else {
+        $field = modcf_retrieve($inst, fieldId => $id);
+        $field_memo{$id} = $field;
+    }
+    return $field;
+}
+
+
+sub do_tti_tuple {
+    my ($outfile, @field_ids) = @_;
+    my $file_root = 'OUTFILE';
+    if ($outfile =~ /^(.*)\.tracklets/) {
+        $file_root = $1;
+    }
+
+    my $dets_filename = "$file_root.dets";
+    my $ids_filename = "$file_root.ids";
+    my $fast_ids_filename = "$file_root.fast.ids";
+    my $fast_dets_filename = "$file_root.fast.dets";
+    my $high_gcr_ids_filename = "$file_root.highgcr.ids";
+    my $high_gcr_dets_filename = "$file_root.highgcr.dets";
+
+    # Tracklet-finding options.
+    my $high_gcr_thresh_arcsec = $mops_config->{tracklet}->{high_gcr_thresh_arcsec} || 2.5;
+    my $high_gcr_minv_degperday = $mops_config->{tracklet}->{high_gcr_minv_degperday} || 1.5;
+    my $do_fast = $mops_config->{tracklet}->{do_fast_pairs};
+    my $do_fast_quads = $mops_config->{tracklet}->{do_fast_pairs_from_quads};
+    my $do_high_gcr = $mops_config->{tracklet}->{do_high_gcr};
+    my $do_off_galactic_pairs = $mops_config->{tracklet}->{do_off_galactic_pairs};
+    my $s2n_cutoff = $mops_config->{site}->{limiting_s2n} || die "can't get s2n_cutoff";
+    my $minv_degperday = $mops_config->{tracklet}->{minv_degperday} || 0;
+    my $maxv_degperday = $mops_config->{tracklet}->{maxv_degperday} || 
+        die "can't get tracklet maxv_degperday";
+    my $min_gal_sep = $mops_config->{tracklet}->{pair_min_galactic_separation_deg} || 15; 
+     
+    my $timeout = $mops_config->{tracklet}->{timeout} || 3600;
+
+    # OK, if we are processing pairs, we allow a pairwise maxv_degperday.
+    if (scalar @field_ids == 2 and defined($mops_config->{tracklet}->{pair_maxv_degperday})) {
+        $maxv_degperday = $mops_config->{tracklet}->{pair_maxv_degperday};
+    }
+
+    # Check to see if off galactic pairs is enabled. If it is and the pair meets
+    # the minimum seperation from the galactic plane then allow for the use of
+    # a possibly larger pair velocity to take advantage of the lower detection
+    # density away from the galactic plane.
+    if ($do_off_galactic_pairs and scalar @field_ids == 2 and defined($mops_config->{tracklet}->{pair_maxv_off_galactic_degperday})) {
+        my $field = _fetch_memoized_field($field_ids[0]) or die("can't fetch field ID $field_ids[0])");
+        if (abs($field->gb_deg) >= $min_gal_sep) {
+            # Set maxv to maxv for off galactic plane if defined.
+            $maxv_degperday = $mops_config->{tracklet}->{pair_maxv_off_galactic_degperday};
+        }
+    }
+    
+    my $fit_threshold_str = 
+        defined($mops_config->{tracklet}->{fit_threshold_arcsec}) ? 
+        ('thresh ' . ($mops_config->{tracklet}->{fit_threshold_arcsec} / 3600)) : 'thresh 0.0008';
+    my $maxt = $mops_config->{tracklet}->{maxt_days} ||
+        die "can't get tracklet maxt_days";
+    my $minobs = $mops_config->{tracklet}->{minobs} || 
+        die "can't get tracklet minobs";
+    if ($minobs eq 'max') { 
+        $minobs = scalar @field_ids;        # 'max' => use number of fields
+    }
+    elsif ($minobs =~ /%$/) {
+        # pct specification
+        $minobs =~ s/%//;
+        $minobs = int((scalar @field_ids) * $minobs / 100 + 0.99);   # cheap ceil()
+    }
+
+
+    # Extract detections then tell findTracklets to do its thing.
+    my $det_fh = new FileHandle ">$dets_filename" or die "can't create $dets_filename";
+
+    # ATLAS vartest parameters.
+    my $dirtyLimit = undef;
+    if (@field_ids == 3 && $mops_config->{tracklet}->{dirty_limit}) {
+        $dirtyLimit = $mops_config->{tracklet}->{dirty_limit};
+        $mops_logger->info("Using dirtyLimit=$dirtyLimit");
+    }
+
+    foreach my $field_id (@field_ids) {
+        select_extended_detections($det_fh, $field_id, $s2n_cutoff, 0, $dirtyLimit);
+    }
+    $det_fh->close();
+
+    # Read in dets and FT ids output and generate MIF-TRACKLET files.
+    my $lines;
+    my @items;
+    my %det_id_map;
+    my %findable_map;
+    my @found_tracklets;
+    my $ssm_id;
+    my $det_id;
+    my $line;
+    my $tid;
+    my %already_seen;
+    my $cmd;
+    my @dets;
+    my $classification;
+    my $minv;   # used by findTracklets invocations
+    my $maxv;
+
+    # Read in all detections from the tuple/stack.  Count occurrences of 
+    # multiple SSM IDs. These are synthetic tracklets we should be able to find.
+    my $dets_fh = new FileHandle $dets_filename or die "can't open dets file $dets_filename";
+    while (defined($line = <$dets_fh>)) {
+        @items = split /\s+/, $line;
+        ($det_id, $ssm_id) = @items[0, 6];
+        if ($ssm_id ne 'NS') {
+            push @{$findable_map{$ssm_id}}, $det_id;    # add det ID for det, will need later to build unfound trk
+            $det_id_map{$det_id} = $ssm_id;             # assoc this det ID with SSM ID
+        }
+    }
+    $dets_fh->close();
+
+    # Now delete length < min_obs entries in the findable map; we wouldn't have made tracklets out
+    # of these.
+    my $k;
+    for $k (keys %findable_map) {
+        delete $findable_map{$k} if @{$findable_map{$k}} < $minobs;
+    }
+
+
+    # FINDTRACKLETS SLOW REGIME
+    $maxv = min $maxv_degperday, $FAST_VEL_THRESH_DD;     # clamp slow max to fast thresh if >
+    $cmd = "findTracklets $fit_threshold_str file $dets_filename idsfile $ids_filename minv $minv_degperday maxv $maxv minobs $minobs";
+    printf STDERR "findTracklets: slow pass $cmd\n" if $debug;
+    cmd_timeout($cmd, $timeout);
+    if (-e $ids_filename) {
+        my $ids_fh = new FileHandle $ids_filename or die "can't open ids file $ids_filename";
+        while (defined($line = <$ids_fh>)) {
+            @items = split /\s+/, $line;
+            # Remove found synthetic tracklets from the hash listing all of the findable synthetics.
+            $ssm_id = suss_ssm_id(\%det_id_map, \@items);
+            if ($ssm_id) {
+                delete $findable_map{$ssm_id};      # found it; remove from findable
+            }
+
+            # If we made it here, we are keeping the tracklet.
+            push @found_tracklets, [ @items ];
+            $tid = join '=', @items;
+            $already_seen{$tid} = 1;        # record this tracklet so we don't re-insert when doing fast  pairs
+            print STDERR "slow: keeping ", join('=', @items), "\n" if $debug;
+        }
+        $ids_fh->close();
+    }
+
+
+    # FINDTRACKLETS FAST REGIME
+    $minv = max $minv_degperday, $FAST_VEL_THRESH_DD;     # clamp slow max to fast thresh if >
+    $cmd = "findTracklets $fit_threshold_str file $dets_filename idsfile $fast_ids_filename minv $minv maxv $maxv_degperday minobs $minobs";
+    printf STDERR "findTracklets: fast pass $cmd\n" if $debug;
+    cmd_timeout($cmd, $timeout);
+    if (-e $fast_ids_filename) {
+        my $ids_fh = new FileHandle $fast_ids_filename or die "can't open ids file $fast_ids_filename";
+        my $trk;
+        while (defined($line = <$ids_fh>)) {
+            @items = split /\s+/, $line;
+            # Remove found synthetic tracklets from the hash listing all of the findable synthetics.
+            $ssm_id = suss_ssm_id(\%det_id_map, \@items);
+            if ($ssm_id) {
+                delete $findable_map{$ssm_id};      # found it; remove from findable
+            }
+
+            @dets = map { $det_memo{$_} } @items;     # list of Detection objects
+            $classification = modcd_classifyDetections($inst, @dets);
+            $trk = PS::MOPS::DC::Tracklet->new($inst,
+                detections => \@dets,
+                classification => $classification,
+                ssmId => $ssm_id,
+                # gcr_arcsec => $gcr 
+            );
+
+            my $keep = 0;
+            # Score only non synthetic tracklets.
+            if ($classification eq $MOPS_EFF_NONSYNTHETIC && $trk->vTot > $FAST_VEL_THRESH_DD) {
+                # We are in the "fast" regime.  Keep only CLEAN tracklets and NONSYNTHETIC
+                # with aligned detections.
+                #
+                # Score the tracklet before deciding to keep it.
+                my $score_spike = score_spike(@items);
+                next if $score_spike;
+
+                my $score_s2n = score_s2n(@items);
+                my $score_rchi2 = score_rchi2(@items);
+                next if $score_s2n < $min_score && $score_rchi2 < $min_score;
+
+                # Ensure detection PAs are consistent with tracklet motion.
+                my $score_aligned = score_aligned(@items);
+                next if $score_aligned < $min_score;
+
+                print STDERR "fast: keeping ", join('=', @items), "\n" if $debug;
+            }
+            elsif ($classification ne $MOPS_EFF_CLEAN) {
+                next;       # don't keep
+            }
+
+            # If we made it here, we are keeping the tracklet.
+            push @found_tracklets, [ @items ];
+            $tid = join '=', @items;
+            $already_seen{$tid} = 1;        # record this tracklet so we don't re-insert when doing fast  pairs
+        }
+        $ids_fh->close();
+    }
+
+
+
+    # High-GCR quad processing.  Want to allow quads with higher GCR than allowed by nominal config
+    # for slower movers.  XXX LD: will be incorporated into regular quad processing.
+    if (1 and ($do_high_gcr and @field_ids > 2)) {
+        my $det_fh = new FileHandle ">$high_gcr_dets_filename" or die "can't create $high_gcr_dets_filename";
+        foreach my $field_id (@field_ids) {
+            select_extended_detections($det_fh, $field_id, $s2n_cutoff, $SEL_EXTENDED);
+        }
+        $det_fh->close();
+
+        my $high_gcr_maxv_degperday = $maxv_degperday;
+        my $high_gcr_fit_threshold_str = sprintf 'thresh %f', $high_gcr_thresh_arcsec / 3600;   # convert to deg
+	cmd_timeout("findTracklets $high_gcr_fit_threshold_str file $high_gcr_dets_filename idsfile $high_gcr_ids_filename minv $high_gcr_minv_degperday maxv $high_gcr_maxv_degperday minobs $minobs", $timeout);
+
+        if (-e $high_gcr_ids_filename) {
+            my $ids_fh = new FileHandle $high_gcr_ids_filename or die "can't open ids file $high_gcr_ids_filename";
+            while (defined($line = <$ids_fh>)) {
+                @items = split /\s+/, $line;
+                $tid = join '=', @items;
+                next if $already_seen{$tid};
+
+                # Our current fast processing can only find nonsynthetics because
+                # synthetics don't have fake morphological information.  But check
+                # against our findable synths just in case.
+                $ssm_id = suss_ssm_id(\%det_id_map, \@items);
+                if ($ssm_id) {
+                    delete $findable_map{$ssm_id};      # found it; remove from findable
+                }
+
+                @dets = map { $det_memo{$_} } @items;     # list of Detection objects
+                $classification = modcd_classifyDetections($inst, @dets);
+
+                # Now score the tracklet before deciding to keep it.
+                # Score only non synthetic tracklets.
+                if ($classification eq $MOPS_EFF_NONSYNTHETIC) {        
+                    my $score_spike = score_spike(@items);
+                    next if $score_spike;
+
+                    my $score_s2n = score_s2n(@items);
+                    my $score_rchi2 = score_rchi2(@items);
+                    next if $score_s2n < $min_score && $score_rchi2 < $min_score;
+
+                    # Ensure detection PAs are consistent with tracklet motion.
+                    my $score_vel = score_vel(@items);
+                    next if $score_vel < $min_score;
+                }
+                push @found_tracklets, [ @items ];
+                $already_seen{$tid} = 1;        # record this tracklet so we don't re-insert when doing fast  pairs
+            }
+            $ids_fh->close();
+        }
+    }
+
+
+
+    # Fast processing for pairs only.
+    if (($do_fast and @field_ids == 2) or ($do_fast_quads and @field_ids == 4)) {
+        my $det_fh = new FileHandle ">$fast_dets_filename" or die "can't create $fast_dets_filename";
+        foreach my $field_id (@field_ids) {
+            select_extended_detections($det_fh, $field_id, $s2n_cutoff, $SEL_EXTENDED);
+        }
+        $det_fh->close();
+
+        my $fast_minv_degperday = $FAST_VEL_THRESH_DD;
+        my $fast_maxv_degperday = 5;        # XXX need to config it
+        cmd_timeout("findTracklets $fit_threshold_str file $fast_dets_filename idsfile $fast_ids_filename minv $fast_minv_degperday maxv $fast_maxv_degperday minobs 2", $timeout);
+
+        if (-e $fast_ids_filename) {
+            my $ids_fh = new FileHandle $fast_ids_filename or die "can't open ids file $fast_ids_filename";
+            while (defined($line = <$ids_fh>)) {
+                @items = split /\s+/, $line;
+                $tid = join '=', @items;
+                next if $already_seen{$tid};
+
+                # Our current fast processing can only find nonsynthetics because
+                # synthetics don't have fake morphological information.  But check
+                # against our findable synths just in case.
+                $ssm_id = suss_ssm_id(\%det_id_map, \@items);
+                if ($ssm_id) {
+                    delete $findable_map{$ssm_id};      # found it; remove from findable
+                }
+
+                @dets = map { $det_memo{$_} } @items;     # list of Detection objects
+                $classification = modcd_classifyDetections($inst, @dets);
+
+                # Now score the tracklet before deciding to keep it.
+                # Score only non synthetic tracklets.
+                if ($classification eq $MOPS_EFF_NONSYNTHETIC) {        
+                    my $score_spike = score_spike(@items);
+                    next if $score_spike;
+
+                    my $score_s2n = score_s2n(@items);
+                    my $score_rchi2 = score_rchi2(@items);
+                    next if $score_s2n < $min_score && $score_rchi2 < $min_score;
+
+                    my $score_vel = score_vel(@items);
+                    next if $score_vel < $min_score;
+                }
+                push @found_tracklets, [ @items ];
+                $already_seen{$tid} = 1;        # record this tracklet so we don't re-insert when doing fast  pairs
+            }
+            $ids_fh->close();
+        }
+    }
+
+
+    # Return stuff.
+    write_tracklets($outfile, \%findable_map, \@found_tracklets);
+}
+
+
+sub do_chunk {
+    my ($outfile, @field_ids) = @_;
+    my $file_root = 'OUTFILE';
+    if ($outfile =~ /^(.*)\.tracklets/) {
+        $file_root = $1;
+    }
+
+    my $dets_filename = "$file_root.dets";
+    my $ids_filename = "$file_root.ids";
+
+    # Detection selection.
+    my $dirtyLimit = undef;
+    if (defined($mops_config->{tracklet}->{dirty_limit})) {
+        $dirtyLimit = $mops_config->{tracklet}->{dirty_limit};
+	$mops_logger->info("Using dirtyLimit=$dirtyLimit");
+    }
+
+    # Tracklet-finding options.
+    my $s2n_cutoff = $mops_config->{site}->{limiting_s2n} || die "can't get s2n_cutoff";
+    my $minv_degperday = $mops_config->{tracklet}->{minv_degperday} || 0;
+    my $maxv_degperday = $mops_config->{tracklet}->{maxv_degperday} || 
+        die "can't get tracklet maxv_degperday";
+    my $do_off_galactic_pairs = $mops_config->{tracklet}->{do_off_galactic_pairs};        
+    my $min_gal_sep = $mops_config->{tracklet}->{pair_min_galactic_separation_deg} || 15;      
+        
+
+    # OK, if we are processing pairs, we allow a pairwise maxv_degperday.
+    if (scalar @field_ids == 2 and defined($mops_config->{tracklet}->{pair_maxv_degperday})) {
+        $maxv_degperday = $mops_config->{tracklet}->{pair_maxv_degperday};
+    }
+
+    # Check to see if off galactic pairs is enabled.
+    if ($do_off_galactic_pairs and scalar @field_ids == 2 and defined($mops_config->{tracklet}->{pair_maxv_off_galactic_degperday})) {
+        my $field = _fetch_memoized_field($field_ids[0]) or die("can't fetch field ID $field_ids[0]");
+        if (abs($field->gb_deg) >= $min_gal_sep) {
+            # Set maxv to maxv for off galactic plane if defined.
+            $maxv_degperday = $mops_config->{tracklet}->{pair_maxv_off_galactic_degperday};
+        }
+    }
+    my $timeout = $mops_config->{tracklet}->{timeout} || 3600;
+
+    my $fit_threshold_str = 
+        defined($mops_config->{tracklet}->{fit_threshold_arcsec}) ? 
+        ('thresh ' . ($mops_config->{tracklet}->{fit_threshold_arcsec} / 3600)) : 'thresh 0.0008';
+    my $maxt = $mops_config->{tracklet}->{maxt_days} ||
+        die "can't get tracklet maxt_days";
+    my $minobs = $mops_config->{tracklet}->{chunk_minobs} || 
+        die "can't get tracklet chunk_minobs";
+    if ($minobs eq 'max') { 
+        $minobs = scalar @field_ids;        # 'max' => use number of fields
+    }
+
+
+    # Extract detections then tell findTracklets to do its thing.
+    my $det_fh = new FileHandle ">$dets_filename" or die "can't create $dets_filename";
+    foreach my $field_id (@field_ids) {
+        select_detections($det_fh, $field_id, $s2n_cutoff, $dirtyLimit);
+    }
+    $det_fh->close();
+
+    cmd_timeout("findTracklets $fit_threshold_str file $dets_filename idsfile $ids_filename minv $minv_degperday maxv $maxv_degperday minobs $minobs use_pht true", $timeout);
+
+    # Read in dets and FT ids output and generate MIF-TRACKLET files.
+    my $lines;
+    my @items;
+    my %det_id_map;
+    my %findable_map;
+    my @found_tracklets;
+    my $ssm_id;
+    my $det_id;
+    my $line;
+
+    # Read in all detections from the tuple/stack.  Count occurrences of 
+    # multiple SSM IDs. These are tracklets we must find.
+    my $dets_fh = new FileHandle $dets_filename or die "can't open dets file $dets_filename";
+    while (defined($line = <$dets_fh>)) {
+        @items = split /\s+/, $line;
+        ($det_id, $ssm_id) = @items[0, 6];
+        if ($ssm_id ne 'NS') {
+            push @{$findable_map{$ssm_id}}, $det_id;    # add det ID for det, will need later to build unfound trk
+            $det_id_map{$det_id} = $ssm_id;             # assoc this det ID with SSM ID
+        }
+    }
+    $dets_fh->close();
+
+    # Now delete length < min_obs entries in the findable map; we wouldn't have made tracklets out
+    # of these.
+    my $k;
+    for $k (keys %findable_map) {
+        delete $findable_map{$k} if @{$findable_map{$k}} < $minobs;
+    }
+
+    # Now read in the output of findTracklets.  This is just lists of det IDs that should form tracklets.
+    # If any of them matches one of our findable tracklets, remove it from the findable table, indicating
+    # that it was indeed found.
+    if (-e $ids_filename) {
+        my $ids_fh = new FileHandle $ids_filename or die "can't open ids file $ids_filename";
+        while (defined($line = <$ids_fh>)) {
+            @items = split /\s+/, $line;
+            $ssm_id = suss_ssm_id(\%det_id_map, \@items);
+            if ($ssm_id) {
+                delete $findable_map{$ssm_id};      # found it; remove from findable
+            }
+            push @found_tracklets, [ @items ];
+        }
+        $ids_fh->close();
+    }
+
+    # Return stuff.
+    write_tracklets($outfile, \%findable_map, \@found_tracklets);
+}
+
+
+
+sub do_atlas_chunk {
+    my ($outfile, @field_ids) = @_;
+    my $file_root = 'OUTFILE';
+    if ($outfile =~ /^(.*)\.tracklets/) {
+        $file_root = $1;
+    }
+
+    my $dets_filename = "$file_root.dets";
+    my $pdets_filename = "$file_root.pdets";    # pseudodets
+    my $ids_filename = "$file_root.ids";
+    my $trackids_filename = "$file_root.trackids";
+
+    # Tracklet-finding options.
+    my $s2n_cutoff = $mops_config->{site}->{limiting_s2n} || die "can't get s2n_cutoff";
+    my $minv_degperday = $mops_config->{tracklet}->{minv_degperday} || 0;
+    my $maxv_degperday = $mops_config->{tracklet}->{maxv_degperday} || 
+        die "can't get tracklet maxv_degperday";
+        
+    my $timeout = $mops_config->{tracklet}->{timeout} || 3600;
+
+    my $fit_threshold_str = 
+        defined($mops_config->{tracklet}->{fit_threshold_arcsec}) ? 
+        ('thresh ' . ($mops_config->{tracklet}->{fit_threshold_arcsec} / 3600)) : 'thresh 0.0008';
+    my $maxt = $mops_config->{tracklet}->{maxt_days} ||
+        die "can't get tracklet maxt_days";
+    my $minobs = $mops_config->{tracklet}->{chunk_minobs} || 
+        die "can't get tracklet chunk_minobs";
+
+
+    # Extract detections then tell findTracklets to do its thing.
+    my $det_fh = new FileHandle ">$dets_filename" or die "can't create $dets_filename";
+    foreach my $field_id (@field_ids) {
+        select_detections($det_fh, $field_id, $s2n_cutoff);
+    }
+    $det_fh->close();
+
+    my $stretch = 50;
+    my $nn = 57600; # use something night-dependent
+    my $min_lobs = 2 * $minobs;
+
+    cmd_timeout("d2t $dets_filename $nn $stretch > $pdets_filename", $timeout);
+#    cmd_timeout("findTracklets $fit_threshold_str file $dets_filename idsfile $ids_filename minv $minv_degperday maxv $maxv_degperday minobs $minobs use_pht true", $timeout);
+    cmd_timeout("linkTracklets vtree file $pdets_filename trackidsfile $trackids_filename min_obs $min_lobs min_sup 2 plate_width 0.0001 pred_thresh 0.0001 vtree_thresh 0.0001", $timeout);
+    cmd_timeout("sed 's/[ab]=/ /g' < $trackids_filename > $ids_filename", $timeout);
+
+    # Read in dets and FT ids output and generate MIF-TRACKLET files.
+    my $lines;
+    my @items;
+    my %det_id_map;
+    my %findable_map;
+    my @found_tracklets;
+    my $ssm_id;
+    my $det_id;
+    my $line;
+
+    # Read in all detections from the tuple/stack.  Count occurrences of 
+    # multiple SSM IDs. These are tracklets we must find.
+    my $dets_fh = new FileHandle $dets_filename or die "can't open dets file $dets_filename";
+    while (defined($line = <$dets_fh>)) {
+        @items = split /\s+/, $line;
+        ($det_id, $ssm_id) = @items[0, 6];
+        if ($ssm_id ne 'NS') {
+            push @{$findable_map{$ssm_id}}, $det_id;    # add det ID for det, will need later to build unfound trk
+            $det_id_map{$det_id} = $ssm_id;             # assoc this det ID with SSM ID
+        }
+    }
+    $dets_fh->close();
+
+    # Now delete length < min_obs entries in the findable map; we wouldn't have made tracklets out
+    # of these.
+    my $k;
+    for $k (keys %findable_map) {
+        delete $findable_map{$k} if @{$findable_map{$k}} < $minobs;
+    }
+
+    # Now read in the output of findTracklets.  This is just lists of det IDs that should form tracklets.
+    # If any of them matches one of our findable tracklets, remove it from the findable table, indicating
+    # that it was indeed found.
+    if (-e $ids_filename) {
+        my $ids_fh = new FileHandle $ids_filename or die "can't open ids file $ids_filename";
+        while (defined($line = <$ids_fh>)) {
+            @items = split /\s+/, $line;
+            $ssm_id = suss_ssm_id(\%det_id_map, \@items);
+            if ($ssm_id) {
+                delete $findable_map{$ssm_id};      # found it; remove from findable
+            }
+            push @found_tracklets, [ @items ];
+        }
+        $ids_fh->close();
+    }
+
+    # Return stuff.
+    write_tracklets($outfile, \%findable_map, \@found_tracklets);
+}
+
+
+sub do_deep_stack_findtracklets {
+    my ($outfile, @field_ids) = @_;
+    my $file_root = 'OUTFILE';
+    if ($outfile =~ /^(.*)\.tracklets/) {
+        $file_root = $1;
+    }
+
+    my $dets_filename = "$file_root.dets";
+    my $ids_filename = "$file_root.ids";
+
+    # Tracklet-finding options.
+    my $s2n_cutoff = $mops_config->{site}->{limiting_s2n} || die "can't get s2n_cutoff";
+    my $minv_degperday = $mops_config->{tracklet}->{minv_degperday} || 0;
+    my $maxv_degperday = $mops_config->{tracklet}->{maxv_degperday} || 
+        die "can't get tracklet maxv_degperday";
+
+    my $fit_threshold_str = 
+        defined($mops_config->{tracklet}->{fit_threshold_arcsec}) ? 
+        ('thresh ' . ($mops_config->{tracklet}->{fit_threshold_arcsec} / 3600)) : 'thresh 0.0008';
+    my $maxt = $mops_config->{tracklet}->{maxt_days} ||
+        die "can't get tracklet maxt_days";
+    my $minobs = int((scalar @field_ids) / 2) + 1;  # 4 => 3, 5 => 3, 6 => 4, 7 => 4, etc.
+    my $maxobs = scalar @field_ids;
+
+    my $timeout = $mops_config->{tracklet}->{timeout} || 3600;
+
+    # Extract detections then tell findTracklets to do its thing.
+    my $det_fh = new FileHandle ">$dets_filename" or die "can't create $dets_filename";
+    foreach my $field_id (@field_ids) {
+        select_detections($det_fh, $field_id, $s2n_cutoff);
+    }
+    $det_fh->close();
+    cmd_timeout("findTracklets $fit_threshold_str file $dets_filename idsfile $ids_filename minv $minv_degperday maxv $maxv_degperday minobs $minobs maxobs $maxobs", $timeout);
+
+    # Read in dets and FT ids output and generate MIF-TRACKLET files.
+    my $lines;
+    my @items;
+    my %det_id_map;
+    my %findable_map;
+    my @found_tracklets;
+    my $ssm_id;
+    my $det_id;
+    my $line;
+
+    # Read in all detections from the tuple/stack.  Count occurrences of 
+    # multiple SSM IDs. These are tracklets we must find.
+    my $dets_fh = new FileHandle $dets_filename or die "can't open dets file $dets_filename";
+    while (defined($line = <$dets_fh>)) {
+        @items = split /\s+/, $line;
+        ($det_id, $ssm_id) = @items[0, 6];
+        if ($ssm_id ne 'NS') {
+            push @{$findable_map{$ssm_id}}, $det_id;    # add det ID for det, will need later to build unfound trk
+            $det_id_map{$det_id} = $ssm_id;             # assoc this det ID with SSM ID
+        }
+    }
+    $dets_fh->close();
+
+    # Now delete length < min_obs entries in the findable map; we wouldn't have made tracklets out
+    # of these.
+    my $k;
+    for $k (keys %findable_map) {
+        delete $findable_map{$k} if @{$findable_map{$k}} < $minobs;
+    }
+
+    # Now read in the output of findTracklets.  This is just lists of det IDs that should form tracklets.
+    # If any of them matches one of our findable tracklets, remove it from the findable table, indicating
+    # that it was indeed found.
+    if (-e $ids_filename) {
+        my $ids_fh = new FileHandle $ids_filename or die "can't open ids file $ids_filename";
+        while (defined($line = <$ids_fh>)) {
+            @items = split /\s+/, $line;
+            $ssm_id = suss_ssm_id(\%det_id_map, \@items);
+            if ($ssm_id) {
+                delete $findable_map{$ssm_id};      # found it; remove from findable
+            }
+            push @found_tracklets, [ @items ];
+        }
+        $ids_fh->close();
+    }
+
+    # Return stuff.
+    write_tracklets($outfile, \%findable_map, \@found_tracklets);
+}
+
+
+sub do_deep_stack_collapsetracklets {
+    my ($outfile, @field_ids) = @_;
+    my $file_root = 'OUTFILE';
+    if ($outfile =~ /^(.*)\.tracklets/) {
+        $file_root = $1;
+    }
+
+    my $dets_fn = "$file_root.dets";
+    my $sum_fn = "$file_root.sum";
+    my $pairs_fn = "$file_root.pairs";
+    my $collapse_fn = "$file_root.collapse";
+    my $pure_fn = "$file_root.pure";
+    my $ids_fn = "$file_root.ids";
+
+    my $s2n_cutoff = $mops_config->{site}->{limiting_s2n} || die "can't get s2n_cutoff";
+    my $tuplewise_min_fields = $mops_config->{tracklet}->{tuplewise_min_fields} || 2;
+    my $tuplewise_min_time_interval = $mops_config->{tracklet}->{tuplewise_min_time_interval} || 0;
+    my $minv_degperday = $mops_config->{tracklet}->{minv_degperday} || 0;
+#    $minv_degperday /= 2;       # XXX hmm
+    my $maxv_degperday = $mops_config->{tracklet}->{maxv_degperday} || 
+        die "can't get tracklet maxv_degperday";
+    my $minobs = int((scalar @field_ids) / 2) + 1;  # 4 => 3, 5 => 3, 6 => 4, 7 => 4, etc.
+#    my $minobs = $mops_config->{tracklet}->{minobs} || 
+#        die "can't get tracklet minobs";
+    my $maxobs = scalar @field_ids;
+    my $maxt = $mops_config->{tracklet}->{maxt_days} ||
+        die "can't get tracklet maxt_days";
+    my $collapse_args = $mops_config->{tracklet}->{collapse_args} or die "can't get tracklet collapse_args";
+    # qw( 0.002 0.002 5.0 0.05 ); # RA_tol_deg Dec_tol_deg Ang_tol_deg Vel_tol_deg/day?
+    my $fit_threshold_str = 
+        defined($mops_config->{tracklet}->{fit_threshold_arcsec}) ? 
+        ('thresh ' . ($mops_config->{tracklet}->{fit_threshold_arcsec} / 3600)) : 'thresh 0.0008';
+    my $timeout = $mops_config->{tracklet}->{timeout} || 10;
+
+    # Extract detections then tell findTracklets to do its thing.
+    my $det_fh = new FileHandle ">$dets_fn" or die "can't create $dets_fn";
+    foreach my $field_id (@field_ids) {
+        select_detections($det_fh, $field_id, $s2n_cutoff);
+    }
+    $det_fh->close();
+    cmd_timeout("findTracklets $fit_threshold_str file $dets_fn summaryfile $sum_fn pairfile $pairs_fn minv $minv_degperday maxv $maxv_degperday minobs $minobs maxobs $maxobs", $timeout);
+    cmd("CollapseTracklets $dets_fn $pairs_fn $collapse_args $collapse_fn");
+    cmd("purifyTracklets --detsFile=$dets_fn --pairsFile=$collapse_fn --outFile=$pure_fn");
+    cmd("removeSubsets --inFile=$pure_fn --outFile=$ids_fn --keepOnlyLongest=true");
+
+    # Read in dets and FT ids output and generate MIF-TRACKLET files.
+    my $lines;
+    my @items;
+    my %det_id_map;
+    my %findable_map;
+    my @found_tracklets;
+    my $ssm_id;
+    my $det_id;
+    my $line;
+
+    # Read in all detections from the tuple/stack.  Count occurrences of 
+    # multiple SSM IDs. These are tracklets we must find.  At the same
+    # time, build a table mapping line numbers to det IDs, since CollapseTracklets
+    # uses the old FT pairs-oriented output.
+    my $dets_fh = new FileHandle $dets_fn or die "can't open dets file $dets_fn";
+    my $line_no = 0;
+    my %line2id_map;
+    while (defined($line = <$dets_fh>)) {
+        @items = split /\s+/, $line;
+        ($det_id, $ssm_id) = @items[0, 6];
+        $line2id_map{$line_no++} = $det_id;             # map it
+
+        if ($ssm_id ne 'NS') {
+            push @{$findable_map{$ssm_id}}, $det_id;    # add det ID for det, will need later to build unfound trk
+            $det_id_map{$det_id} = $ssm_id;             # assoc this det ID with SSM ID
+        }
+    }
+    $dets_fh->close();
+
+    # Now delete length < min_obs entries in the findable map; we wouldn't have made tracklets out
+    # of these.
+    my $k;
+    for $k (keys %findable_map) {
+        delete $findable_map{$k} if @{$findable_map{$k}} < $minobs;
+    }
+
+    # Now read in the output of findTracklets/CollapseTrackltes.  This is just
+    # lists of line numbers that form tracklets.  If any of them matches one
+    # of our findable tracklets, remove it from the findable table, indicating
+    # that it was indeed found.
+    if (-e $ids_fn) {
+        my $ids_fh = new FileHandle $ids_fn or die "can't open lines file $ids_fn";
+        while (defined($line = <$ids_fh>)) {
+            @items = map { $line2id_map{$_} || die("CT ID lookup failed") } split /\s+/, $line;
+            $ssm_id = suss_ssm_id(\%det_id_map, \@items);
+            if ($ssm_id) {
+                delete $findable_map{$ssm_id};      # found it; remove from findable
+            }
+            push @found_tracklets, [ @items ];
+        }
+        $ids_fh->close();
+    }
+
+    # Return stuff.
+    write_tracklets($outfile, \%findable_map, \@found_tracklets);
+}
+
+
+sub suss_ssm_id {
+    # Given a ref to a map of det IDs => SSM IDs, and a list of det IDs from findTracklets,
+    # return whether they form a clean tracklet of a synthetic object; that is, all the
+    # detections belong to the same synthetic object.
+    my ($det_id_href, $items_aref) = @_;
+    my %tmp;
+    my $det_id;
+    my $ssm_id;
+
+    foreach $det_id (@{$items_aref}) {
+        $ssm_id = $det_id_href->{$det_id};      # try to lookup synth obj
+        if ($ssm_id) {
+            $tmp{$ssm_id} = 1;
+        }
+        else {
+            return undef;                       # nonsynthetic object
+        }
+    }
+
+    if (scalar keys %tmp == 1) {
+        return (keys %tmp)[0];
+    }
+    else {
+        return undef;
+    }
+}
+
+
+sub cmd {
+    # Run a command; die if fails.
+    my ($cmd_str) = @_;
+    print STDERR "Executing $cmd_str\n" if $debug;
+    system($cmd_str) == 0 or die "command failed with code $?: $cmd_str";
+}
+
+sub cmd_timeout {
+    # Run a command; die if fails or timeout
+    # From http://www.perlmonks.org/?node_id=77188
+    # and http://www.perlmonks.org/bare/?node_id=539889
+    my ($command, $timeout) = @_;
+    print STDERR "Executing $command (timeout: $timeout)\n";
+    print STDERR "Executing $command (timeout: $timeout)\n" if $debug;
+    my $pid = open(PIPE, "$command |") or die $!;
+    eval {
+	local $SIG{ALRM} = sub { die "TIMEDOUT" };
+	alarm($timeout);
+	while (<PIPE>) {
+	    ;
+	};
+	close(PIPE);
+	alarm(0);
+    };
+    if ($@) {
+	die $@ unless $@ =~ /TIMEDOUT/;
+	kill 9, $pid;
+	close(PIPE);  ## needed??
+	$? ||= 9;
+	print STDERR "Command [$command] timed out\n";
+	exit(1);
+    }
+}
+
+
+sub _mapobjname {
+    # Return an object name suitable for MOPS processing.  If the
+    # object name is empty or 'FALSE', just return a space character.
+    my ($name) = @_;
+    $name = 'NS' if (!$name or ($name eq 'FALSE' or $name eq $MOPS_NONSYNTHETIC_OBJECT_NAME));
+    return $name ;      # return original name
+}
+
+
+sub score_spike {
+    # Return a score based on ON_SPIKE content.
+    my @det_ids = @_;
+    my @morphdata;
+    foreach my $id (@det_ids) {
+        push(@morphdata, $morph_memo{$id}) if defined $morph_memo{$id};
+    }
+    my $ct = 0;
+    foreach my $m (@morphdata) {
+        $ct++ if ($m->{flags2} & $ON_SPIKE || $m->{flags2} & $ON_STARCORE);
+    }
+    return $ct >= 1;        # pairs, require both good
+}
+
+
+sub avg {
+    return (sum @_) / @_;
+}
+
+
+sub score_s2n {
+    # Return a score based on moderate to high S/N.  The idea here is that high, slowish S/N tracklets are
+    # rare enough that we don't have to worry about morphology.  If the GCR is small then we will boost.
+    my @det_ids = @_;
+    my @dets = map { $det_memo{$_} } @det_ids;
+    my $s2n_avg = avg(map { $_->{s2n} } @dets);
+
+    return 1 - ($MIN_S2N / $s2n_avg);      # check 50 => .8, 10 => 0
+}
+
+
+sub score_rchi2 {
+    # Return a PSF-ness regardless of S/N.  Allow a small GCR to contribute 
+    # similarly to a single good PSF value (small 1-rchi2).
+    my @det_ids = @_;
+    my @morphdata;
+    foreach my $id (@det_ids) {
+        push(@morphdata, $morph_memo{$id}) if defined $morph_memo{$id};
+    }
+    my @vals = map { (1 - ($_->{rchi2})) ** 2 } @morphdata;
+    my $max = max @vals;            # allow one outlier
+    my $sum = sum(@vals);
+    return 1 unless $sum;
+
+    if (@vals > 2) {
+        my $denom = @vals + 1;                      # -1 for outlier, +1 for GCR adj
+        return 1 / (1 + ($sum) / $denom);        # remove outlier if @vals > 2
+    }
+    return 1 / (1 + $sum / @vals);
+}
+
+
+sub score_aligned {
+    # Return a score based on the tracklet having aligned detections.
+
+    my (@det_ids) = @_;
+    my @morphdata;
+    foreach my $id (@det_ids) {
+        push(@morphdata, $morph_memo{$id}) if defined $morph_memo{$id};
+    }
+    return 0 if (scalar(@morphdata) == 0); # No morphology for provided detections
+    
+    # First build a temporary tracklet so we have velocity information, PA, etc.
+    my @dets = map { $det_memo{$_} } @det_ids;
+    my $trk = PS::MOPS::DC::Tracklet->new($inst, detections => \@dets, classification => 'N');
+    my $minexp_sec = min(map { $_->{exptime_sec} } @morphdata);
+    
+    # Get pixel spacing for the detection. If detection is synthetic then data 
+    # must be retrieved from the configuration file, or is set the PS1 spacing
+    # value of 0.25"
+    my $pxspc = $morphdata[0]->{pxspc} || $inst->getConfig()->{site}->{pixel_scale} || 0.25;
+
+    # velocity for which shortest possible exposure has expected len exceeding px thresh
+    my $vel_thresh = $FAST_VEL_THRESH_DD;
+
+    if ($trk->vTot > $vel_thresh) {
+        # tracklet has "fast" motion, so create a vector that is the sum
+        # of all det PAs * trail len.  This resultant vector must be in the
+        # direction of the tracklet PA and within .75(?) of the expected length.
+        my $trk_pa_deg = fmod($trk->posAng, 180);
+        $trk_pa_deg += 180 if $trk_pa_deg < 0;      # ensure between 0, 180
+
+        my $model_sumx = 0;
+        my $model_sumy = 0;
+        my $sumx = 0;
+        my $sumy = 0;
+
+        my $r;
+        my $ndet = 0;
+        foreach $r (@morphdata) {
+            # For this detection, compute the avg PSF width, and a PSF major axis extent
+            # for a fast detection relative to this width.
+            $ndet++;
+            my $avg_psf_px = 2 * ($r->{pmaj} + $r->{pmin}) / 2;     # IPP reports half lengths
+            my $min_excess_px = ($vel_thresh * $minexp_sec / 86400 / $pxspc * 3600) - $avg_psf_px;
+            return 0 if ($min_excess_px < 0);       # cannot resolve velocity
+
+            my $xaxis = $r->{xaxis} || 1.0;
+            my $theta_deg = fmod(-90 + $xaxis * rad2deg(0.5 * atan2(2 * $r->{mxy}, $r->{mxx} - $r->{myy})), 180);
+            $theta_deg += 180 if $theta_deg < 0;
+
+            # Choose the angle so that it's oriented as closely as possible to the tracklet PA.  This 
+            # lets us handle the bidirectional uncertainty in the detection orientation (can't tell 
+            # which direction the direction is pointed +/- 180 deg).
+            $theta_deg -= 180 if ($trk_pa_deg - $theta_deg < -90);
+            $theta_deg += 180 if ($trk_pa_deg - $theta_deg > 90);
+
+            # If the tracklet is "very fast", require a good match to orientation.
+            if ($trk->vTot > 1.0 * $vel_thresh) {
+                return 0 if abs($trk_pa_deg - $theta_deg) > $ALIGN_THRESH_DEG; # XXX LD config this?
+            }
+        }
+        return 1;
+    }
+
+    return 0;
+}
+
+
+sub score_vel {
+    # Return a score based on the tracklet having
+    #   "fast motion" (large computed major axis in pixels relative to stellar PSF)
+    #   consistent PA across detections
+    #   PA matches tracklet PA
+
+    my (@det_ids) = @_;
+
+    # First build a temporary tracklet so we have velocity information, PA, etc.
+    my @dets = map { $det_memo{$_} } @det_ids;
+    my $trk = PS::MOPS::DC::Tracklet->new($inst, detections => \@dets, classification => 'N');
+
+    my @morphdata = map { $morph_memo{$_} } @det_ids;
+    my $minexp_sec = min(map { $_->{exptime_sec} } @morphdata);
+    
+    # Get pixel spacing for the detection. If detection is synthetic then data 
+    # must be retrieved from the configuration file, or is set to the PS1 spacing
+    # value of 0.25"
+    my $pxspc = $morphdata[0]->{pxspc} || $inst->getConfig()->{site}->{pixel_scale} || 0.25;
+
+    # velocity for which shortest possible exposure has expected len exceeding px thresh
+#    my $vel_thresh = $FAST_PX_THRESH / $minexp_sec * 86400 * $pxspc / 3600;
+    my $vel_thresh = $FAST_VEL_THRESH_DD;
+
+    if ($trk->vTot > $vel_thresh) {
+        # tracklet has "fast" motion, so create a vector that is the sum
+        # of all det PAs * trail len.  This resultant vector must be in the
+        # direction of the tracklet PA and within .75(?) of the expected length.
+        my $trk_pa_deg = fmod($trk->posAng, 180);
+        $trk_pa_deg += 180 if $trk_pa_deg < 0;      # ensure between 0, 180
+
+        my $model_sumx = 0;
+        my $model_sumy = 0;
+        my $sumx = 0;
+        my $sumy = 0;
+
+        my $r;
+        my $ndet = 0;
+        foreach $r (@morphdata) {
+            # For this detection, compute the avg PSF width, and a PSF major axis extent
+            # for a fast detection relative to this width.
+            $ndet++;
+            my $avg_psf_px = 2 * ($r->{pmaj} + $r->{pmin}) / 2;     # IPP reports half lengths
+            my $min_excess_px = ($vel_thresh * $minexp_sec / 86400 / $pxspc * 3600) - $avg_psf_px;
+            return 0 if ($min_excess_px < 0);       # cannot resolve velocity
+
+            $model_sumx += cos(deg2rad(90 + $trk_pa_deg)) * $min_excess_px;
+            $model_sumy += sin(deg2rad(90 + $trk_pa_deg)) * $min_excess_px;
+
+            # Compute major and minor axes from moments.
+            my $arg2 = 4 * $r->{mxy}**2 + ($r->{mxx} - $r->{myy})**2;
+            if ($arg2 < 0) {
+                $arg2 = 0;
+            }
+
+            my $maj_arg = $r->{mxx} + $r->{myy} + sqrt($arg2);
+            if ($maj_arg < 0) {
+                $maj_arg = 0;
+            }
+
+            my $min_arg = $r->{mxx} + $r->{myy} - sqrt($arg2);
+            if ($min_arg < 0) {
+                $min_arg = 0;
+            }
+
+            my $maj_px = 2 * sqrt($maj_arg / 2);
+            my $min_px = 2 * sqrt($min_arg / 2);
+            my $xaxis = $r->{xaxis} || 1.0;
+            my $theta_deg = fmod(-90 + $xaxis * rad2deg(0.5 * atan2(2 * $r->{mxy}, $r->{mxx} - $r->{myy})), 180);
+            $theta_deg += 180 if $theta_deg < 0;
+
+            # Choose the angle so that it's oriented as closely as possible to the tracklet PA.  This 
+            # lets us handle the bidirectional uncertainty in the detection orientation (can't tell 
+            # which direction the direction is pointed +/- 180 deg).
+            $theta_deg -= 180 if ($trk_pa_deg - $theta_deg < -90);
+            $theta_deg += 180 if ($trk_pa_deg - $theta_deg > 90);
+
+            # If the tracklet is "very fast", require a good match to orientation.
+#            if ($trk->vTot > 1.5 * $vel_thresh) {
+            if ($trk->vTot > 1.0 * $vel_thresh) {
+                return 0 if abs($trk_pa_deg - $theta_deg) > 10; # XXX LD config this?
+            }
+
+#            printf "%s trk=%.2f det=%.2f\n", join('=', @det_ids), $trk_pa_deg, $theta_deg;
+#            $maj_px -= $avg_psf_px;
+#            $sumx += cos(deg2rad(90 + $theta_deg)) * $maj_px;
+#            $sumy += sin(deg2rad(90 + $theta_deg)) * $maj_px;
+        }
+        return 1;
+
+        # Now we have two vectors: a model based on the tracklet velocity and
+        # a real one measured from the major axis fits.
+
+        my $model_len = sqrt($model_sumx ** 2 + $model_sumy ** 2);
+        my $len = sqrt($sumx ** 2 + $sumy ** 2);
+        if ($len > $model_len) {
+            $sumx *= $model_len / $len;
+            $sumy *= $model_len / $len;
+            $len = $model_len;
+        }
+
+        my $dot = ($sumx * $model_sumx + $sumy * $model_sumy) / ($model_len ** 2);
+        $dot = 1.0 if $dot > 1.0;
+        return $dot;
+    }
+
+    return 0;
+}
+
+
+sub select_detections {
+    my ($fh, $field_id, $minS2N, $dirtyLimit) = @_;
+    my $field = modcf_retrieve($inst, fieldId => $field_id);
+    die("can't fetch field ID $field_id") unless $field;
+
+    my $exposure_time = ($field->timeStop - $field->timeStart) * $SECONDS_PER_DAY;
+    my $det_i;
+   
+    # ATLAS-specific.
+    if (defined($dirtyLimit)) {
+        $det_i = modcd_retrieve($inst, fieldId => $field_id, minS2N => $minS2N, dirtyLimit => $dirtyLimit);
+    } else {
+        $det_i = modcd_retrieve($inst, fieldId => $field_id, minS2N => $minS2N);
+    }
+
+    # Output detection in MITI extended format, which means length and angle at the
+    # end of each line.
+    my $det;
+    my $emit_extended = $mops_config->{tracklet}->{extended};
+
+    while ($det = $det_i->next()) {
+        my @stuff = ($det->detId, $det->epoch, $det->ra, $det->dec, $det->mag, $det->{obscode});
+        push @stuff, _mapobjname($det->objectName);
+        if ($emit_extended) {
+            push @stuff, ($det->{length_deg} > 0 ? ($det->{length_deg} * $STD_EXPOSURE_TIME / $exposure_time) : '-1'), ($det->{orient_deg} || '-1');
+        }
+        else {
+            push @stuff, '-1', '-1';
+        }
+        print $fh join(' ', @stuff), "\n";
+    }
+}
+
+
+sub select_extended_detections {
+    # Detection objects are stored in $det_memo, and for real detections, their morophology
+    # is stored in $morph_memo.
+    my ($fh, $field_id, $minS2N, $extended, $dirtyLimit) = @_;
+    my $field = _fetch_memoized_field($field_id) or die("can't fetch field ID $field_id");
+
+    # First get a list of the "fast" detections in this field.
+    my $fast_px_thresh = 5.25;      # determined empirically, XXX LD config it?
+    my $dbh = $inst->dbh;
+
+    # If the extended parameter was provided then only select detections whose 
+    # psf is more than 5.25 pixels in length.
+    my $extended_str = $extended ? 
+        "2*sqrt((dr.moments_xx+dr.moments_yy+sqrt(4*pow(dr.moments_xy,2)+pow(dr.moments_xx-dr.moments_yy,2)))/2) > $fast_px_thresh and" : '';
+    my $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select d.det_id det_id,
+    2*sqrt((dr.moments_xx+dr.moments_yy+sqrt(4*pow(dr.moments_xy,2)+pow(dr.moments_xx-dr.moments_yy,2)))/2) maj,
+    dr.psf_chi2 / dr.psf_dof rchi2, 
+    dr.moments_xx mxx, 
+    dr.moments_yy myy, 
+    dr.moments_xy mxy, 
+    dr.f_pos f_pos, 
+    dr.psf_major pmaj, 
+    dr.psf_minor pmin, 
+    dr.flags flags,
+    dr.flags2 flags2,
+    f.de10 pxspc, 
+    (f.time_stop - f.time_start) * 86400 exptime_sec
+from fields f join detections d using(field_id) join det_rawattr_v2 dr using(det_id)
+where
+    $extended_str 
+    field_id=?
+SQL
+
+    # Store morphological information for all real detections in the field in the 
+    # morph_memo hash keyed on detection id.
+    $sth->execute($field_id) or die $sth->errstr;
+    my $href;
+    while ($href = $sth->fetchrow_hashref) {
+        $morph_memo{$href->{det_id}} = $href;
+    }
+    $sth->finish;
+    
+    # Calculate exposure time for detections in the field.
+    my $exposure_time = ($field->timeStop - $field->timeStart) * $SECONDS_PER_DAY;
+    
+    # Get all detections real and synthetic with a S/N above our set minimum S/N
+    my $det_i;
+
+    # Output detection in MITI extended format, which means length and angle at the
+    # end of each line if use extended data when generating trackles is specified.
+    my $det;
+    my $emit_extended = $mops_config->{tracklet}->{extended};
+
+    while ($det = $det_i->next()) { 
+        $det_memo{$det->detId} = $det;                      # save for later
+#        next unless exists($morph_memo{$det->detId});       # skip unless morphology exists
+
+        my @stuff = ($det->detId, $det->epoch, $det->ra, $det->dec, $det->mag, $det->{obscode});
+        push @stuff, _mapobjname($det->objectName);
+        if ($emit_extended) {
+            push @stuff, ($det->{length_deg} > 0 ? ($det->{length_deg} * $STD_EXPOSURE_TIME / $exposure_time) : '-1'), ($det->{orient_deg} || '-1');
+        }
+        else {
+            push @stuff, '-1', '-1';
+        }
+        print $fh join(' ', @stuff), "\n";
+    }
+}
+
+
+sub write_tracklets {
+    # MIF-TRACKLET CLASSIFICATION DET_ID1 DET_ID2 ...
+    my ($filename, $findable_href, $found_list) = @_;
+    my $out_fh = new FileHandle ">$filename" or die "can't create $filename";
+
+    # Write out found tracklets.
+    my $stack;
+    foreach $stack (@{$found_list}) {
+        print $out_fh join(' ', 'MIF-TRACKLET', 'U', @{$stack}), "\n";
+    }
+
+    # Unfound tracklets.
+    foreach my $ssm_id (keys %{$findable_href}) {
+        print $out_fh join(' ', 'MIF-TRACKLET', $MOPS_EFF_UNFOUND, @{$findable_href->{$ssm_id}}), "\n";
+    }
+
+    $out_fh->close();
+}

@@ -1,0 +1,24 @@
+PS/MOPS/DC/Runtime version 0.01
+===================================
+
+Runtime.pm is an interface to runtime and non-DC specific MOPS database
+information.
+
+INSTALLATION
+
+To install this module type the following:
+
+   perl Makefile.PL LIB=$MOPS_HOME/lib/perl5
+   make
+   make test
+   make install
+
+DEPENDENCIES
+
+This module requires these other modules and libraries:
+
+  PS::MOPS::DC;
+
+COPYRIGHT AND LICENCE
+
+Copyright (C) 2004 Institute for Astronomy, University of Hawaii

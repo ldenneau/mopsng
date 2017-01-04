@@ -1,0 +1,40 @@
+Attendees:
+Bolin, Chastel, Denneau, Veres, Wainscoat
+
+* Telescope Status
+SC for KC: All good.
+
+* IPP Issues  - IPP Trail fitting: No progress
+  - Photometry: No report
+  - Convolution: No report
+
+* Data Processing
+  No changes
+  - SC Action: Convert Marco’s IDL script to Perl/Python
+  - PV Action: Send other IDL script to SC for conversion?
+
+* NEO Status
+  - Agreement with Catalina: only observing South of ecliptic for w
+  - Very clean OSS data last night -> 2013-11-27
+  - Not so much follow-up from cfht
+  - Currently 63 objects on the confirmation page
+  - PV: Very fast mover P109e0v (8 deg/day) -> 4 detections 
+
+* NEO Czaring
+  Nothing to report
+
+* Comets
+  - New comets should be submitted asap
+  - http://www.minorplanetcenter.net/iau/NEO/pccp_tabular.html
+  - SC Action: Add a text field to czar/tracklet to add COM info
+ 
+* ATLAS
+  No report
+
+* AOB
+  - LD: Talked with Erik Christiansen (Catalina). Plan to replace known_server by pre-computed known objects positions. Will save a lot of time.
+  - SC: Test Sets Definition. (1) observation conditions: excellent, good, fair, poor, awful => define that thorugh SEEING; (2) must have fast movers (but for poor or awful); (3) galactic / ecliptic latitude? close/not close from galactic/ecliptic; (4) quad vs pairs
+Total: ~5*4 = 20 test quads or pairs per filter.
+Will work on w first; then g,r,i. Won’t do it for y,z.
+
+

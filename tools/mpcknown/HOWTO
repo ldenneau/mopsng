@@ -1,0 +1,10 @@
+# Download orbit and observation files
+sh get
+
+# Extract F51 observations
+perl -ane 'print if substr($_,77,3) eq "F51"' < CmtObs.txt NumObs.txt UnnObs.txt > F51.obs
+
+# For each one, look it up and generate SQL for it for our master MPC table.
+munge F51.obs --sql F51.sql | tee F51.out
+mysql -umopsroot -ppanstar1 -hmops01 mpc < mpc.sql 
+mysql -umopsroot -ppanstar1 -hmops01 mpc < f51.sql 

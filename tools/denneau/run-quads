@@ -1,0 +1,29 @@
+#!/bin/sh
+
+# List our email recipients here.
+RECIPS='denneau@ifa.hawaii.edu granvik@ifa.hawaii.edu tgrav@pha.jhu.edu jedicke@ifa.hawaii.edu rjw@ifa.hawaii.edu chambers@ifa.hawaii.edu kaiser@ifa.hawaii.edu schastel@ifa.hawaii.edu burgett@ifa.hawaii.edu eva.schunova@gmail.com'
+#RECIPS='schastel@ifa.hawaii.edu'
+
+# night number
+NN=$1
+
+# Exit on error.
+set -e
+
+# First make sure chunks are in config file.
+# editConfig
+
+# Now ingest, patch chunk names, mopper --once, get stamps, KNOWN_SERVER, email
+# ingest        # suggest you run manually
+
+# Run the pipeline and necessary postprocessing.
+mopper --no_ingest
+
+# This is now in config and run by EON.
+#nightly_digests --nn $NN
+#submit_stamps --quads --derived --nn $NN
+# KNOWN_LOCAL --nn $NN
+
+echo "Night $NN 2-TTI data completed.  See http://mopshq2.ifa.hawaii.edu/model/$MOPS_DBINSTANCE/2tti.html?nn=$NN&limit=100" | mail -s "2-TTI night $NN completed" $RECIPS
+echo "Sent msg to $RECIPS"
+

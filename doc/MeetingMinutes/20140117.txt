@@ -1,0 +1,48 @@
+Attendees: Bolin, Chastel, Denneau, Veres, Wainscoat
+
+* Telescope Status
+No report
+
+* IPP Issues
+  - IPP Trail fitting
+  - Photometry
+  - Convolution
+No report. IPP move should be finished by Feb 17th.
+
+* Data Processing
+  - MOPS Hardware
+  - Changes
+  - findTracklets needs tuning
+
+* NEO Status
+Bright time not too overwhelming. 3 on the CP.
+
+* NEO Czaring
+- 20% of stamps missing
+
+* Comets
+- BB: See last week
+- RJW: Create a tool to query our comets and get info/statistics about them.
+- BB: No follow-up of P109CWR with CFHT. Need to get it when CFHT has Megaprime back on
+
+* ATLAS
+- Observing every night on Mauna Loa
+- they would like to start to see bright NEOs - please advise them if you know of suitable targets
+
+
+* AOB
+  * New observing plan (RJW)
+- Starts Feb 1st (Same plan till Jan 31)
+- 11% on e.g. odd nights; 100% on e.g. even nights
+- ipp0022.ifa.hawaii.edu/ps1sc/denneau/173/hammer.html (show: oss w)
+- OSS stripes 1h wide, e.g. OSS.R02N1 => RA between 02 and 03 hours, North 1 (up to N7)
+- Cooperation with Catalina continues
+- i band when the moon is up and bright enough
+- there might be a few z band observations but only quads
+- the tessellation needs to be modified and rerun to extend down to -40 - LD is exploring this
+- we plan to cover areas twice per month to start with, and this will produce some self-followup
+- Present staffing may not be enough for NEO review/followup
+- MSS and ESS will still be observed
+ * Lindley Johnson and possibly Tim Spahr may visit at the end of February
+ * We would like more open access to the IPP
+

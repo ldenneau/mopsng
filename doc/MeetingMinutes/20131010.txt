@@ -1,0 +1,34 @@
+Attendees:
+Chastel (chair/scribe), Denneau, Engelhardt
+
+Minutes:
+* Telescope Status (KC)
+-> Bad weather
+
+* IPP Trail fitting (PV)
+-> "Ground-truth data" e-mail sent to EAM. No deadline given.
+
+* Data Processing (SC)
+-> digest2 updated to 2.0.15
+-> needs to be updated for the NEO cluster
+
+* NEO Status (SC)
+No report
+
+* NEO Czaring (SC)
+-> prenotification when tracklet stage is started
+-> review link on the right
+
+* Comets (LD)
+New one. Faint.
+
+* ATLAS (RJ/LD/AS)
+No report
+
+* AOB
+ - automated detection efficiency status / automated tracklet efficiency
+-> known for w: about 75%
+-> for other bands: difficult to say. We only have pairs. Limit on velocity. Depends on sensitivity.
+-> LD: injecting synthetic objects wouldn't give a good estimate
+-> LD will talk to RJ about it
+

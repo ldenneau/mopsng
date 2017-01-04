@@ -1,0 +1,20 @@
+# Set up env, set for MOPS development
+#
+# Usage within bash: source mops_env {MOPS instance name}
+
+MOPS="MOPS_DEVEL"
+
+export MOPS_HOME=/home/mops/$MOPS
+export MOPS_DBINSTANCE=$1                   # dev database instance
+export MOPS_VAR=$MOPS_HOME/var/$MOPS_DBINSTANCE
+
+export PERL5LIB=$MOPS_VAR/lib/perl5:$MOPS_HOME/lib/perl5
+export PYTHONPATH=$MOPS_VAR/lib/python:$MOPS_HOME/lib/python
+export PATH=$MOPS_VAR/bin:$MOPS_HOME/bin:/bin:/usr/bin:/usr/local/bin:/opt/bin:$BASE_PATH
+export LD_LIBRARY_PATH=$HOME/lib:$MOPS_VAR/lib:$MOPS_HOME/lib
+
+export CAET_DATA=$MOPS_HOME/data/caet_data
+export OORB_DATA=$MOPS_HOME/data/oorb
+export ORBFIT_DATA=$MOPS_HOME/data/orbfit
+
+export PS1="[\u@\h ($MOPS/$MOPS_DBINSTANCE)]$ "

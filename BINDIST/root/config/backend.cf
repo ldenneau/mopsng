@@ -1,0 +1,4 @@
+hostname = localhost
+backend = mysql
+username = mops
+password = mops

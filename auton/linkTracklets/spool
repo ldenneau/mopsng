@@ -1,0 +1,16 @@
+running build
+running build_ext
+building 'linktracklets' extension
+gcc -arch ppc -arch i386 -isysroot /Developer/SDKs/MacOSX10.4u.sdk -fno-strict-aliasing -Wno-long-double -no-cpp-precomp -mno-fused-madd -fno-common -dynamic -DNDEBUG -g -O3 -I. -I.. -I../extra -I../draw -I../ASL_headers -I../dset -I../utils -I/usr/X11R6/include -I/Library/Frameworks/Python.framework/Versions/2.5/include/python2.5 -c linktrackletsmodule.c -o build/temp.macosx-10.3-fat-2.5/linktrackletsmodule.o
+linktrackletsmodule.c: In function 'wrap_linktracklets_main':
+linktrackletsmodule.c:660: warning: return makes pointer from integer without a cast
+linktrackletsmodule.c: In function 'wrap_linktracklets_main':
+linktrackletsmodule.c:660: warning: return makes pointer from integer without a cast
+linktrackletsmodule.c: At top level:
+linktrackletsmodule.c:667: warning: initialization from incompatible pointer type
+linktrackletsmodule.c: At top level:
+linktrackletsmodule.c:667: warning: initialization from incompatible pointer type
+creating build/lib.macosx-10.3-fat-2.5
+gcc -arch i386 -arch ppc -isysroot /Developer/SDKs/MacOSX10.4u.sdk -g -bundle -undefined dynamic_lookup build/temp.macosx-10.3-fat-2.5/linktrackletsmodule.o -L./Darwin_x86__gcc.fast -llinktracklets -o build/lib.macosx-10.3-fat-2.5/linktracklets.so
+/usr/bin/ld: for architecture ppc
+/usr/bin/ld: warning ./Darwin_x86__gcc.fast/liblinktracklets.a archive's cputype (7, architecture i386) does not match cputype (18) for specified -arch flag: ppc (can't load from it)

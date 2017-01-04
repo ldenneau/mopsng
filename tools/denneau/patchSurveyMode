@@ -1,0 +1,34 @@
+#!/usr/bin/env perl
+
+# Just a stub for quick debugging.
+use Data::Dumper;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::IPPDB;
+
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => undef);
+$dbh = $inst->dbh();
+$rows = $dbh->selectcol_arrayref(<<"SQL") or die $dbh->errstr;
+select fpa_id from fields
+SQL
+
+# Loop through fields and get survey mode from IPP.
+$ippdbh = PS::MOPS::IPPDB::dbh();
+$comments = $ippdbh->selectcol_arrayref(<<"SQL", { Columns => [1, 2] }) or die $dbh->errstr;
+select exp_name, comment from rawExp where exp_name like 'o5%'
+SQL
+%name2comment = @{$comments};
+
+# Match em up and update.
+$sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+update fields set survey_mode=? where fpa_id=?
+SQL
+foreach my $row (@{$rows}) {
+    $match = $name2comment{$row};
+    if ($match) {
+        # Clean it up.
+        $match =~ s/ .*//;      # for now everything past first string
+        $sth->execute($match, $row) or die $sth->errstr;
+    }
+}

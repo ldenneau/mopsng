@@ -1,0 +1,454 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+
+use File::Slurp;
+use PS::MOPS::MITI;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::Orbit;
+
+
+use subs qw(
+    make_link_item
+    make_avail_table
+    make_linked_table
+    make_orbit_table
+    classify_link_id
+    slurp_des_tracklets
+    translate_tids
+    translate_orbit
+);
+
+
+# Define an object for use in this program.
+package _DetItem;
+sub new {
+    my $pkg = shift;
+    my $str = shift;
+    my %self;
+    my @stuff = split /\s+/, $str;
+    # string contains
+    # tracklet_id epoch_mjd ra_deg dec_deg mag filter obscode sigma_ra_arcsec sigma_dec_arcsec sigma_mag s2n object_name
+    @self{qw(
+        tracklet_id
+        epoch_mjd
+        object_name
+    )} = @stuff[0, 1, -1];
+    return bless \%self;
+}
+
+
+package main;
+
+my $inst;
+my $instance_name;
+my $help;
+my $nn;
+my $tracklets_file;
+my $tracks_file;
+my $iods_file;
+my $orbits_file;
+my $translate_tids;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    'tracklets=s' => \$tracklets_file,
+    'tracks=s' => \$tracks_file,
+    'iods=s' => \$iods_file,
+    'orbits=s' => \$orbits_file,
+    translate_tids => \$translate_tids,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+pod2usage(-message => '--nn must be specified') unless defined($nn);
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+my ($min_nights) = $mops_config->{linkod}->{min_nights} || 3;
+$mops_logger->logdie("Can't get min_nights") unless defined($min_nights);
+
+$mops_logger->logdie("can't read tracklets file $tracklets_file") unless -r $tracklets_file;
+$mops_logger->logdie("can't read tracks file $tracks_file") unless -r $tracks_file;
+$mops_logger->logdie("can't read iods file $iods_file") unless -r $iods_file;
+$mops_logger->logdie("can't read orbits file $orbits_file") unless -r $orbits_file;
+
+
+# First read tracklets file and figure out all the possible clean linkages.  We're
+# going to build a table like this:
+#
+=pod
+%linkeff = (
+    SSM_ID1 => { 
+        LINK_ID => undef,       # utility 
+        LAST_NN => undef,       # utility 
+
+        TRACKLETS => [ TID1, TID2, TID3, ... ], 
+        CLASSIFICATION => $MOPS_EFF_UNFOUND,
+        ORBIT_CODE => $MOPS_EFF_ORBIT_UNLINKED,
+        ORBIT => undef,
+    },
+    ...
+)
+=cut
+
+# and as information is progressively obtained we will improve entries in
+# the table.
+
+my @lines;
+my $trackdets_href;         # info of tracklet => [ det object names ]
+my $avail_href;             # available clean linkages in raw tracklet data
+my $linked_href;            # ssm IDs of linked clean objects
+my $iod_href;               # IODs of linked clean objects
+my $diffcor_href;           # DIFFCORs of linked clean objects
+my @non_clean;              # Non-clean items
+
+my $link2ssm_href;          # maps tracks link IDs to clean SSM IDs.
+my ($k, $v);                # util
+my $link_id;
+my $ssm_name;
+
+
+# From the raw list of tracklets generate the list of available clean linkages.
+($trackdets_href, $avail_href) = make_avail_table($tracklets_file);
+
+# From the LinkTracklets tracks output, generate the list of clean tracks
+# found by LinkTracklets.
+($linked_href, $link2ssm_href) = make_linked_table($tracks_file);
+
+# Mark the clean tracks that were found by LinkTracklets.
+foreach $k (grep { exists(${$avail_href}{$_}) } keys %{$linked_href}) {
+    $avail_href->{$k}->{ORBIT_CODE} = $MOPS_EFF_ORBIT_IODFAIL;          # was linked, so improve to IODFAIL
+}
+
+# Handle IODs first.
+$iod_href = make_orbit_table($iods_file);
+my $orb;
+foreach $link_id (sort keys %{$iod_href}) {
+    $ssm_name = $link2ssm_href->{$link_id};
+    if ($ssm_name) {
+        if (exists(${$avail_href}{$ssm_name})) {
+            # Exists in avail table, so must be clean UNLINKED or IODFAIL.
+            $avail_href->{$ssm_name}->{ORBIT_CODE} = $MOPS_EFF_ORBIT_DIFFAIL;   # improve to IOD OK, DIFF fail
+            $avail_href->{$ssm_name}->{ORBIT} = $iod_href->{$link_id};          # store IOD string
+        }
+        else {
+            # Probably a failed object ending on an earlier night.
+#            $mops_logger->logwarn("Clean track with IOD $link_id not found in available");
+        }
+    }
+}
+
+# Now diffcors.
+$diffcor_href = make_orbit_table($orbits_file);
+foreach $link_id (sort keys %{$diffcor_href}) {
+    $ssm_name = $link2ssm_href->{$link_id};
+    if ($ssm_name) {
+        if (exists(${$avail_href}{$ssm_name})) {
+            $avail_href->{$ssm_name}->{ORBIT_CODE} = $MOPS_EFF_ORBIT_OK;        # improve to DIFFCOR OK
+            $avail_href->{$ssm_name}->{ORBIT} = $diffcor_href->{$link_id};      # store orbit string
+            $avail_href->{$ssm_name}->{CLASSIFICATION} = $MOPS_EFF_CLEAN;       # upgrade to clean, finally
+            $avail_href->{$ssm_name}->{LINK_ID} = $link_id;
+            $avail_href->{$ssm_name}->{OBJECT_NAME} = $ssm_name;
+        }
+        else {
+            $mops_logger->logwarn("Clean track $link_id not found in available");
+        }
+    }
+    else {
+        # The linkage does have an SSM ID associated with it, so it is MIXED/BAD/NS.
+        push @non_clean, make_link_item(
+            LINK_ID => $link_id,
+            CLASSIFICATION => classify_link_id($link_id),
+            ORBIT_CODE => $MOPS_EFF_ORBIT_OK,
+            ORBIT => $diffcor_href->{$link_id},      # store orbit
+        );
+    }
+}
+
+# Now we write our stuff.
+my $item;
+my @vals;
+foreach $link_id (sort keys %{$avail_href}) {
+    $item = $avail_href->{$link_id};
+    warn("No LINK_ID: $link_id: " . Dumper($item)) unless $item->{LINK_ID};
+
+    if ($translate_tids) {
+        $item->{ORBIT} = translate_orbit($item->{ORBIT}) if $item->{ORBIT};    # chummy with MIF-O
+        $item->{LINK_ID} = translate_tids($item->{LINK_ID});
+    }
+
+    @vals = (
+        'MIF-TRACK', 
+        $item->{LINK_ID},
+        $item->{CLASSIFICATION},
+        $item->{OBJECT_NAME},
+        $item->{ORBIT_CODE},
+    );
+    push @vals, $item->{ORBIT} if $item->{ORBIT};
+    print join(' ', @vals), "\n";
+}
+
+foreach $item (@non_clean) {
+    if ($translate_tids) {
+        $item->{ORBIT} = translate_orbit($item->{ORBIT});          # chummy with MIF-O
+        $item->{LINK_ID} = translate_tids($item->{LINK_ID});
+    }
+    print join(' ', 
+        'MIF-TRACK', 
+        $item->{LINK_ID}, 
+        $item->{CLASSIFICATION},
+        $MOPS_NONSYNTHETIC_OBJECT_NAME,
+        $item->{ORBIT_CODE},
+        $item->{ORBIT},
+    ), "\n";
+}
+
+exit;
+
+
+sub classify_link_id {
+    # Given a link_id which is a concatenation of tracklet_ids, determine its
+    # efficiency classification by referencing the global tracklet_detnames table.
+    my ($link_id) = @_;
+    my @tracklet_ids = split /=/, $link_id;
+    return mopslib_effClassifyObjectNames(map { @{$trackdets_href->{$_}} } @tracklet_ids);
+}
+
+
+sub make_link_item {
+    my (@stuff) = @_;           # key-value pairs
+    # Create an empty entry for the link table and initialize with specified stuff.
+    my $empty = { 
+        LINK_ID => undef,
+        CLASSIFICATION => $MOPS_EFF_UNFOUND,
+        ORBIT_CODE => $MOPS_EFF_ORBIT_UNLINKED,
+        ORBIT => undef,
+
+        @stuff,                 # initialize, overriding the above
+    };
+}
+
+
+sub make_avail_table {
+    # Given a list of input lines from a DES tracklet file
+    #   TRACKLET_ID EPOCH_MJD OBSTYPE RA_DEG DEC_DEG MAG FILTER OBSCODE SIGMA_RA_ARCSEC SIGMA_DEC_ARCSEC SIGMA_MAG S2N OBJECT_NAME
+    # scan the list and return a hashref whose keys are clean
+    # tracklets available in the file.
+    # The values of the hashref should be:
+    #   TRACKLETS => { $nn => $tracklet_id }    # note: multiple tracklets on $nn OK here
+    #   ORBIT_CODE => orbit code, if available
+    my ($filename) = @_;
+    my %all_synth_objects;                      # all synthetic object names seen in tracklets input file
+    my $stuff = slurp_des_tracklets(shift);     # grab entire file, creating list of _DetItems
+
+    # Scan file and gang the MITI lines by tracklet_id.
+    my %tracklets;              # table of tracklet_id => [ MITI lines ]
+    my %tracklet_detnames;      # table of tracklet_id => [ detection names ]
+    my $obs;
+    foreach $obs (@{$stuff}) {
+        push @{$tracklets{$obs->{tracklet_id}}}, $obs;    # add mini obj for this tracklet ID
+        push @{$tracklet_detnames{$obs->{tracklet_id}}}, $obs->{object_name};
+    }
+
+    # Walk tracklets.  If a tracklet is clean, the store the night numbers for the detections.
+    foreach my $obs_aref (values %tracklets) {
+        # Test that the tracklet is clean.
+        my %clean;
+        my $objectName;
+        my $name;
+        my $this_nn;
+        $clean{$_->{object_name} || $MOPS_NONSYNTHETIC_OBJECT_NAME} = 1 foreach (@{$obs_aref});
+
+        my $ssm_name = (keys %clean)[0];   # name of first object in list
+        if (scalar keys %clean == 1 && $ssm_name ne $MOPS_NONSYNTHETIC_OBJECT_NAME) {
+            $objectName = $obs_aref->[0]->{object_name};  # get SSM name of first object
+
+            foreach $obs (@{$obs_aref}) {
+                # Add night number, trackletId pair
+                $this_nn = mopslib_mjd2nn($obs->{epoch_mjd}, $mops_config->{site}->{gmt_offset_hours});
+                $all_synth_objects{$objectName}->{TRACKLETS}->{$this_nn}->{$obs->{tracklet_id}} = 1;
+
+                if (!defined($all_synth_objects{$objectName}->{LAST_NN})) {
+                    $all_synth_objects{$objectName}->{LAST_NN} = $this_nn;            # save this NN as last NN
+                }
+                else {
+                    if ($all_synth_objects{$objectName}->{LAST_NN} < $this_nn) {
+                        $all_synth_objects{$objectName}->{LAST_NN} = $this_nn;        # $this_nn is later, so save it
+                    }
+                }
+            }
+        }
+    }
+
+    # Scan all objects and report the ones for which we have at least
+    # three nights of observations, and the final night is our processing 
+    # night number.
+    my %keep_objects;
+    foreach my $obj (sort keys %all_synth_objects) {
+        if (scalar keys %{$all_synth_objects{$obj}->{TRACKLETS}} >= $min_nights           # satisfies min nights req
+            and $all_synth_objects{$obj}->{LAST_NN} == $nn                                # terminates this night
+        ) {     
+            $keep_objects{$obj} = make_link_item (
+                LINK_ID => join('=', sort { $a cmp $b } map { keys %{$_} } values %{$all_synth_objects{$obj}->{TRACKLETS}}),
+                OBJECT_NAME => $obj,
+            );
+        }
+    }
+
+    return \%tracklet_detnames, \%keep_objects;
+}
+
+
+sub make_linked_table {
+    # Given a list of input lines from a test file of the form
+
+    #   LINK_ID MJD RA DEC MAG OBSCODE SSM_ID
+    # scan the list and return a hashref whose keys are clean
+    # tracks available in the file.
+    # The values of the hashref should be:
+    #   ORBIT_CODE => orbit code, if available
+    my ($filename) = @_;
+    my %ssm2link;
+    my %link2ssm;
+
+    # Scan file and create a table of clean tracklets and their detections.
+    my %tracks;  # table of tracks by link ID
+    my $des_stuff;
+    my $name;
+    my $line;
+    open my $fh, $filename or die "can't open tracks file $filename";
+    while (defined($line = <$fh>)) {
+    # foreach $des_stuff (@stuff) {
+        if ($line !~ /^#/) {    # ignore comments
+            $des_stuff = [split /\s+/, $line];
+            $name = $des_stuff->[-1] || $MOPS_NONSYNTHETIC_OBJECT_NAME;
+            push @{$tracks{$des_stuff->[0]}}, $name;    # record SSM name for this detection
+        }
+    }
+    close $fh;
+
+    # Scan tracks.  If a track is clean, then store the track info.
+    my $link_id;
+    my $ssm_list;
+    while (($link_id, $ssm_list) = each %tracks) {
+        # Test that the track is clean.
+        my %clean;
+        $clean{$_} = 1 foreach (@{$ssm_list});
+
+        my $ssm_name = (keys %clean)[0];   # name of first object in list
+        if (scalar keys %clean == 1 && $ssm_name ne $MOPS_NONSYNTHETIC_OBJECT_NAME) {
+            $ssm2link{$ssm_name} = $link_id;
+            $link2ssm{$link_id} = $ssm_name;
+        }
+    }
+
+    return (\%ssm2link, \%link2ssm);  # return table of kept objects (keys: SSM names, values: tracklets)
+}
+
+
+sub make_orbit_table {
+    # Given a list of orbit output from mopsdiffcor of the format
+    #   Q E I NODE ARG_PERI TIME_PERI MAG EPOCH LINK_ID RESID CONV_CODE
+    # scan the list and return a hashref whose keys are link IDs
+    # and values are orbit objects.
+    my ($filename) = @_;
+    my @lines = read_file($filename);
+    chomp(@lines);
+
+    my %ok;
+    my @stuff;
+    my $oid_index = 1;      # index into split string to get OID
+
+    foreach my $line (@lines) {
+        if ($line and $line !~ /^#/) {
+            chomp $line;
+            @stuff = split /\s+/, $line;
+
+            # Save the orbit string.
+            $ok{$stuff[1]} = $line;     # whole enchilada
+        }
+    }
+
+    return \%ok;
+}
+
+
+sub slurp_des_tracklets {
+    my ($filename) = shift;
+    my @stuff;
+    my $fh = new FileHandle $filename;
+    my $line;
+    while (defined($line = <$fh>)) {
+        next if (!$line or $line =~ /^!!/ or $line =~ /^#/);    # skip if empty or comment
+        chomp $line;
+        push @stuff, new _DetItem($line);
+    }
+    close $fh;
+    return \@stuff;
+}
+
+
+sub translate_tids {
+    # Given a track ID, translate its parts back to numeric MOPS IDs.
+    return join('=', map { mopslib_fromB62($_) } split /=/, shift);
+}
+
+
+sub translate_orbit {
+    # Given a MIF-O orbit, translate its ORBIT ID (which is concatenated
+    # tracklet IDs).
+    my @foo = split /\s+/, shift;
+    $foo[1] = translate_tids($foo[1]);
+    return join(' ', @foo);
+}
+
+
+=head1 DESCRIPTION
+
+Analyze the output of a single-target-field LinkTracklets run executed
+by a worker node.  Assemble information into a single file that can be
+concatenated by a master node so that orbit management can be performed
+and total efficiency for the night computed.
+
+Some efficiency determination is performed here.  While this is somewhat
+distasteful and overly chummy, the master node would not have intermediate
+IOD and DIFFCOR status available to it, only coarse information regarding
+whether a track was found by MOPS and not where it was lost.  A design
+that would accomodate post-facto efficiency would require all tracks
+and all compute orbits to be preserved in the MOPS database, which under
+current design constraints is prohibitive.
+
+Each line of the output file contains all linking information for a
+track.
+
+    MIF-TRACK track_id orbit_code ssm_id classification orbital_elements ...
+
+where track_id is composed of concatenated tracklet IDs.
+
+Note that this program does create derived objects nor otherwise touch
+the database.  All derived object creation is performed by the master
+node after ID1 orbit management.
+
+=head1 SYNOPSIS
+
+effLinkTracklets [--options] 
+
+  --nn NIGHT_NUMBER : night number we are processing
+  --tracklets TRACKLETS_FILE : tracklets file, probably NNN.tracklets
+  --tracks TRACKS_FILE : tracks file, probably NNN.tracks
+  --iods IOD_FILE : IODs file, probably NNN.iods
+  --orbits ORBITS_FILE : orbits file (objects that passed orbit det), probably NNN.orbits
+  --help : show man page
+
+=cut
+

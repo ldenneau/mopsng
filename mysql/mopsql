@@ -1,0 +1,42 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+
+use Getopt::Long;
+my $instance_name;
+my $nohead;        # omit header
+my $table;
+my $raw;
+my $admin;         # delete access to DB
+GetOptions(
+    'instance=s' => \$instance_name,
+    nohead => \$nohead,
+    table => \$table,
+    raw => \$raw,
+) or pod2usage(2);
+
+use PS::MOPS::Config;
+my $backend_cfg = PS::MOPS::Config->new('backend');
+
+my $mops_user = $ENV{MOPS_DBUSERNAME} || 'mops';
+my $mops_pass = $ENV{MOPS_DBPASSWORD} || 'mops';
+
+my $mops_host = $ENV{MOPS_DBHOSTNAME} || $backend_cfg->{hostname} || 'mops12';
+my $mops_sid = $instance_name || $ENV{MOPS_DBINSTANCE} || die "can't determine instance";
+
+#my $more_args = join " ", @ARGV;
+my ($more_args) = join(' ', 
+    $table ? "--table" : '',
+    $raw ? "--raw" : '',
+);
+#print STDERR "Connecting as $mops_user\@$mops_host ($mops_sid)...\n";
+if (-t STDIN && -t STDOUT) {
+    system("mysql -u$mops_user -p$mops_pass -h$mops_host $more_args $mops_sid");
+}
+else {
+    my @stuff = `mysql -u$mops_user -p$mops_pass -h$mops_host $more_args $mops_sid`;
+    shift @stuff if $nohead;
+    print @stuff;
+}

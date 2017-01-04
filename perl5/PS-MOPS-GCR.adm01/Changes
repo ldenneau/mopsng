@@ -1,0 +1,6 @@
+Revision history for Perl extension PS::MOPS::GCR.
+
+0.01  Fri Jan 28 09:12:41 2011
+	- original version; created by h2xs 1.23 with options
+		-O -n PS::MOPS::GCR ./PS-MOPS-GCR/gcf/gcf.h
+

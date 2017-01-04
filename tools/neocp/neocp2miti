@@ -1,0 +1,34 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+# Scrape orbital elements off of the MPC confirmation page and output them
+# in MITI format for a basic e vs a plot.  We will ignore the time of perihelion
+# for now.
+
+my ($desig, $url) = @ARGV;
+
+use LWP::UserAgent;
+my $ua = LWP::UserAgent->new;
+my $response = $ua->get($url);
+my @out = ('');
+if ($response->is_success) {
+    my $content = $response->content;
+    my @lines = split /\n/, $content;
+#    print @lines;
+    for my $line (@lines) {
+        if ($line =~ /^$desig/) {
+            my @foo = split /\s+/, $line;
+            my $dummy;
+            my ($a, $q, $e, $i, $node, $argPeri, $timePeri, $hv, $epoch, $id);
+            ($id, $hv, $dummy, $dummy, $dummy, $argPeri, $node, $i, $e, $dummy, $a) = @foo;
+            $q = $a * (1 - $e);
+            $timePeri = 56000;  # dummy
+            $epoch = 56000;     # dummy
+            push @out, "$q $e $i $node $argPeri $timePeri $hv $epoch $id\n";
+        }
+    }
+}
+
+print @out;

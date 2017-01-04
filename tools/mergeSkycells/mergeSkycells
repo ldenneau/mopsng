@@ -1,0 +1,495 @@
+#! /usr/bin/env perl
+# $Id: table.pm 186 2007-03-10 01:39:17Z yamada $
+
+use strict;
+use warnings;
+
+use Carp;
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+use FileHandle;
+use File::Copy;
+use File::Basename;
+use File::Temp qw(tempfile tempdir);
+
+use PS::MOPS::DataStore::table;
+use PS::MOPS::DataStore::dbclient;
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+
+use subs qw(
+    dump_file
+    submit_to_datastore
+);
+
+
+my $instance_name;
+my $inst;
+my $gmt_offset_hours;
+
+my $mag_limit;
+#my $proxrad_thresh_deg = 0.00013;         # default, about 0.5 arcsec
+my $proxrad_thresh_deg = 0.00013 * 2;     # default, about 1.0 arcsec
+my $nofilter;
+my $nnlist_str;
+my %nnmap;
+my $out_filename;
+my $miti;
+my $fits;
+my $insert;                 # insert directly into MOPS DB instead of datastore
+my $ignore_filenames;       # don't check filenames for integrity
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'mag_limit=f' => \$mag_limit,
+    'nnlist=s' => \$nnlist_str,
+    'proxrad_thresh_deg=f' => \$proxrad_thresh_deg,
+    nofilter => \$nofilter,
+    'out=s' => \$out_filename,      # output filename for --miti or --fits
+    'miti' => \$miti,
+    'fits' => \$fits,
+    insert => \$insert,
+    ignore_filenames => \$ignore_filenames,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(-msg => 'No files specified.') unless @ARGV;
+
+if (($miti or $fits) and !$out_filename) {
+    pod2usage(-msg => '--out is required with --miti or --fits');
+}
+
+
+# If --nnlist was specified, create a table of NNs we are to process.
+if ($nnlist_str) {
+    my @nnlist = split /[^\d]+/, $nnlist_str;
+    $nnmap{$_} = 1 foreach @nnlist;
+}
+
+my $global_epoch_mjd;           # epoch for all skycells
+my $global_obscode;             # obscode for all skycells
+my $global_filter;              # filter for all skycells
+my $skycell_root;               # root name for skycell, e.g. 'mops.1'
+
+my $dets_href = {};              # table of all detections.
+my $field_href = {};            # table of field metadata
+
+# Figure out some execution options.  Essentially, if we are putting the
+# result into a MOPS simulation, we need the instance handle.  Otherwise
+# don't worry about it (for MITI and FITS output).
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+$gmt_offset_hours = $inst->getConfig()->{site}->{gmt_offset_hours};
+die "can't get gmt_offset_hours" unless defined($gmt_offset_hours);
+
+
+my $bail;       # if set, stop!
+foreach my $filename (@ARGV) {
+    if (-s $filename == 0) {
+        warn "empty file: $filename, skipping.\n";
+        next;
+    }
+
+    # Check that the filename is compatible with our entire file group.  If there's
+    # one that's different, there may be a problem.
+    if (!$ignore_filenames) {
+        # Get file root, the 'mops.X' part of the basename.
+        my $root;
+        my $base = basename($filename);
+        if ($base =~ /^(\D+\.\d+)\./) {
+            $root = $1;
+        }
+        else {
+            die "can't get root for $filename";
+        }
+
+        # Check that roots of all files are the same.
+        if (!defined($skycell_root)) {
+            $skycell_root = $root;
+        }
+        else {
+            die "root $root doesn't match $skycell_root"
+                unless $root eq $skycell_root;
+        }
+    }
+
+    $bail = grab_file($field_href, $dets_href, $filename);
+}
+exit 0 if $bail;
+
+# Now all our detections are loaded into a table.  We want to astroclean, then
+# write to a single FITS file that can be ingested into MOPS.
+printf STDERR "Processing %d detections.\n", scalar keys %{$dets_href};
+do_astroclean($dets_href);
+printf STDERR "Cleaned down to %d detections.\n", scalar keys %{$dets_href};
+
+if ($miti) {
+    write_miti($out_filename, $dets_href);
+}
+elsif ($fits) {
+    write_fits($out_filename, $field_href, $dets_href);
+}
+#elsif ($datastore) {
+else {
+    # Write out a FITS file, then put it in the datastore.
+    if (scalar %{$dets_href}) {
+        # Only write something if we have detections.
+        my ($tmp_fh, $tmp_filename) = tempfile();
+        $tmp_fh->close();
+        write_fits($tmp_filename, $field_href, $dets_href);
+
+        if ($insert) {
+            my $res = PS::MOPS::DataStore::dbclient::insert($inst, $tmp_filename);
+            $inst->getLogger()->info(sprintf "INGEST: inserted $tmp_filename");
+        }
+        else {
+            submit_to_datastore($tmp_filename, $inst);
+        }
+
+
+        unlink $tmp_filename;
+    }
+    else {
+        print STDERR "No detections for fileset.\n";
+    }
+}
+exit;
+
+
+sub grab_file {
+    my ($field_href, $stuff, $filename) = @_;
+    my $table = new PS::MOPS::DataStore::table;
+    $table->openskycellfile($filename);
+
+    my ($epoch_mjd, $obscode, $filter);
+    $epoch_mjd = $table->keyval('MJD-OBS');
+    $obscode = $table->keyval('OBSCODE');
+    $filter = substr($table->keyval('FILTER'), 0, 1);
+
+    # Check the night number to-do list.
+    if (%nnmap) {
+        my $nn = mopslib_mjd2nn($epoch_mjd, $gmt_offset_hours);
+        if (!$nnmap{$nn}) {
+            print STDERR "Skipping $filename (NN=$nn)\n";
+            $table->closefile();
+            return 1;           # 1 => bail
+        }
+    }
+
+    if (!defined($global_epoch_mjd)) {
+        $global_epoch_mjd = $epoch_mjd;
+    }
+    elsif ($epoch_mjd != $global_epoch_mjd) {
+        warn "Epoch ($epoch_mjd) differs from global ($global_epoch_mjd)";
+        $epoch_mjd = $global_epoch_mjd;
+    }
+
+    if (!defined($global_obscode)) {
+        $global_obscode = $obscode;
+    }
+    else {
+        die "OBSCODE ($obscode) differs from global ($global_obscode)" 
+            unless $obscode eq $global_obscode; 
+    }
+
+    my $basename = basename($filename);
+    $filename =~ s|^.*/||;          # strip up to filename
+    $filename =~ s|\.fits||;        # strip more stuff
+    my $base_det_id = $filename;        # more hackage
+    if ($filename =~ m|^\D+\.\d+\.skycell\.(.*)$|) {
+        $base_det_id = $1;
+    }
+#    else {
+#        die "can't get base_det_id from $filename";
+#    }
+
+    print STDERR "Processing $basename/$base_det_id.\n";
+
+    my $diffimid = $table->{_keys}->{DIFFIMID} || '0';
+    do_skycell($stuff, $base_det_id, $table, $diffimid);
+    %{$field_href} = %{$table->{_keys}};
+
+    # Slap the DIFF_ID on there.
+    if (!$field_href->{DIFF_ID}) {
+        my $wd = (split '/', getcwd)[-1];      # last part of current dir
+        if ($wd =~ /diff\.(\d+)/) {
+            $field_href->{DIFF_ID} = $1;
+        }
+    }
+
+    $table->closefile();
+
+    return 0;
+}
+
+
+sub do_skycell {
+    # Read the FITS skycell table and accumulate in $stuff.
+    my ($stuff, $base_det_id, $skycell_table, $proc_id) = @_;
+    my @data;
+    my $rownum = 0;
+    while (@data = $skycell_table->readrecord()) {
+        my ($ra_deg, $dec_deg, $ra_sigma_deg, $dec_sigma_deg, $mag, $mag_sigma, $flags, $starpsf,
+            $ang_deg, $ang_sig_deg, $len_deg, $len_sig_deg) = @data;
+        if ($ra_deg eq 'nan' or $dec_deg eq 'nan' or $mag eq 'nan' 
+        or $mag == 0 or $mag_sigma == 0 or $ra_sigma_deg eq 'na' or $dec_sigma_deg eq 'nan') {
+#            warn "bogus detection: in skycell";
+        }
+
+        if ($starpsf eq 'nan' or $starpsf <= 0) {
+            # fake it for now
+            $starpsf = 42;
+        }
+
+        my $det_id = sprintf("$base_det_id.%09d", $rownum);
+
+        next if ($flags & 0x2000);      # PM_SOURCE_MODE_CR_LIMIT
+        next if ($flags & 0x0080);      # PM_SOURCE_MODE_SATSTAR
+
+        $data[0] += 360 if $ra_deg < 0;
+
+        # Chuck any funny looking mags (zero, NaN, too large, too small.
+        if ($mag > 0 && $mag < 50 && (!defined($mag_limit) or $mag < $mag_limit)) {
+            $stuff->{$det_id} = [@data, $proc_id];
+        }
+
+        $rownum++;
+    }
+    1;
+}
+
+
+sub do_astroclean {
+    # Process the current set of detections in $stuff, send it to the cleaners, and
+    # remove anything that was scrubbed by astroclean.
+    my ($stuff) = @_;
+    my $det_id;
+    my $dir = tempdir(CLEANUP => 1, DIR => '/tmp');
+    my ($ac_infh, $ac_infilename) = tempfile(DIR => $dir);
+    my ($ra_deg, $dec_deg, $ra_sigma_deg, $dec_sigma_deg, $flux, $flux_sigma);
+    my $mag;
+    my %keep_stuff;
+
+    foreach $det_id (keys %{$stuff}) {
+        ($ra_deg, $dec_deg, $ra_sigma_deg, $dec_sigma_deg, $flux, $flux_sigma) = @{$stuff->{$det_id}};
+        $mag = $flux;
+
+        # Write out det to file.
+        print $ac_infh join(' ', 
+            $det_id,
+            $global_epoch_mjd,
+            $ra_deg,
+            $dec_deg,
+            $mag,
+            $global_obscode
+        ), "\n";
+    }
+    $ac_infh->close();
+
+    # Set up some astroclean options.  We always want to remove overlaps from skycells.  But we
+    # want density filtering to be an option.
+    my $proxrad_str = "proxrad $proxrad_thresh_deg";
+    my $density_str = $nofilter ? "" : "density 2500 Dradius .025";     # 2500/sqdeg radius .025deg
+
+    my ($ac_outfh, $ac_outfilename) = tempfile(DIR => $dir);
+    $ac_outfh->close();                         # just need filename, not fh
+#astroclean file $ac_infilename outtype 1 density 1000 Dradius .0010 proxrad $proxrad_thresh_deg clean_file $ac_outfilename
+    my $cmd = <<"EOF";
+astroclean file $ac_infilename outtype 1 $density_str $proxrad_str clean_file $ac_outfilename
+EOF
+    system($cmd) == 0 or die "command failed: $? : $cmd";
+
+    # Read output file into table, return table.
+    $ac_outfh = new FileHandle $ac_outfilename;
+    my $line;
+    my $remainder;
+    my ($epoch_mjd, $obscode);
+    while (defined($line = <$ac_outfh>)) {
+        next if $line =~ /^(!|#)/;   # comment, skip
+        chomp $line;
+        ($det_id, $remainder) = split /\s+/, $line, 2;
+        $keep_stuff{$det_id} = 1;
+    }
+    $ac_outfh->close();
+
+    unlink $ac_infilename;
+    unlink $ac_outfilename;
+    rmdir $dir or die "can't remove dir $dir";
+
+    # Now walk through our table of stuff and throw out anything that's not in the keep table.
+    foreach my $key (keys %{$stuff}) {
+        delete ${$stuff}{$key} unless exists($keep_stuff{$key});
+    }
+}
+
+
+sub write_miti {
+    my ($filename, $stuff) = @_;
+    my $fh = new FileHandle ">$filename" or die "can't create filehandle for $filename";
+
+    foreach my $key (sort keys %{$stuff}) {
+        my @foo = @{$stuff->{$key}};
+        print $fh join(' ', 
+            $key,
+            $global_epoch_mjd,
+            $foo[0],
+            $foo[1],
+            $foo[4],            # flux
+            $global_obscode,
+            'NA',
+        ), "\n";
+    }
+
+    $fh->close();
+}
+
+
+sub write_fits {
+    my ($filename, $field_href, $dets_href) = @_;
+    #my $fpa_id = 'DUMMY_FPA_ID';
+    my $fpa_id = $skycell_root;
+    my $t = new PS::MOPS::DataStore::table;
+
+    my $force = 1;      # force file overwrite
+    my $filter = substr($field_href->{FILTER}, 0, 1);
+
+    $t->createfile($filename, $force,
+        # IPP processing identifiers.
+        'FPA_ID' => $field_href->{FPA_ID},
+        'EXP_ID' => $field_href->{EXP_ID},
+        'DIFF_ID' => $field_href->{DIFF_ID},
+
+        'MJD-OBS' => $field_href->{'MJD-OBS'},
+        'RA' => $field_href->{RA},
+        'DEC' => $field_href->{DEC},
+        'EXPTIME' => $field_href->{EXPTIME},
+        'ROTANGLE' => $field_href->{ROTANGLE},
+        'FILTER' => $filter,
+#        'STARPSF' => $field_href->{STARPSF},       # XXX
+        'STARPSF' => 1.0,
+        'DIFFIMID' => $field_href->{DIFFIMID},
+        'LIMITMAG' => $field_href->{LIMITMAG},
+        'DE1' => $field_href->{DE1},
+        'DE2' => $field_href->{DE2},
+        'DE3' => $field_href->{DE3},
+        'DE4' => $field_href->{DE4},
+        'DE5' => $field_href->{DE5},
+        'DE6' => $field_href->{DE6},
+        'DE7' => $field_href->{DE7},
+        'DE8' => $field_href->{DE8},
+        'DE9' => $field_href->{DE9},
+        'DE10' => $field_href->{DE10},
+        'OBSCODE' => $field_href->{OBSCODE},
+        'TEL_ALT' => $field_href->{TEL_ALT},
+        'TEL_AZ' => $field_href->{TEL_AZ},
+    );
+
+    my ($det_id, $det);
+    while (($det_id, $det) = each %{$dets_href}) {
+        # Our flux and flux_sigma are really mag and mag_sigma.  So convert them 
+        # back.
+#        my ($flux, $flux_sigma, $s2n) = mopslib_mag2fluxsn($det->[4], $det->[5], $filter);
+        $t->writerecord(
+            @{$det},
+#            @{$det}[0..7],    # ra_deg, dec_deg, ra_sigma_deg, dec_sigma_deg, mag, mag_sigma, flags, starpsf
+#            0, 0,       # orient_deg, orient_sigma_deg
+#            0, 0,       # length_deg, length_sigma_deg
+#            $det->[8],  # PROC_ID (DIFFIMID)
+        );
+    }
+
+}
+
+
+sub submit_to_datastore {
+	my ($src_file, $inst) = @_;
+	my ($destdir) = '/usr/local/MOPS_DEV/ds/dsroot/det';
+    my $dbname = $inst->dbname();
+
+	my $fh = new FileHandle;
+
+	my ($sec,$min,$hour,$mday,$mon,$year) = gmtime(time);
+	$mon++;
+	$year += 1900;
+
+    my $state = "N";
+    my $default_ds_type = 'DETECTION';
+
+    # See if the directory exists.  If not, create it and initialize
+    # the count file and index.
+    my $dbdir = $destdir . "/" . $dbname;
+    my $index = $destdir . "/index";
+    my @dbstat = stat($dbdir);
+
+    unless (@dbstat) {
+        print STDERR "Initializing datastore.\n";
+
+        # Create the per-instance directory.
+        mkdir($dbdir, 0777);
+        chmod(0777, $dbdir);
+
+        open($fh, ">$dbdir" . "/count");
+        flock($fh, 2);
+        chmod(0666, $dbdir . "/count");
+        print $fh "0\n";
+        close $fh;
+
+        open($fh, ">$dbdir" . "/index");
+        flock($fh, 2);
+        chmod(0666, $dbdir . "/index");
+        close $fh;
+
+        # Create an entry in the root index.
+        open($fh, ">>$index");
+        flock($fh, 2);
+        chmod(0666, $index);
+        printf($fh "%s|%04d-%02d-%02dT%02d:%02d:%02d|%s\n",
+            $dbname,
+            $year, $mon, $mday, $hour, $min, $sec, 'INSTANCE');
+        close $fh;
+    }
+
+    # If $src_file was specified, copy it to the DataStore.  This gives us a cheap
+    # way of initializing the sim's datastore area by passing $src_file=undef.
+    if ($src_file) {
+        # Read and increment the count number.
+        my $count;
+
+        open($fh, "+<$dbdir/count");
+        flock($fh, 2);
+        chmod(0666, "$dbdir/count");
+        $count = <$fh>;
+        chomp($count);
+        seek($fh, 0, 0);
+        print $fh $count + 1 . "\n";
+        close $fh;
+
+        # Send the file.
+        my $output_file = sprintf("%s/%.05d", $dbdir, $count);
+        copy($src_file, $output_file);
+
+        open($fh, ">>$dbdir/index");
+        flock($fh, 2);
+        printf($fh "%.05d|%04d-%02d-%02dT%02d:%02d:%02d|%s|%s\n",
+            $count,
+            $year, $mon, $mday, $hour, $min, $sec,
+            $default_ds_type, $state);
+        close($fh);
+    }
+}
+
+
+
+
+=head1 SYNOPSIS
+
+mergeSkycells [options] FILES
+
+=head1 DESCRIPTION
+
+Consolidate the specified set of skycell FITS files into a single MOPS ingest
+file.  Load all the detections into a single set, then process the detections
+through DetectionProximity to remove duplicates in overlapping areas between
+different skycells.
+
+=cut

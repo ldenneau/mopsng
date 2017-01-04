@@ -1,0 +1,153 @@
+#!/usr/bin/env perl
+# $Id: buildInstance 5118 2012-09-27 01:53:42Z dgreen $
+# Build a complete MOPS Solar System Simulation.
+
+use strict;
+
+use Pod::Usage;
+use Getopt::Long;
+use Data::Dumper;
+
+use PS::MOPS::DC::Build;
+use PS::MOPS::DC::Runtime;
+use PS::MOPS::DC::Instance; 
+
+my $name;
+my $remove;
+my $model;
+my $shape;
+my $noprompt;
+my $description;
+my $help;
+GetOptions(
+    remove => \$remove,                 # remove instance
+    'model=s' => \$model,
+    shape => \$shape,
+    'description=s' => \$description,
+    noprompt => \$noprompt,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+$name = shift || $ENV{MOPS_DBINSTANCE} || die "couldn't determine DB name.\n";
+pod2usage(3) unless $name;
+
+# Allowed models are 1/10/100/250/neos/test/1000.
+
+my $res;
+my $delay = 4;
+
+if ($remove) {
+    print STDERR "Deleting $name do you wish to continue (Y/N)? ";
+    my $ans = <STDIN>;
+    chomp($ans);
+    if (uc($ans) ne 'Y') {
+        print STDERR "Aborting... $name will not be removed.\n\n";
+        exit;
+    }
+    print STDERR "\n Deleting $name in $delay seconds...\n";
+    sleep $delay;                # give user time to undo!
+
+    $res = modcb_remove(
+        name => $name,
+        quiet => 1,
+    );
+
+    if (!$res) {
+        print STDERR "\nRemoved failed: " . Dumper($res);
+    }
+    else {
+        print STDERR "done.\nMOPS instance $name removed.\n";
+    }
+}
+else {
+    # Verify that database instance does not already exist.
+    my $inst = PS::MOPS::DC::Instance->new(DBNAME => $name); 
+    my $dbh;
+    eval {$dbh = $inst->dbh;};
+    if (defined($dbh) && not(defined($noprompt))) {
+        print STDERR "\nThe simulation $name already exists!!!";
+        print STDERR "\nContinuing will delete the $name simulation!!!";
+        print STDERR "\n\nDo you want to delete $name?(Y/N): ";
+        my $ans = <STDIN>;
+        chomp($ans);
+        if (uc($ans) ne 'Y') {
+            print STDERR "Aborting... $name will not be removed.\n\n";
+            exit;
+        }
+    }
+    # If description has not been supplied, ask for it on command line.
+    if (!$description) {
+        print STDERR "About to create $name.  Please enter a description for it:\n";
+        $description = <STDIN>;
+    }
+
+    print STDERR "Creating $name...\n";
+    sleep $delay;                # give user time to undo!
+
+    $res = modcb_build(
+        name => $name,
+        model => $model,
+        shape => $shape,
+        description => $description,
+        noprompt => $noprompt,
+        quiet => 1,
+    );
+
+    # Insert a CREATE event in the runtime table.
+    my $inst = PS::MOPS::DC::Instance->new(DBNAME => $res->{name})
+        or die "can't create instance object";
+
+    my $evt = PS::MOPS::DC::Runtime->new($inst,
+        subsystem => $MOPS_SUBSYSTEM_GLOBAL,
+        message => 'CREATE',
+    );
+    $evt->insert;
+
+    # Install config into DB.
+    system qq{editConfig --install};
+
+    if (!$res) {
+        print STDERR "\nBuild failed: " . Dumper($res);
+    }
+    else {
+        print STDERR <<"FOO";
+done.
+MOPS instance $name created.  You can gracefully stop a running simulation
+using "mopper --stop".  Insert some stuff and have fun!
+
+Make sure you set:
+
+site.astrometric_error_arcsec
+site.limiting_s2n
+findtracklets.tti_min
+FOO
+    }
+}
+
+
+=head1 NAME
+
+buildInstance - Build PSMOPS instances
+ 
+=head1 SYNOPSIS
+
+buildInstance [options] [NAME]
+
+buildInstance --remove NAME
+
+buildInstance --help
+
+  NAME : name to give to instance, should be prefixed with "psmops_"
+  --remove : remove named instance
+  --model MODEL : select solar system SSM model (1/100/250/1000/neos/test)
+  --shape : insert shape definitions for all SSM objects
+  --noprompt : don't prompt before building new instance (will overwrite old instance)
+  --description : verbose description of simulation
+  --help : show usage
+ 
+=head1 DESCRIPTION
+
+Builds and optionally populates a PSMOPS instance.
+
+=cut
+

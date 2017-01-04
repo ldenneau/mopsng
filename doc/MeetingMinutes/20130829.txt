@@ -1,0 +1,40 @@
+Attending:
+Wainscoat, Denneau, Jedicke, Bolin, Veres, Chastel (chiar/scribe), Engelhardt, Hsieh
+
+Minutes:
+* Telescope Status (KC)
+no report
+
+* IPP
+  * Trail Fitting (PV): no progress
+  * Photometry+Dual-Convolution (AF): AF is on vacation till 9/15.
+  * 1D-Convolution (SC): no progress
+
+* Data Processing (SC)
+- 1 night off because of strong winds (2013-08-25), good weather before (in the bright time), unstable after
+- mops10 seems to have memory(?) issues. Removed from the condor pool. Tracklet performs better without it.
+
+* NEO Status (RW / PV)
+- RJW: observe more East. Might be worth going more South
+- CFHT is back tonight (2013-08-29)
+- Object with a geocentric orbit seen last week was artificial
+
+* NEO Czaring (BB)
+- Starting the OC
+- 47 objects on the confirmation page
+- RJW: send only one e-mail at end of processing instead of 2
+- RJW: quiet "submit neo button"  => no e-mail sent
+
+* Comets (HH)
+- P5. Possibly MBC? Should be followed on CFH.
+- P2: Non-cometary object on a cometary (parabolic) orbit.
+
+* ATLAS (RJ/LD/AS)
+- Nothing to report on the mops side
+
+* AOB
+- SC: Should we have a PS2 item in the agenda? Answer: yes
+- SC: TE Efficiency implemented. Efficiency should be moved to mops00
+- SC: Last MOPS meeting (in Hawaii) for HH.
+- BB: Simulations: observations from anywhere in the Universe? RJ: Atlas does that for locations on the Earth.
+

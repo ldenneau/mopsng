@@ -1,0 +1,30 @@
+#!/usr/bin/env perl
+
+# Stupid program to take the first two lines of a DES orbit from OpenORB, which
+# is in scientific notation, and format the results for readibility.
+
+use strict;
+use warnings;
+
+while (my $line = <STDIN>) {
+    if ($line =~ /^!/) {
+        print $line;
+        next;
+    }
+    
+    my ($id, $fmt, $q, $e, $i, $node, $argperi, $t_p, $H, $t_0, $index, $n_par, $moid) = split /\s+/, $line;
+    print join(' ', 
+        $id, $fmt, 
+        sprintf("%.6f", $q), 
+        sprintf("%.4f", $e), 
+        sprintf("%.4f", $i), 
+        sprintf("%.6f", $node), 
+        sprintf("%.6f", $argperi), 
+        sprintf("%.6f", $t_p), 
+        sprintf("%.3f", $H), 
+        sprintf("%.6f", $t_0), 
+        $index,
+        $n_par,
+        $moid,
+    ), "\n";
+};

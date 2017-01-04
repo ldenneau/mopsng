@@ -1,0 +1,38 @@
+
+* Telescope Status
+Back on the sky.
+
+* IPP Issues
+  - IPP Trail fitting
+  - Photometry
+  - Convolution
+
+* Data Processing
+  - MOPS Hardware
+-> Ordered on Monday
+   - IPP Stamps
+-> BB: Add 1k warp?
+-> LD: Czar should send the link to 1k stamps?
+
+* NEO Status
+- Recovered 1995CP.
+- We still have 4 PHA
+
+* NEO Czaring
+No report
+
+* Comets
+No report
+
+* ATLAS
+- (1626) Sadeya is the official first asteroid seen by Atlas on 2014-01-21
+- Tuning being performed.
+
+* AOB 
+- i-band WS diffs
+  -> If the s2n cut-off is 7, set it to 5;
+  -> Ask the IPP to keep the images;
+  -> Velocity cut. tweak the low cut for slow movers (decrease from 0.05 deg/day to 0.01)
+- Current limit to 5 deg/day 
+   -> Ask the IPP to reprocess 2013-11-04UT OSS.I with the current code and see what’s changed
+

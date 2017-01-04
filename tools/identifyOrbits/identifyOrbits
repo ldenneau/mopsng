@@ -1,0 +1,456 @@
+#!/usr/bin/env perl
+# $Id: identifyOrbits 1884 2007-09-06 23:04:11Z denneau $
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Temp qw(tempfile);
+use File::Slurp;
+use Params::Validate;
+use Data::Dumper;
+
+use PS::MOPS::JPLORB;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib;
+use PS::MOPS::DC::Orbit;
+use PS::MOPS::DC::DerivedObject;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::JPLEPH;
+use PS::MOPS::DC::History::Identification;
+use PS::MOPS::DC::History;
+use PS::MOPS::DC::Efficiency;
+use PS::MOPS::DC::Precovery;
+
+
+use subs qw(
+    build_match_table
+    eval_orbit
+);
+
+
+# Globals.
+my $ORBIT_PROXIMITY = 'orbitProximity';
+
+# Temp
+my $START_FIELD_STATUS = $FIELD_STATUS_TRACKLETS_DONE;
+my $END_FIELD_STATUS = $FIELD_STATUS_ATTRIBUTIONS;
+my $FOV_EXTRA = 1.05;
+
+my $inst;
+my $instance_name;
+my $nodb;
+my $help;
+my $hacky = 0;
+my $verbose;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'hacky=s' => \$hacky,
+    nodb => \$nodb,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+my $date_mjd = shift;           # get MJD from cmd line
+
+
+# MOPS Configuration.
+my $disable_orbit_identification = $mops_config->{debug}->{disable_orbit_identification};
+if ($disable_orbit_identification == 2) {
+    # Special code for don't process instead of passthrough
+    $mops_logger->info("Orbit identification disabled; skipping.");
+    exit;
+}
+
+my $attribution_resid_threshold_arcsec = 
+    $mops_config->{dtctl}->{attribution_resid_threshold_arcsec} or
+    $mops_logger->logdie("couldn't get attribution_resid_threshold_arcsec");
+
+my $obscode = $mops_config->{site}->{obscode} or 
+    $mops_logger->logdie("couldn't get obscode");
+
+my $attribution_proximity_thresh_arcsec = 3 * 60;    # 3 arcminutes
+
+
+# Start.  Grab identified (NEW) and unidentified (DERIVED) orbits.
+my @NEW;
+my @DERIVED;
+my $orbit_i;
+my $orbit;
+
+
+##$orbit_i = modco_retrieve($inst, derived => 1, identified => 0);
+##while ($orbit = $orbit_i->next) {
+##    push @NEW, $orbit;
+##}
+##$mops_logger->info(sprintf "Found %d NEW orbits", scalar @NEW);
+
+##$orbit_i = modco_retrieve($inst, derived => 1, identified => 1);
+##while ($orbit = $orbit_i->next) {
+##    push @DERIVED, $orbit;
+##}
+##$mops_logger->info(sprintf "Found %d DERIVED orbits", scalar @DERIVED);
+
+
+# Schwing them through OrbitProximity.
+my $data_filename = File::Temp::tempnam('/tmp', 'identifyOrbitsDATAXXXXXXXX');
+my $queries_filename = File::Temp::tempnam('/tmp', 'identifyOrbitsQUERIESXXXXXXXX');
+my $match_filename = File::Temp::tempnam('/tmp', 'identifyOrbitsMATCHXXXXXXXX');
+my $cmd;
+
+$cmd = "catOrbits --format=MITI --derived --identified=1 > $data_filename";
+system($cmd) == 0 or $mops_logger->logdie("$cmd failed");
+
+$cmd = "catOrbits --format=MITI --derived --identified=0 > $queries_filename";        # newly added orbits
+system($cmd) == 0 or $mops_logger->logdie("$cmd failed");
+
+my $params = "q_thresh 0.10 e_thresh 0.050";
+$cmd = "$ORBIT_PROXIMITY data $data_filename queries $queries_filename matchfile $match_filename $params >> identifyOrbits.out";
+system($cmd) == 0 or $mops_logger->logdie("$cmd failed");
+
+# Build our results table.  This is simply an association of query 
+# orbits with derived ("data") orbits.
+my %match_n2d = build_match_table(
+    data => $data_filename,
+    queries => $queries_filename,
+    match => $match_filename,
+);      # build table of new IDs and match lists
+
+
+##print Dumper(\%match_n2d);
+
+
+# Now for each key in the match table, fit orbits for all combinations
+# of the match orbit with matched (parent) orbits.  Take the best one
+# that satisfies our residual requirement and consolidate the orbits
+# and their detections.
+my $qorbit_name;
+my $dorbit_name;
+my @merge_list;
+
+# If orbit identifications are disabled, empty the merge list.
+unless ($disable_orbit_identification) {
+    foreach $qorbit_name (keys %match_n2d) {
+    ##    my ($tmp_fh, $tmp_fn) = tempfile('/tmp/identifyOrbitsODXXXXXXXX', UNLINK => 1);
+
+        eval {
+            my $qobj;               # query derived object
+            my $qorbit;             # query derived object's orbit from OrbitProximity
+            my @qorbit_dets;        # query orbit's detections
+
+            $qobj = modcdo_retrieve($inst, objectName => $qorbit_name) ;
+            $qorbit = modco_retrieve($inst, derivedobjectName => $qorbit_name) 
+                or die "didn't get orbit for $qorbit_name";
+            @qorbit_dets = $qobj->fetchDetections()
+                or die "got zero detections for $qorbit_name";
+
+            my $best;
+            my $resid_href;     # OD result
+
+            foreach $dorbit_name (@{$match_n2d{$qorbit_name}}) {
+                next if $dorbit_name eq $qorbit_name;   # sanity check for dupes
+
+                my $dobj = modcdo_retrieve($inst, objectName => $dorbit_name);
+                if ($dobj->status eq $DERIVEDOBJECT_STATUS_MERGED) {
+                    $mops_logger->info(sprintf "%s already merged.", $dobj->objectName);
+                    last;
+                }
+
+                my $dorbit = modco_retrieve($inst, derivedobjectName => $dorbit_name);
+                my $eval_orb = eval_orbit($dobj, $dorbit, @qorbit_dets);
+
+                # Was result any good?
+                if ($eval_orb and $eval_orb->residual < $attribution_resid_threshold_arcsec) {
+                    if (!defined($best) or $eval_orb->residual < $best->{ORBIT}->{residual}) {
+                        # Current best orbit; save
+                        $best = {
+                            MASTER => $dobj,
+                            CHILD => $qobj,
+                            ORBIT => $eval_orb,
+                        };
+                    }
+                }
+            }
+
+            # If $best_orbit is set, then we have a winner.
+            if ($best) {
+                push @merge_list, $best;
+            }
+        };
+        die $@ if $@;
+    }
+}
+
+# Hacky.
+if ($hacky) {
+    @merge_list = @merge_list[0..4];    # just a few
+}
+
+# Write stuff to database.
+$inst->pushAutocommit(0); # disable DC autocommit
+
+
+# If --nodb, just report findings and bail.
+if ($nodb) {
+    print Dumper(\@merge_list);
+    exit;
+}
+
+# Merge orbits.
+eval {
+    foreach my $merge_result (@merge_list) {
+        my ($parent_obj, $child_obj, $new_orb) = @{$merge_result}{qw(MASTER CHILD ORBIT)};
+
+        ## EFF save elems_hr orbit
+        ## EFF save ident history
+        $new_orb->insert();
+        $parent_obj->mergeChild($child_obj, $new_orb);
+        $mops_logger->info(sprintf "Identification: %s merged with parent %s", 
+            $child_obj->objectName, $parent_obj->objectName);
+        
+        # Submit the DO to the precovery pipeline...
+        modcp_submitDerivedObjectJob($inst,
+                                     $parent_obj->derivedobjectId,
+                                     $date_mjd);
+        $mops_logger->info(sprintf "Submitted precovery job for orbit %s/%s",
+                           $parent_obj->derivedobjectId, 
+                           $parent_obj->objectName);
+        # ... and remove the child orbit from the precovery table.
+        modcp_retireDerivedObjectJob($inst,
+                                     $child_obj->derivedobjectId);
+        $mops_logger->info(sprintf "Retired precovery job for orbit %s if any.",
+                           $child_obj->derivedobjectId, 
+                           $child_obj->objectName);
+        
+        # Update history.
+        my @child_history = grep { $_->eventType eq $EVENT_TYPE_DERIVATION } 
+            @{modch_retrieve($inst, derivedobjectId => $child_obj->derivedobjectId)};
+        
+        die ("got empty field ID for derived object: " . $child_obj->derivedobjectId) unless @child_history;
+        die ("got multiple field IDs for derived object: " . $child_obj->derivedobjectId) if @child_history > 1;
+        my $child_obj_field_id = $child_history[0]->fieldId;
+        
+        my $hist = PS::MOPS::DC::History::Identification->new(
+            $inst,
+            derivedobjectId => $parent_obj->derivedobjectId,
+            fieldId => $child_obj_field_id,         # use target field of child object for identification event
+            orbitId => $new_orb->orbitId,
+            orbitCode => $MOPS_EFF_ORBIT_OK,
+            classification => $parent_obj->classification,
+            ssmId => $parent_obj->ssmId,
+            childobjectId => $child_obj->derivedobjectId,
+        );
+        $hist->record;
+    }
+
+
+    # Do an efficiency pass by selecting all non-identified derived objects (query orbits)
+    # that have matching derived objects.  Note that the onces we have just merged will
+    # have their status set to 'M', so we will not re-process them.
+    my $lost_identifications_aref = modce_retrieveIdentifiableDerivedObjects($inst);
+    foreach my $pair_aref (@{$lost_identifications_aref}) {
+        my ($child_obj, $parent_obj) = @{$pair_aref};
+        my @child_history = grep { $_->eventType eq $EVENT_TYPE_DERIVATION } 
+            @{modch_retrieve($inst, derivedobjectId => $child_obj->derivedobjectId)};
+
+        die ("got empty field ID for derived object: " . $child_obj->derivedobjectId) unless @child_history;
+        die ("got multiple field IDs for derived object: " . $child_obj->derivedobjectId) if @child_history > 1;
+        my $child_hist = $child_history[0];
+
+        my $hist = PS::MOPS::DC::History::Identification->new(
+            $inst,
+            derivedobjectId => $parent_obj->derivedobjectId,
+            fieldId => $child_hist->fieldId,         # use target field of child object for identification event
+            orbitId => $child_hist->orbitId,
+            orbitCode => $MOPS_EFF_ORBIT_OK,
+            classification => $MOPS_EFF_UNFOUND,
+            childobjectId => $child_obj->derivedobjectId,
+        );
+        $hist->record;
+    }
+
+    # Mark all query orbits (new orbits) as "identified".
+    my @all_new;
+    my $queries_fh = new FileHandle;
+    my $line;
+
+    # Read queries file, which contains new orbits.
+    open $queries_fh, $queries_filename or $mops_logger->logdie("can't open DATA fh $queries_filename");
+    while (defined($line = <$queries_fh>)) {
+        push @all_new, [split /\s+/, $line]->[-1];       # push last token (orbit ID)
+    }
+    close $queries_fh;
+
+    # Iterate through orbits; fetch and mark as identified.
+    my $dobj;
+    foreach my $object_name (@all_new) {
+        $dobj = modcdo_retrieve($inst, objectName => $object_name);
+        if ($dobj->status ne $DERIVEDOBJECT_STATUS_MERGED) {
+#            $dobj->status($DERIVEDOBJECT_STATUS_IDENTIFIED);         # mark as identified and wasn't merged
+            
+            # Submit the DO to the precovery pipeline.
+            modcp_submitDerivedObjectJob($inst,
+                                         $dobj->derivedobjectId, 
+                                         $date_mjd);
+            $mops_logger->info(sprintf "Submitted precovery job for orbit %s/%s",
+                               $dobj->derivedobjectId, 
+                               $dobj->objectName);
+            
+        }
+    }
+};
+
+if ($@) {
+    $mops_logger->logwarn($@);
+    $inst->dbh->rollback;
+}
+else {
+    $inst->dbh->commit;
+}
+
+# Clean up.
+unlink $data_filename or warn $mops_logger->info("Couldn't unlink $data_filename");
+unlink $queries_filename or warn $mops_logger->info("Couldn't unlink $queries_filename");
+unlink $match_filename or warn $mops_logger->info("Couldn't unlink $match_filename");
+exit;
+
+
+sub find_candidate_tracklets {
+    # Given a field, object and position, return tracklet objects 
+    # that contain detections within "some radius" of the field.
+    # The return value is a HASHREF whose keys are trackletIds
+    # and values are the tracklet objects.
+    my ($dets_aref, $obj, $pos) = @_;
+    my $det;
+    my @near_dets;              # dets near our object
+
+    my $dist;
+    my $ra_rad = $pos->{ra} / $DEG_PER_RAD;
+    my $dec_rad = $pos->{dec} / $DEG_PER_RAD;
+    my $thresh_rad = $attribution_proximity_thresh_arcsec / 3600 / $DEG_PER_RAD;
+    foreach $det (@{$dets_aref}) {
+        $dist = slaDsep($ra_rad, $dec_rad, $det->ra / $DEG_PER_RAD, $det->dec / $DEG_PER_RAD);
+        if ($dist < $thresh_rad) {
+            push @near_dets, $det;
+        }
+    }
+
+    # Assemble hash of tracklets that contain these detections.
+    my %trkid2trk;
+    foreach $det (@near_dets) {
+        my $trk_i = modct_retrieve($inst, detectionId => $det->detId);
+        my $trk;
+        while ($trk = $trk_i->next) {
+            $trkid2trk{$trk->trackletId} = $trk;
+        }
+    }
+    return \%trkid2trk;
+}
+
+
+sub eval_orbit {
+    # Given a query orbit and a data orbit, calculate the consolidated
+    # orbit using all detections and IOD from the data orbit.
+    my ($dobj, $dorbit, @qorbit_dets) = @_;
+    my @all_dets = ($dobj->fetchDetections, @qorbit_dets);
+    return jplorb_evaluateOrbit(
+        $inst, 
+        orbit => $dorbit, 
+        detections => \@all_dets
+    );    # returns MOPS orbit
+}
+
+
+sub build_match_table {
+    my %args = validate(@_, {
+        data => 1,              # data filename
+        queries => 1,           # queries filename
+        match => 1,             # matches filename
+    });
+
+    # Build a hash table whose keys are IDs of orbits in the queries
+    # file and whose values are lists (ARRAYREFs) of matching IDs
+    # from the data file.
+    my %match_n2d;          # "n2d" -> new to derived
+
+    # For now we have to re-read the entire input files so that we
+    # can fetch stuff by row number, as OrbitProximity does not
+    # report by ID (yet).
+    my @data;
+    my @queries;
+    my $line;
+
+    my $data_fh = new FileHandle;
+    open $data_fh, $args{data} or $mops_logger->logdie("can't open DATA fh $args{data}");
+    while (defined($line = <$data_fh>)) {
+        push @data, [split /\s+/, $line]->[-1];       # push last token (orbit name)
+    }
+    close $data_fh;
+
+    my $queries_fh = new FileHandle;
+    open $queries_fh, $args{queries} or $mops_logger->logdie("can't open QUERIES fh $args{queries}");
+    while (defined($line = <$queries_fh>)) {
+        push @queries, [split /\s+/, $line]->[-1];       # push last token (orbit name)
+    }
+    close $queries_fh;
+    
+    my $match_fh = new FileHandle;
+    my @stuff;
+    open $match_fh, $args{match} or $mops_logger->logdie("can't open MATCH fh $args{match}");
+    while (defined($line = <$match_fh>)) {
+        @stuff = split /\s+/, $line, 2;
+        push @{$match_n2d{@queries[$stuff[0]]}}, @data[$stuff[1]]; # first item=query line no; second=data line no
+    }
+    close $queries_fh;
+
+    return %match_n2d;
+}
+
+
+=head1 NAME
+
+identifyOrbits - associate new orbits with derived orbits
+
+=head1 SYNOPSIS
+
+identifyOrbits [options]
+
+  --nodb : don't actually change the database
+  --help : show this manual page
+
+=head1 DESCRIPTION
+
+identifyOrbits performs complete orbit identifcation processing, as follows:
+
+=begin code
+
+  extract orbitIDs of all NEW unchecked orbits (flags.identified unset)
+  extract all DERIVED orbits (flags.identified set)
+  perform an OrbitProximity operation of NEW orbits against DERIVED ORBITS
+  create a map NEW orbits and their match lists
+  for each NEW orbit :
+    if it has a match:
+        compute orbits using old and new detections
+        if any orbit is below RMS cutoff:
+          select lowest
+          merge with source DERIVED (new.parent = derived)
+    
+    new.flags.identified = set
+
+
+
+=end code
+
+=head1 TODOS
+
+select s.object_name, s.ssm_id, doa.derivedobject_id, dob.derivedobject_id from derivedobjects doa, derivedobjects dob, ssm s where doa.ssm_id=dob.ssm_id and doa.ssm_id=s.ssm_id and doa.status='U' and dob.status='I';
+
+=cut
+

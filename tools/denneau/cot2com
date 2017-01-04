@@ -1,0 +1,56 @@
+#!/usr/bin/env perl
+#
+# Convert DES COT (Cometary + True Anomaly) orbits to COM (Cometary).
+# DANGER: doesn't work yet!  Calulation is incorrect.
+#
+use strict;
+use warnings;
+
+use Math::Trig;
+
+
+our $AU_m = 1.49597870691E+11;          # AU in m
+our $GM_sun = 1.32712440018E+20;        # m^3/s^-2
+our $GM = $GM_sun * (86400**2) / ($AU_m**3);        # 0.000295912134144 AU^3/d^2
+#our $GM = 0.000295912134144;            # AU^3/d^2
+
+
+sub cvt {
+    my ($line) = @_;
+
+    # Process lines.
+    my ($q_AU, $e, $i_deg, $node_deg, $arg_peri_deg, $true_anomaly, $h_v, $epoch_mjd);
+    my ($id, $dummy);
+    my $time_peri_mjd;
+    my $a_AU;   # semi-major axis
+    my $theta_rad;      # true anomaly, rad
+    my $E;      # eccentric anomaly, rad
+    my $M;      # mean anomaly, rad
+    my $n;      # mean motion, rad/day
+    my @etc;
+
+    ($id, $dummy, $q_AU, $e, $i_deg, $node_deg, $arg_peri_deg, $true_anomaly, $h_v, $epoch_mjd, @etc) = split /\s+/, $line;
+    warn "bogus line $line" unless defined($epoch_mjd);
+    warn "$id not COT" unless $dummy eq 'COT';
+
+    # Convert true anomaly to time of perihelion.
+    $theta_rad = $true_anomaly * pi / 180;
+    $E = 2 * atan(sqrt((1 - $e) / (1 + $e)) * tan($theta_rad / 2));
+    $M = $E - $e * sin($E);
+    $a_AU = $q_AU / (1 - $e);
+    $n = sqrt($GM / $a_AU**3);
+    $time_peri_mjd = $epoch_mjd - $M / $n;
+
+    return join(' ', $id, 'COM', $q_AU, $e, $i_deg, $node_deg, $arg_peri_deg, $time_peri_mjd, $h_v, $epoch_mjd, @etc);
+}
+
+
+my $line;
+while (defined($line = <>)) {
+    chomp $line;
+    if ($line =~ /^(#|!)/) {
+        print $line, "\n";
+        next;
+    }
+    print cvt($line), "\n";
+}

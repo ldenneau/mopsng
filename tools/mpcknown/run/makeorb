@@ -1,0 +1,38 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use FileHandle;
+
+# Given an input DES file of observations and DES file of orbits, emit
+# only those orbits that have an observation.
+
+my ($obs, $orb) = @ARGV;
+my $fh;
+
+my %obsids;
+my @fields;
+$fh = new FileHandle $obs or die "can't open $obs";
+while (my $line = <$fh>) {
+    next if $line =~ /^#|^!/;
+    @fields = split /\s+/, $line, 2;
+    $obsids{$fields[0]} = 1;
+}
+$fh->close();
+
+
+$fh = new FileHandle $orb or die "can't open $orb";
+while (my $line = <$fh>) {
+    if ($line =~ /^#|^!/) {
+        print $line;
+        next;
+    }
+
+    @fields = split /\s+/, $line, 2;
+    if ($obsids{$fields[0]}) {
+        print $line;
+        next;
+    }
+}
+$fh->close();

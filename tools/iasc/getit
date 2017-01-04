@@ -1,0 +1,49 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+my $dsroot = 'http://datastore.ipp.ifa.hawaii.edu/pstampresults';
+
+my $fs = shift;
+my $dest = shift;
+
+# set this if the files have already been downloaded 
+my $skip_download = 0;
+
+die "usage: $0 <fileset_name> <destdir" if !$fs or !$dest;
+
+
+# $fs = 'web_' . $fs if !($fs =~ /web_/);
+
+my $url = "$dsroot/$fs";
+
+my $destdir = "$dest/$fs";
+
+unless($skip_download) {
+
+    my $rc = system "dsgetfileset -u $url -o $destdir";
+    if ($rc) {
+        my $status = $rc >>  8;
+        die "dsgetfileset failed with $rc $status\n";
+    }
+}
+
+# read exp_name from results.mdc (keyword is FPA_ID)
+my $grepout = `grep FPA_ID $destdir/results.mdc | tail -n 1`;
+chomp $grepout;
+
+die "failed to find exp_name in results.mdc" unless $grepout;
+
+my (undef, undef, $exp_name) = split " ", $grepout;
+
+die "failed to find exp_name in results.mdc: $grepout" unless $exp_name;
+
+my $final_destdir = "$dest/$exp_name";
+rename $destdir, $final_destdir or die "failed to rename $destdir";
+
+chdir $final_destdir or die "failed to chdir to $final_destdir";
+
+system 'perl /data/ippc18.0/home/ipp/iasc.v2/rename.stamp.outputs.pl *';
+
+

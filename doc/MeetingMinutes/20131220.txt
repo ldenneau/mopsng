@@ -1,0 +1,44 @@
+Attendees: Chastel, Denneau
+
+* Telescope Status
+No report
+
+* IPP Issues
+  - IPP Trail fitting
+No progress.
+SC: We should set up intense development/tests with IPP during 3-4 weeks in Jan/Feb.
+  - Photometry
+No report
+  - Convolution/Covariance
+SC: Provide new cut-off values for s2n to the IPP(?)
+
+* Data Processing
+  - MOPS HW status
+     - Buy 2 or 3 of the Processing nodes: Has to be quick (we run on 14 cpus instead of 32)
+     - Then replace Database node
+
+* NEO Status
+No report
+* NEO Czaring
+No report
+
+* Comets
+No report
+
+* ATLAS
+No report
+
+* AOB 
+-> Synthetics
+    LD: Should we still ingest synthetics? The way they were designed took into account PS4: Are they still significant?
+    SC: More a "scientific" concern than an "engineering" one. Should ask RJW/PV
+-> IPP extended parameters
+    LD: Add IPP extended parameters in the database: det_trailed -> length, pos angle
+           Create new database and ingest IPP extended parameters
+           -> Even if we don't use them we have them in database and not in fits files...
+    LD: Clean exisitng tables (e.g. length, pos is not used in detections)
+-> Database performance
+    SC: Ingesting mdrm152 on mops00 took 4 days.
+    - Use lvm for snapshots and backups (needs exactly same engines)
+    - postgresql for future: partitioning?
+

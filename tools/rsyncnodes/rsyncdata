@@ -1,0 +1,50 @@
+#!/bin/bash
+
+CODEBASE=MOPS_DATA
+SRCDIR=~mopsnode/mops/$CODEBASE
+echo "Using CODEBASE=$CODEBASE, SRCDIR=$SRCDIR."
+
+if [ ! -d $SRCDIR ]
+then
+    echo "can't find $SRCDIR"
+    exit 1
+fi
+
+if [ ! -d ~mopsnode ]
+then
+    echo "can't find ~mopsnode home directory"
+    exit 1
+fi
+
+pushd $SRCDIR
+echo "Synchronizing $CODEBASE tree to mopsnode home directory."
+sh SYNC.sh
+pushd
+
+
+# Get the list of Condor nodes from the Condor configuration, as follows:
+# 1. Get the hosts listed in HOSTALLOW_WRITE in the Condor configuration.  This line
+#   will have the format 'HOSTALLOW_WRITE=host1, host2, host3'
+# 2. Strip leading whitespace
+# 3. Strip trailing whitespace
+# 4. Strip everything through the assigment operator
+# 5. Strip commas
+# 6. Convert whitespace to returns
+# 7. Remove the master host from the list
+MASTER_HOST=`hostname`
+NODES=`grep '^HOSTALLOW_WRITE ' /etc/condor/condor_config | sed 's/^ *//; s/ *$//; s/^.*=//; s/,/ /g; s/  */\n/g' | grep -v $MASTER_HOST`
+NODES="${NODES} mops03.ifa.hawaii.edu"
+
+for node in $NODES
+do
+    echo Processing node $node...
+    echo ssh mops@${node} "rsync -avx mopsnode@$MASTER_HOST:mops/$CODEBASE .; chmod 0755 ."
+    ssh mops@${node} "rsync -avx mopsnode@$MASTER_HOST:mops/$CODEBASE .; chmod 0755 ."
+    
+    # Sync contents of /usr/local/caet_data
+    echo ssh mops@${node} "rsync -avx mopsnode@$MASTER_HOST:/usr/local/caet_data /usr/local"
+    ssh mops@${node} "rsync -avx mopsnode@$MASTER_HOST:/usr/local/caet_data /usr/local"
+    
+    # Sync libsla.a by hand!!!!
+    
+done

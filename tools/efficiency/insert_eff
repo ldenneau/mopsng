@@ -1,0 +1,85 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+insert_eff - Insert efficiency output into table
+
+=head1 SYNOPSIS
+
+insert_eff [options] FILENAME
+  --filter=FILT : PS1 filter
+  --eff_type=TYPE : either "DETECTION" or "TRACKLET"
+  FILENAME : file containing eff_known output
+
+=head1 DESCRIPTION
+
+Stuff.
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+use FileHandle;
+use File::Slurp;
+
+use PS::MOPS::DC::Instance;
+
+my $instance_name;
+my $nn;
+my $sim = 'psmops_ps1_efficiency';      # known sim to compare against
+my $filter;
+my $eff_type;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'nn=i' => \$nn,
+    'filter=s' => \$filter,
+    'eff_type=s' => \$eff_type,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+my $filename = shift;
+pod2usage(-msg => 'FILENAME not specified.') unless $filename;
+die "--nn NN not specified" unless $nn;
+die "can't read $filename" unless -r $filename;
+die "eff_type must be either DETECTION or TRACKLET" unless ($eff_type && $eff_type =~ /^(DETECTION|TRACKLET)$/);
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbname = $inst->dbname();
+my $cfg = $inst->getConfig();
+my $dbh = $inst->dbh();
+my $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+insert into deteff (
+    nn, filter_id, eff_type, bin_start, bin_end, known, found
+)
+values (
+    ?, ?, ?, ?, ?, ?, ?
+)
+SQL
+
+# Clean old efficiency rows for this filter.
+$dbh->begin_work or die $dbh->errstr;
+$dbh->do("delete from deteff where nn=? and eff_type=? and filter_id=?", undef, $nn, $eff_type, $filter);
+
+my @lines = grep { !/MAG/ } read_file($filename);
+my @foo;
+foreach my $line (@lines) {
+    @foo = split /\s+/, $line;
+    die "weird line @foo" unless @foo == 5;
+    $sth->execute(
+        $nn,
+        $filter,
+        $eff_type,
+        $foo[0],
+        $foo[1],
+        $foo[2],
+        $foo[3]
+    ) or die $sth->errstr;
+}
+$sth->finish;
+$dbh->commit or die $dbh->errstr;
+exit;

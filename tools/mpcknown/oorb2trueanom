@@ -1,0 +1,150 @@
+#!/usr/bin/env python
+
+# Given an OORB orbit file and an OORB observation file, read in all the orbits
+# and store them.  Then read in each observation, find its orbit, and compute
+# true anomaly.  Re-emit the obs line with true anomaly added as column "TrueAnom".
+
+import sys
+import os
+import slalib
+import math
+import subprocess
+import tempfile
+
+
+# See
+# http://www.stjarnhimlen.se/comp/ppcomp.html#19
+
+# orb.des
+#!!OID FORMAT q e i Omega argperi t_p H t_0 INDEX N_PAR MOID COMPCODE
+#00019 COM 2.0565700480233 0.1578430 1.57339 211.23558 182.36099 67.184 7.13 56199.9992224074 1 6 -1 MOPS
+#00022 COM 2.61672118130805 0.1003693 13.71888 66.08212 354.63467 66.184 6.45 56199.9992224074 1 6 -1 MOPS
+#00024 COM 2.73807275724416 0.1279832 0.75447 36.10180 106.44371 67.184 7.08 56199.9992224074 1 6 -1 MOPS
+#00025 COM 1.785471326452 0.2558544 21.59356 214.23019 90.11185 67.184 7.83 56199.9992224074 1 6 -1 MOPS
+#00026 COM 2.4155738350095 0.0898734 3.56415 45.79603 194.50748 67.184 7.4 56199.9992224074 1 6 -1 MOPS
+#00033 COM 1.90007854029972 0.3372291 1.86978 8.59791 338.14108 67.184 8.55 56199.9992224074 1 6 -1 MOPS
+#00034 COM 2.4064178977468 0.1047704 5.49796 184.45347 330.00701 67.184 8.51 56199.9992224074 1 6 -1 MOPS
+#00035 COM 2.31108381898108 0.2271708 7.93513 353.78971 213.67346 66.184 8.5 56199.9992224074 1 6 -1 MOPS
+#00036 COM 1.91681676057216 0.3026416 18.43035 358.45123 46.90401 66.184 8.46 56199.9992224074 1 6 -1 MOPS
+
+# obs.out
+#Designation Code        MJD_UTC/UT1              Delta                 RA                Dec          dDelta/dt             dRA/dt            dDec/dt               VMag                Alt              Phase          LunarElon           LunarAlt         LunarPhase          SolarElon           SolarAlt                  r               HLon               HLat               TLon               TLat             TOCLon             TOCLat             HOCLon             HOCLat            TOppLon            TOppLat          HEclObj_X          HEclObj_Y          HEclObj_Z      HEclObj_dX/dt      HEclObj_dY/dt      HEclObj_dZ/dt         HEclObsy_X         HEclObsy_Y         HEclObsy_Z
+#CK05L030         F51   55634.4210700000       8.8851859031     167.6414359393      42.4569484741       0.0105783244      -0.1418996059       0.0243652622      14.0305389817      68.1759672659       3.8059298650      58.8217796607      28.7351626080       0.5925521116     139.8060371668     -70.7537202173       9.6658897397     152.8598662646      30.7686600366     150.1611657474      33.8155785279     -23.1631990173      33.8149784686     -20.4644985000      30.7680599774     173.3243647647       0.0006000593      -7.3908481176       3.7886231172       4.9448077251      -0.0027527473       0.0073266725       0.0002101073      -0.9873985105       0.1155670068       0.0000104116
+
+
+def emit(*stuff):
+    print stuff
+    return
+
+
+# Read in the orbits file.
+if __name__ == '__main__':
+    orb_in = sys.argv[1]
+    lines = file(orb_in).readlines()
+    header_line = None
+    orbits = {}
+
+    try:
+        for line in lines:
+            if line[0] == '#' or line[0] == '!':
+                header_line = line
+                continue
+            (id, fmt, q_au, e, i_deg, node_deg, arg_peri_deg, time_peri_mjd, h_v, epoch_mjd, dummy1, dummy2, dummy3, dummy4) = line.split()
+            q_au = float(q_au)
+            e = float(e)
+            i_deg = float(i_deg)
+            node_deg = float(node_deg)
+            arg_peri_deg = float(arg_peri_deg)
+            time_peri_mjd = float(time_peri_mjd)
+            h_v = float(h_v)
+            epoch_mjd = float(epoch_mjd)
+            orb_line = line
+            orbits[id] = {
+                'desig': id,
+                'q_au': q_au,
+                'e': e,
+                'i_deg': i_deg,
+                'node_deg': node_deg,
+                'arg_peri_deg': arg_peri_deg,
+                'time_peri_mjd': time_peri_mjd,
+                'hv': h_v,
+                'epoch_mjd': epoch_mjd,
+            }
+        # <- for
+    except Exception, e:
+        sys.stderr.write('Error with line: ' + line)
+        exit()
+
+    #tmpdir = tempfile.mkdtemp()
+    #os.chdir(tmpdir)
+    obs_in = sys.argv[2]
+    lines = file(obs_in).readlines()
+    header_line = None
+    for line in lines:
+        line = line.rstrip("\r\n")
+        if line[0] == '#':
+            # Header line
+            print line, " TrueAnom"
+            continue
+
+        stuff = line.split()
+        desig = stuff[0]
+        test_epoch_mjd = float(stuff[2])
+
+        # look up orbit
+        orbit = orbits.get(desig)
+        q_au = orbit['q_au']
+        e = orbit['e']
+        i_deg = orbit['i_deg']
+        node_deg = orbit['node_deg']
+        arg_peri_deg = orbit['arg_peri_deg']
+        time_peri_mjd = orbit['time_peri_mjd']
+        epoch_mjd = orbit['epoch_mjd']
+
+        arg = (q_au / (1 - e)) ** 3
+        if (arg > 0):
+            period_d = math.sqrt((q_au / (1 - e)) ** 3) * 365.25
+        else:
+            period = None
+
+
+        # Get position of perihelion by computing Cartesian position at time of perihelion (lame).
+        pv, jstat = slalib.sla_planel(time_peri_mjd, 3, time_peri_mjd, math.radians(i_deg), math.radians(node_deg), math.radians(arg_peri_deg), q_au, e, 0, 0)
+        pperi = (pv[0], pv[1], pv[2])
+
+        # Get current position.
+        pv, jstat = slalib.sla_planel(test_epoch_mjd, 3, time_peri_mjd, math.radians(i_deg), math.radians(node_deg), math.radians(arg_peri_deg), q_au, e, 0, 0)
+        ptest = (pv[0], pv[1], pv[2])
+
+
+        # Separation.  True anomaly is angle between periapsis direction (p) and
+        # current position (a).
+        t = math.degrees(slalib.sla_dsepv(pperi, ptest))
+
+
+        # Finally, since the separation is computed between 0 and 180 degrees,
+        # we have to know if we're per- or post-periapsis and adjust the angle
+        # so that it represents 0-360.
+        if period_d is not None:
+            if test_epoch_mjd > time_peri_mjd:
+                # find nearest time of periapsis before our test epoch
+                delta_d = test_epoch_mjd - time_peri_mjd - int((test_epoch_mjd - time_peri_mjd) / period_d) * period_d
+            else:
+                # find nearest time of periapsis before our test epoch by finding nearest after and subtracting
+                # one period
+                delta_d = test_epoch_mjd - (time_peri_mjd - (1 + int((time_peri_mjd - test_epoch_mjd) / period_d)) * period_d)
+
+            if delta_d > period_d / 2:
+                true_anomaly = 360 - t
+            else:
+                true_anomaly = t
+        else:
+            true_anomaly = t
+        # <- period
+                
+
+        print line, ' ', true_anomaly
+        #os.rmdir(tmpdir)
+
+
+    exit()

@@ -1,0 +1,18 @@
+MOPS SSM Version
+$Id: VERSION 375 2005-06-21 21:00:22Z denneau $
+Version 1.0
+
+This is version 1.0 of the MOPS Solar System Model (SSM).  The various
+populations are
+
+* 10M main-belt ojects
+* NEOs
+* Centaurs
+* Trojans
+* TNOs
+* SDOs
+* Comets
+
+Known problems:
+
+* The TNOs have an inclination distribution that is too narrow.

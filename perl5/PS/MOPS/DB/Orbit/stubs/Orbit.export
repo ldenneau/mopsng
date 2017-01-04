@@ -1,0 +1,56 @@
+%EXPORT_TAGS = ( 'all' => [ qw(
+    modco_toStruct
+    modco_toStructArray
+    modco_getCount
+    modco_create
+    modco_retrieve
+    modco_retrieveByValue
+    modco_retrieveByDetectionId
+    modco_insertByValue
+    modco_insert
+    modco_attributeDetections
+    modco_clearDetections
+    modco_update
+    modco_delete
+    modco_free
+    modco_freeArray
+    modco_freeStruct
+    modco_freeArrayStruct
+    modco_getId
+    modco_getQ
+    modco_getE
+    modco_getI
+    modco_getNode
+    modco_getLongPeri
+    modco_getTimePeri
+    modco_getEpoch
+    modco_getDetCount
+    modco_getChiSquared
+    modco_getOMinusC
+    modco_getIsFake
+    modco_getFlags
+    modco_getUpdated
+    modco_getMoid
+    modco_getMoidLong
+    modco_getObjectName
+    modco_getTaxonomicType
+    modco_getRotationPeriod
+    modco_getAmplitude
+    modco_getRotationEpoch
+    modco_getHV
+    modco_getHSS
+    modco_getG
+    modco_getAlbedo
+    modco_getPoleLat
+    modco_getPoleLong
+    modco_getDetections
+    modco_next
+    modco_prev
+    modco_nextDetection
+    modco_prevDetection
+) ] );
+
+@EXPORT_OK = ( @{ $EXPORT_TAGS{'all'} } );
+
+@EXPORT = qw( );
+

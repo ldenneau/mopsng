@@ -1,0 +1,131 @@
+#!/usr/bin/env perl
+# $Id: insertNewDerivedObjects 3009 2008-08-21 20:21:11Z denneau $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use FileHandle;
+use Pod::Usage;
+use File::Slurp;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::Residuals;
+
+
+# Options.
+my $inst;
+my $instance_name;
+my $resids_file;
+my $help = 0;
+my $debug = 0;
+
+# Start program here.
+GetOptions(
+    'instance=s' => \$instance_name,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+
+$resids_file = shift @ARGV;
+pod2usage(2) unless $resids_file;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+my $resids_data;
+$resids_data = load_resids($resids_file) if $resids_file;
+
+
+my $line;
+my $link_id;                # ID assigned to orbit by LinkTracklets
+my $classification;
+my $object_name;
+my $orbit_code;
+my $orbit_els;
+
+# Write per-detection postfit residuals.
+$inst->pushAutocommit(0); # disable DC autocommit
+eval {
+    my ($ktrk, $vtrk);
+    my ($ktrkl, $vtrkl);
+    my ($kdet, $vdet);
+    my $r;
+    while (($ktrk, $vtrk) = each %{$resids_data}) {
+        while (($ktrkl, $vtrkl) = each %{$vtrk}) {
+            while (($kdet, $vdet) = each %{$vtrkl}) {
+                $r = PS::MOPS::DC::Residuals->new($inst, 
+                    detId => $kdet,
+                    trackletId => $ktrkl,
+                    raResid_deg => $vdet->[0],          # just RA and DEC resids for now
+                    decResid_deg => $vdet->[1],
+                    raError_deg => $vdet->[2],
+                    decError_deg => $vdet->[3],
+                );
+                $r->insert();
+            }
+        }
+    }
+};
+
+if ($@) {
+    $inst->dbh->rollback;
+    $mops_logger->logdie("insert failed: $@");
+}
+else {
+    $inst->dbh->commit;
+}
+
+
+exit;
+
+
+sub load_resids {
+    my ($resids_file) = @_;
+    my $fh;
+    my $resids_data = {};
+    my $line;
+    my @stuff;
+    my ($track_id, $tracklet_id, $det_id, $ra_res_deg, $dec_res_deg, $mag_res, $ra_err_deg, $dec_err_deg, $ra_wgt, $dec_wgt, $ast_reject);
+
+    $fh = new FileHandle $resids_file or $mops_logger->logdie("can't open $resids_file");
+    # Data is format
+    #   TRACK_ID TRACKLET_ID DET_ID RA_RES_DEG DEC_RES_DEG RA_ERR_DEG DEC_ERR_DEG AST_REJECT
+    while ($line = <$fh>) {
+        next if $line =~ /^(#!)/;
+        @stuff = split /\s+/, $line;
+        $mops_logger->logdie("wrong number of args in resids line") unless scalar @stuff == 8;
+        ($track_id, $tracklet_id, $det_id, $ra_res_deg, $dec_res_deg, $ra_err_deg, $dec_err_deg, $ast_reject) = @stuff;
+
+        $resids_data->{$track_id}->{$tracklet_id}->{$det_id} = [ 
+            $ra_res_deg, 
+            $dec_res_deg, 
+            $ra_err_deg, 
+            $dec_err_deg, 
+            $ast_reject
+        ];
+    }
+    $fh->close();
+
+    return $resids_data;
+}
+
+
+=head1 NAME
+
+insertResids - Program to postfit residuals for tracks
+
+=head1 SYNOPSIS
+
+insertResids MIF
+
+  MIF : file containing MIF-TRACK orbits
+
+=head1 DESCRIPTION
+
+Insert postfit residuals.
+
+=cut

@@ -1,0 +1,43 @@
+Attending:
+Bolin, Chastel (chair/scribe), Denneau, Jedicke, Veres
+
+Mnutes:
+* Telescope Status (SC)
+Bad weather, camera problems but fine.
+* IPP
+  - IPP Trail fitting (PV)
+PV: If trail pixels length>10, position angle is good. Tested on 10,000 longest asteroid trails (all bands)
+PV: Position angle is ok for objects moving faster than 0.5 deg/day.
+PV: The lengths are often off leading to poor magnitude estimates.
+JD/LD/SC: How good is it compared to PV's IDL code? When not trailed can we know reliably about it?
+-> Need to build a reference set of trailed detections. Provide a report to IPP based for testing with ground-truth data (namely a table with exposure name, band, psf quality, ra, dec, asteroide name, flux (estimated by IDL), length, position angle).
+
+  - Photometry (AF)
+No report
+  - Convolution (SC)
+No progress
+* Data Processing (SC)
+- no more SYNTH stage: can't estimate the speed-up because of no data
+- mops04/mops10: memory tests; swapping tests. Apparently no problem on these hosts. SC will try to add them back to the Condor pool at some point.
+
+* NEO Status (PV)
+- nothing much to report (bad weather)
+- Follow-up: cfht down since Tuesday (bright time); 88 off or half-time operated
+
+* NEO Czaring (BB)
+- nothing to report
+- silent/quiet button still required
+- nice detections of L2
+
+* Comets (JK)
+Nothing to report
+* ATLAS (LD)
+- mops working on the atlas cluster (mops installation was painful: jpl python extension installation failed)
+- atlas will largely use GO (google language)
+  SC: Need to evaluate if GO can run on the mops cluster.
+* AOB
+  - Searching detections in IPP smf (SC)
+smf_search on mops14. Grab smf files from the IPP, give the nearest neighbors from a ra,dec position
+  - New MOPS meeting time
+New time for MOPS meeting: Tuesday 11am.
+

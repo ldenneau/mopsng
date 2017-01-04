@@ -1,0 +1,204 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+
+use PS::MOPS::DC::Instance;
+
+
+my $instance_name;
+my $debug;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $dbh = $inst->dbh;
+
+#my $obsurl = 'http://scully.cfa.harvard.edu/cgi-bin/showobsorbs.cgi?Obj=XXXX&obs=y';
+#my $orburl = 'http://scully.cfa.harvard.edu/cgi-bin/showobsorbs.cgi?Obj=XXXX&orb=y';
+my $CONFIRM_URL = 'http://www.minorplanetcenter.net/iau/NEO/ToConfirm.html';
+my $PREVIOUS_URL = 'http://www.minorplanetcenter.net/iau/NEO/ToConfirm_PrevDes.html';
+
+
+# Get contents of confirmation page.
+print STDERR "Fetching $CONFIRM_URL...\n" if $debug;
+my @lines = `wget $CONFIRM_URL -q -O -`;
+chomp @lines;
+
+my $desig;
+my %work;
+
+for my $line (@lines) {
+    my $one_nighter;
+    if ($line =~ /VALUE="(P1\w+)"> \1/) {
+        $desig = $1;
+        $one_nighter = $line =~ /1 nighter/;
+        if ($one_nighter) {
+            $work{$desig} = {
+                DISPOSITION => '1'      # one-nighter
+            };
+        }
+        else {
+            $work{$desig} = {
+                DISPOSITION => '2'      # followed-up
+            };
+        }
+    }
+}
+
+
+# Now process previous designations page.  This will have lists of tracklets
+# that were previously on the confirmation page along with what happened to
+# them.
+print STDERR "Fetching $PREVIOUS_URL...\n" if $debug;
+@lines = `wget $PREVIOUS_URL -q -O -`;
+chomp @lines;
+
+my @mbo;
+my @neo;
+my @comet;
+my $mpc_desig;
+my $neo_type;
+my $mpec_url;
+my $get_sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select disposition from export.mpc_sub where desig=? limit 1
+SQL
+
+for my $line (@lines) {
+    # Remove the subscripting on MPC long designations.
+    if ($line =~ /\b(P1\w+)\b/) {
+        $desig = $1;
+        $line =~ s|</?sub>||g;
+
+        # Get the current disposition of this tracklet.
+        $get_sth->execute($desig) or die $get_sth->errstr;
+        my ($cur_disp) = $get_sth->fetchrow_array();
+        if (!$cur_disp) {
+            warn "No disposition for $desig";
+            next;
+        }
+
+        # Want to handle following cases:
+        # 1. designation, no MPEC (MBO)
+        # 2. designation with MPEC (NEO or PHA, need to follow URL)
+        # 3. comet
+        # 4. does not exist
+        # 5. what about recoveries?
+
+        # 3. Comet.  Match
+        #   <li> Comet C/2012 K1 = P103Bam(May 21.75 UT)   [see <a href="http://www.cbat.eps.harvard.edu/cbet/003100/CBET003112.txt"><i>CBET</i> 3112</a>]
+        if ($line =~ m|Comet\s+([CP]/\d\d\d\d\s*\w+)\s+=\s+$desig|) {
+            $mpc_desig = $1;
+            $work{$desig} = {
+                DISPOSITION => 'M',     # M => comet
+                MPC_DESIG => $mpc_desig,
+            };
+        }
+        # 2. NEO/PHA.  Match 
+        #   <li> 2012 KY41  = P103CJH (May 28.05 UT)   [see <a href="/mpec/K12/K12K62.html"><i>MPEC</i> 2012-K62</a>]
+        # and follow the MPEC URL.
+        elsif ($line =~ m|(\d\d\d\d\s*\w\w\d*)\s+=\s+$desig\b.*(/mpec/.*html)|) {
+            $mpc_desig = $1;
+            $mpec_url = $2;
+            $neo_type = scrape_mpec($mpec_url, $mpc_desig);
+            $work{$desig} = {
+                DISPOSITION => ($neo_type eq 'PHA' ? 'A' : 'C'),        # A => PHA, C => NEO ('confirmed')
+                MPC_DESIG => $mpc_desig,
+            };
+        }
+        # 1. MBO.  Match 
+        #   2012 KU24  = P103Drx(May 25.76 UT)
+        elsif ($line =~ /(\d\d\d\d\s*\w\w\d*)\s+=\s+$desig/) {
+            $mpc_desig = $1;
+            $work{$desig} = {
+                # if was on CP (1 or 2), change to non-NEO discovery (N)
+                DISPOSITION => 'N',
+                MPC_DESIG => $mpc_desig,
+            };
+        }
+        # 4. Rejected tracklet.
+        # XXX LD we cannot trust this information yet from MPC; it's erroneous -- lists real objects as 'does not exist'
+        elsif ($line =~ m|$desig does not exist|) {
+            $work{$desig} = {
+                DISPOSITION => 'J',     # J => rejected
+            };
+        }
+    }
+}
+
+# Now process our stuff.
+my $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+update export.mpc_sub set disposition=?, mpc_desig=? where desig=? and disposition in ('S', 'T', '1', '2', 'O')
+SQL
+
+foreach $desig (sort keys %work) {
+    my $v = $work{$desig};
+    if ($v->{MPC_DESIG}) {
+        print "$desig => $v->{DISPOSITION} ($v->{MPC_DESIG})\n";
+    }
+    else {
+        print "$desig => $v->{DISPOSITION}\n";
+    }
+    if (!$debug) {
+        $sth->execute($v->{DISPOSITION}, $v->{MPC_DESIG}, $desig) or die $sth->errstr;     # N => non-NEO
+    }
+}
+$sth->finish or die $sth->errstr;
+
+exit;
+
+
+sub scrape_mpec {
+    # Fetch the contents of an MPEC and determine whether an object is a PHA
+    # or NEO.
+    my ($url, $desig) = @_;
+    $url = "http://www.minorplanetcenter.net$url";
+    print STDERR "Fetching $url...\n" if $debug;
+    my @lines = `wget $url -q -O -`;
+    chomp @lines;
+
+    for my $line (@lines) {
+        if ($line =~ m|$desig\b.*\bPHA\b|) {
+            return 'PHA';
+            last;
+        }
+    }
+    return 'NEO';
+}
+
+=head1 NAME
+
+neocp_scrape - MOPS tool get MPC confirmation page PS1 tracklets and assign status in MOPS DB
+
+=head1 SYNOPSIS
+
+neocp_scrape [options]
+
+  --help : show this manpage
+
+=head1 DESCRIPTION
+
+Downloads the page
+
+    http://www.minorplanetcenter.net/iau/NEO/ToConfirm.html
+
+and looks for VALUE="(P\w+)" strings which are likely to be PS1 tracklet
+IDs.  Sets the disposition of these tracklets to NEOCP or NEOCP-F.
+
+Now downloads
+
+  http://www.minorplanetcenter.net/iau/NEO/ToConfirm_PrevDes.html
+
+as well and updates discovery data.  For MPECed PS1 objects, we follow the MPEC
+URL and determine if the discovery is an NEO, PHA or comet.
+
+=cut

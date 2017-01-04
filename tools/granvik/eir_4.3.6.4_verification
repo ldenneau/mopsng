@@ -1,0 +1,65 @@
+#!/bin/bash
+ 
+# Verification test for EIR 4.3.6.4 (orbits size)
+# Mikael Granvik  07/25/2008
+
+USERNAME="granvik"
+STUB="eir_4364_verification"
+INSTANCE_NAME="psmops_granvik_emptysim"
+NORBITS=100000000
+MYSQLHOST="mops00"
+MYSQLUSER="mops"
+MYSQLPASSWD="mops"
+
+echo "1..1"
+
+# Initialize empty MOPS DB
+source $HOME/bin/mops_env $INSTANCE_NAME
+buildInstance --description "Empty sim" &> /dev/null
+
+# Write more than 1,000,000 SQL insertion commands to a single string
+str="INSERT INTO orbits() VALUES(); "
+a=1
+while (( a <= 1000000 ))
+  do
+  str="$str$str"
+  let a=a*2
+done
+
+# Write the stuff into the table
+b=0
+while (( b <= $NORBITS ))
+  do
+  echo \
+"
+SET AUTOCOMMIT=0;
+$str
+COMMIT;
+" | mysql -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME
+b=$b+$a
+done
+
+# Count rows in table after insertion
+rows=`echo \
+"
+select
+ count(*)
+from
+ orbits;
+" | mysql -N -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME`
+if [[ $1 == "--result" ]]
+    then
+    echo $rows
+fi
+
+# Check whether the size req is met:
+if (( $rows >= $NORBITS )) ; then
+    echo "ok 1 - ${STUB}"
+else
+    echo "not ok 1 - ${STUB}"
+fi
+
+# Delete temporary MOPS DB
+buildInstance --remove $INSTANCE_NAME &> /dev/null
+
+exit

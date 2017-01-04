@@ -1,0 +1,396 @@
+# $Id: master.cf 5516 2014-06-03 01:16:50Z schastel $
+#
+# MOPS master config file.  Nearly all MOPS runtime operation is controlled
+# using this file.  Configuration variables can be fetched from Perl using the
+# PS::MOPS::Config module.
+
+# Global options.
+main {
+    notify = mopsczar@ifa.hawaii.edu       # email address here for auto-notify
+    admin = mopsadmin@ifa.hawaii.edu       # email for admin related stuff
+    notify_twitter = 0
+
+    # Number of CPUs available for computation:
+    #   Controls how many condor jobs we preferrably create
+    #   e.g. for digest scores
+    cpus = 72
+
+    # Modules.  These control which high-level options are available.
+    # PS1 testing.
+    enable_datastore = 1
+    enable_detectability = 0
+    enable_lsd = 0
+    enable_moid = 1
+
+#    enable_alert = 1       # web01 not responding
+    enable_alert = 0
+    enable_coverage = 1
+
+    # End-of-night/lunation processing.
+    # disable for NEO night, run at end
+    enable_known = 0
+    enable_digest = 1
+    # run by hand
+    #enable_stamps = 1
+    enable_stamps = 1
+    stamps_direct = 1
+    enable_link2 = 0
+
+    # PS1 production.
+#    enable_datastore = 1
+#    enable_detectability = 1
+#    enable_lsd = 1
+#    enable_moid = 1
+#    enable_alert = 1
+#    enable_known = 1
+#    enable_link2 = 1
+
+    # Non-PS1 testing, pure simulations.
+#    enable_datastore = 0
+#    enable_detectability = 0
+#    enable_lsd = 0
+#    enable_moid = 1
+#    enable_alert = 1
+#    enable_known = 1
+#    enable_link2 = 1
+}
+
+# Orbit determination.
+orbit_determination {
+    iod_program = 'mopsiod'                 # usually this means OrbFit
+    diffcor_program = 'mopsdiffcor'         # default standard MOPS diffcor
+}
+
+
+# Select one of the following ingest setups.
+
+# PS1 Run4 ingest full FPAs
+ingest {
+    rootdir = /data/mops01.0/MOPS_STAGE/nomagic/IPP-MOPS
+    data_format = 'fpa_pairs'
+    date_format = 'TAI'                     # 'TAI' or 'UTC'
+    exposure_reference = 'midpoint'         # 'midpoint' or 'start'
+    ignore_ingested = 1
+    #fileset_filter = diff
+    #start_file_id = pub.176323.diff.87845
+    keep_detections = 1                     # set to preserve filtered dets
+
+    # white space seperated list that specifies the survey modes which cannot be ingested
+    forbidden_modes = 'ENGINEERING CAL Unkown M31 STS SS STS2A STS2B CNP PI STD Footprint SAS2 PR201108 DD'
+    
+    accept_singletons = 0                  # do not accept single MD warp-stack image3
+
+    astrometry {
+        # Parameters for importing IPP astrometry.  The reported astrometry is
+        # added in quadrature to some floor.  Plus we might want to have upper
+        # limits or even force all astrometry to some value.  Note that the
+        # reported Poisson uncertainty is added in quadrature to the floor
+        # to produce RA and DEC uncertainties.
+        floor_arcsec = 0.15
+        max_arcsec = 0.25
+    }
+
+    photometry {
+        min_mag = 0
+        max_mag = 40
+    }
+
+    # Data cleanup.
+    remove_bad_otas = 1
+    max_dets_per_ota = 1000
+    remove_dipoles = 1                      # remove dipoles or not
+    remove_nearbright = 0                   # remove dipoles or not
+    density_filter = 1                      # perform specific IPP FPA cleaning
+    #density_filter = 0                      # OFF 09 APR 2012
+    density_perdeg2 = 10000        # dets/deg2
+    dradius_radius_deg = .01       # local radius
+
+    skip_zero_fluxes = 1 
+}
+
+
+# The following sections correspond generally to individual MOPS
+# pipeline stages.
+
+synth {
+    add_astrometric_error = 1               # 1 => add astrometric error, 0 => no
+    add_shape_mag = 0                       # 1 => compute shape magnitudes for objects
+    no_trailing_info = 0                    # if set, don't product trailing info (elongated detections)
+#    concurrency = 8                         # if you want to change how many jobs SYNTH creates
+}
+
+detectability {
+    index_url = 'http://localhost/';        # where to read detectabilitiy responses
+}
+
+tracklet {
+    # Timeout in seconds for the execution of findTracklets
+#    timeout = 1800
+    timeout = 3600
+
+    do_fast_pairs = 1                       # enable fast pairs processing
+    do_high_gcr = 1
+    high_gcr_thresh_arcsec = 4.0
+    #high_gcr_thresh_arcsec = 2.5
+
+    minv_degperday = .005                   # findtracklets min degree/day when no trailing info present
+    maxv_degperday = 10.0                   # findtracklets max degree/day when no trailing info present
+    pair_maxv_degperday = 0.6               # findtracklets max degree/day when no trailing info present
+    deep_maxv_degperday = 4.0               # maxv for deep stacks
+    minobs = 75%                            # mininum number detections/tracklet; usually 2; 'auto' allowed for tuplewise stacks
+    chunk_minobs = 3
+    extended = 1                            # use elongated (trailed) detection information if available
+    maxt_days = 0.200                       # The maximum time range for a tracklet (in fractional days).
+    fit_threshold_arcsec = 4.0             # The maximum RMS deviation from linear that a detection may have (arcsec)
+#    fit_threshold_arcsec = 1.5             # The maximum RMS deviation from linear that a detection may have (arcsec)
+    #fit_threshold_arcsec = 0.5             # The maximum RMS deviation from linear that a detection may have (arcsec)
+    #high_gcr_minv_degperday = 1.0
+    high_gcr_minv_degperday = 1.5
+
+# Hax to handle rapid recovery sequence
+    #tti_min = 100.0                         # 30-minute nominal TTI
+    #tuplewise = 1                           # set to 1 for tuplewise processing
+    #tuplewise_min_fields = 4                # minimum number of fields in a tuplewise stack
+    #tuplewise_min_time_interval = 0         # minimum time interval (in minutes) between any two fields in a tuplewise stack
+    #mag_diff_control = 1.0                  # mag diff cannot exceed this
+# Restore above block after processing 55456
+#    max_tti_min = 3.0                       # 2-minute nominal TTI
+#    tuplewise = 1                           # set to 1 for tuplewise processing
+#    tuplewise_min_fields = 2                # minimum number of fields in a tuplewise stack
+#    tuplewise_min_time_interval = 0         # minimum time interval (in minutes) between any two fields in a tuplewise stack
+#    mag_diff_control = 1.0                  # mag diff cannot exceed this
+#    any_filter = 0
+    no_deep_stacks = 1
+    tuplewise = 1                           # set to 1 for tuplewise processing
+    tuplewise_min_fields = 2                # minimum number of fields in a tuplewise stack
+    tuplewise_max_fields = 4                # minimum number of fields in a tuplewise stack
+    tuplewise_min_tti_min = 5              # min consecutive time
+    #tuplewise_max_tti_min = 30              # max consecutive time
+    #tuplewise_max_time_min = 90             # 90-minute max tracklet length
+    # use these for wide pairs in time
+##    tuplewise_max_tti_min = 120             # separated pairs LD temp 2012-10-05
+#    tuplewise_max_tti_min = 200             # separated pairs
+#    tuplewise_max_tti_min = 45             # GP kills us, back to 120m
+
+#    tuplewise_max_tti_min = 120             # GP kills us, back to 120m
+#    tuplewise_max_time_min = 180            # 90-minute max tracklet length
+
+    tuplewise_max_tti_min = 180             # GP kills us, back to 120m
+    tuplewise_max_time_min = 240            # 90-minute max tracklet length
+    mag_diff_control = 2.0                  # mag diff cannot exceed this
+    max_deep_tuple = 8
+#    deep_method = findtracklets
+    deep_method = collapsetracklets
+    any_filter = 1
+    no_deep_stacks = 0
+
+    collapse_args = '0.002 0.002 5.0 0.05'  # some defaults for collapseTracklets
+    # skip_deep_stacks = 0                  # enable to skip deep stack processing (buggy)
+    
+    # Digest
+    minTrackletsForDigest = 100    # Minimum number of tracklets in a digest condor job
+
+    # KNOWN
+    attribute_known = 1                   # perform KNOWN attr after tracklets, hiding known tracklets
+}
+
+linkod {
+    iod_threshold_arcsec = 3600             # IOD residual acceptance threshold, arcseconds
+    diffcor_threshold_arcsec = 0.20         # differential correction residual threshold, arcseconds
+    fallback_iod = 0                        # if set, use low-resid IOD if diffcor failed
+
+# You can override the global iod/diffcor programs here.
+#    iod_program = your_iod_program
+#    diffcor_program = your_iod_program
+
+    max_link_days = 29                      # size of window for moving objects
+    min_nights = 3                          # minimum number of nights to attempt OD
+    slow_minv_degperday = 0.02              # minv for "slow movers"
+    #slow_maxv_degperday = 0.6               # maxv for "slow movers"
+    slow_maxv_degperday = 1.0               # maxv for "slow movers"
+    slow_link_opts = 'vtree_thresh 0.0010 pred_thresh 0.0010'
+
+    fast_minv_degperday = 25.0              # minv for "fast movers"
+    fast_maxv_degperday = 0.0              # maxv for "fast movers"
+    fast_link_opts = 'vtree_thresh 0.0025 pred_thresh 0.0025'
+
+    # Other linkTracklets options.
+    plate_width_days = 0.001                # default used to be 0.0001
+    end_t_range_days = 0.8                  # require last tracklet time be within this time-delta from NN end
+
+    allow_multiple_attributions = 1         # allow multiple tracklet attributions
+#    max_tracklets_per_track = 50            # set to small if SAS on, etc.
+
+    min_probability = 0.6                   # require tracklets to have this probability
+}
+
+moid {
+    moid_program = 'oorb --task=moid --conf=$MOPS_HOME/config/oorb.conf --orb-in=$INPUT --orb-out=$OUTPUT'
+}
+
+panda {
+    min_probability = 0.6               # require tracklets to have this probability
+    resid_threshold_arcsec = 0.20       # attributed orbits must have resid < this
+
+    max_search_radius_arcsec = 3600     # 1.0 degrees
+    iod_only_search_radius_arcsec = 600 # search radius when IOD only (no cov/uncertainty)
+    lsd_max_search_radius_arcsec = 600  # max search radius for LSD pandas
+    min_search_radius_arcsec = 15       # search radius floor; always use at least this big
+
+    max_arclength_for_iod = 45          # max arc length in days for IOD+DC instead of just DC
+    mag_delta = 1.0                     # mag 'slop' when computing whether to attempt to panda an obj, added to limiting mag
+    uncertainty_sigma = 3               # number of sigma to consider for ephemeris uncertainty
+    fallback_iod = 0                    # if > 0, use low-resid IOD if diffcor failed and IOD resid < fallback_iod
+
+# You can override the global iod/diffcor programs here.
+#    iod_program = your_iod_program
+#    diffcor_program = your_iod_program
+}
+
+orbit_stability {
+    min_arclength_days = 365                # minimum arc length (days) for orbit to be stable
+    max_uncertainty_arcsec = 10             # max ephem error (arcsec) for orbit stability test
+    min_time_range_days = 365               # minimum time range (days) for orbit stability test
+}
+
+orbitid {
+    resid_threshold_arcsec = 0.20;          # absolute RMS residual threshold for ID2 identifications
+    orbit_proximity_args = "q_thresh 0.10 e_thresh 0.050"
+}
+
+site {
+# Leave blank; force manual set
+    obscode = F51                           # PS1 Haleakala
+    site_longitude_deg = -156.252160        # longitude
+    site_latitude_deg = 20.72160            # latitude
+    gmt_offset_hours = -10                  # 10 hours behind GMT; used for local night aggregation
+
+    field_size_deg2 = 7.0
+    field_shape = circle
+    field_xyidx_size = 101                  # number of horizontal and vertical bins for per-field XY-indexing
+                                            # should be odd; total number of bins in field is square of this value
+
+    fwhm_arcseconds = 0.7                   # PSF FWHM; calc false/deg2 from this (see insertFalseDetections)
+    astrometric_error_arcseconds = 0.10     # arcseconds RMS
+    #limiting_s2n = 4.75                     # SSM high-confidence S/N
+    limiting_s2n = 4.50                     # SSM high-confidence S/N
+    #limiting_s2n = 3.01                     # SSM high-confidence S/N
+    low_confidence_s2n = 3.0                # PS1/MOPS low-confidence S/N
+    false_s2n = 5.0                         # used to generate LSDs: beware!
+
+# A/P
+    # Comprehensive A/P config to control synthetic detection generation in different filters.
+    # This is a PS1 configuration.
+    s2n_config = {
+        PS = 1          # special "PS" constant; 4 for PS4, 1 for PS1
+        g = {
+            M1 = 24.90
+            MU = 21.90
+            M1plusMU = 46.8
+            exposure_time_sec = 60
+            limiting_mag = 23.2
+        }
+        w = {
+            M1 = 24.90
+            MU = 21.90
+            M1plusMU = 46.8
+            exposure_time_sec = 60
+            limiting_mag = 23.2
+        }
+        r = {
+            M1 = 25.15
+            MU = 20.86
+            M1plusMU = 46.01
+            exposure_time_sec = 38
+            limiting_mag = 22.7
+        }
+        i = {
+            M1 = 25.00
+            MU = 20.15
+            M1plusMU = 45.15
+            exposure_time_sec = 30
+            limiting_mag = 22.6
+        }
+        z = {
+            M1 = 24.63
+            MU = 19.26
+            M1plusMU = 43.89
+            exposure_time_sec = 30
+            limiting_mag = 21.6
+        }
+        y = {
+            M1 = 23.02
+            MU = 17.98
+            M1plusMU = 41.00
+            exposure_time_sec = 30
+            limiting_mag = 20.1
+        }
+    }
+
+    # Fitzsimmons/Tonry PS1 filter conversions.
+    v2filt = {
+        g = -0.28
+        r = 0.23
+        i = 0.39
+        z = 0.37
+        y = 0.36
+        w = 0.16
+    }
+
+    limiting_mag = 22.7                     # only used by coarse ephemeris
+    limiting_mag_correction = 0.5           # used when checking to see if a predicted position is visible
+                                            # visible := mag < limiting_mag + limiting_mag_correction
+}
+
+
+alert {
+      username = mops              # login of the alert seuper-user
+      password = mops              # password of the alert seuper-user
+      server = mopshq2.ifa.hawaii.edu
+      min_arclength = 8            # min orbit arclength in days to be alert candidate
+      bandwidth = 0                # bytes/s bandwidth allocated to server communications
+}
+
+# Low-significance detection archive.
+lsd {
+    lsd_rootdir = /data/mops01.0/LSD        # where to find LSDs on cluster
+    num_slices = 3600                       # 3600 slices in RA (1/10 degree) indexing
+    hsd_s2n_cutoff = 5.0                    # HSD-LSD S/N boundary
+}
+
+
+# Torque vs Condor vs ...
+middleware {
+    flavor = 'condor'               # valid values are condor and  torque for now
+    scheduler = ''                  # name of the scheduler host. Leave blank for default host
+    group = ''                      # submission user group. Leave blank for default group
+    queue = ''                      # submission queue. Leave blank for default
+}
+
+# KNOWN_SERVER
+known {
+    host = 'known@mops12'
+    local_catalog_dir = /data/mops12.0/KNOWN/fitconvtars
+    local_export_dir = /data/mops12.0/KNOWN/export
+    remote_export_dir = /export/mops12.0/KNOWN/export
+#    host = denneau@piazzi.dm.unipi.it
+#    local_export_dir = .
+#    remote_export_dir = /home/denneau/KNOWN/export
+}
+
+# MPC Data Export
+mpc_export {
+    export_data_to_the_mpc_datastore = 0    # if set to 1, data is exported, 0 is not enabled (default)
+    email_notification_recipient = ''       # recipient of data export notifications, empty by default
+}
+
+# Debug options.
+debug {
+    force_empty_attribution_list = 0        # for testing provisional attributions; should be 0
+    disable_attributions = 0                # disable attributions when fields processed
+    disable_orbit_determination = 0         # disable orbit determination; otherwise just link
+    disable_id2 = 1                         # disable ID2 orbit identification
+    disable_precovery = 0                   # disable precovery jobs after linking night completed
+#    hide_syds = OCNUM                      # set to OCNUM in which to activate, zero otherwise
+}
+

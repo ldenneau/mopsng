@@ -1,0 +1,111 @@
+<script src="/js/jquery.js"></script>
+<script>
+	$(document).ready(function(){
+		$("img.stamp").toggle(function (){
+			var id = "#C" + $(this).attr('id');
+			$(this).fadeTo(0, .25);
+			$(id).attr('checked', true);
+			
+		}, function (){
+			var id = "#C" + $(this).attr('id');
+			$(this).fadeTo(0, 1);
+			$(id).removeAttr('checked');
+		});
+	});
+</script>
+	
+<!-- @stamps is an array of hashes. Each hash contains two keys, det which contains a detection in the 
+	derived object, and diff which contains the stamp. 
+-->
+% foreach my $foo (@stamps) {
+% 	my $det = $foo->{det};
+
+% 	if ($foo->{diff}) {
+		<img src="/model/<% $dbname %>/stamp.jpg?file=<% $foo->{diff} %>" width="<% $size %>" height="<% $size %>" class="stamp" id="<% $det->{detId} %>">
+        <input type="checkbox" name="detection" value="<% $det->{detId} %>" id="C<% $det->{detId} %>" style="display: none" autocomplete="off"> 
+% 	} elsif ($foo->{chip}) {
+		<img width="<% $size %>" height="<% $size %>" src="/model/<% $dbname %>/stamp.jpg?file=<% $foo->{chip} %>" class="stamp" id="<% $det->{detId} %>">
+        <input type="checkbox" name="detection" value="<% $det->{detId} %>" id="C<% $det->{detId} %>" style="display: none" autocomplete="off">
+% 	} else {
+		<b>N/A</b>
+% 	}
+% }
+
+<%args>
+$size => 75
+$dets
+</%args>
+
+<%perl>
+sub stamp_clicked {
+	my ($det_id, %bad_det) = @_;
+
+    # Does the bad detection hash already contain the detection id as a key?
+    # If it does then remove the detection from the hash and if it doesn't 
+    # then add it to the hash.
+    my $key;
+    foreach $key (keys(%bad_det)) {
+    	if ($key == $det_id) {
+        	delete $bad_det{$det_id};
+          	return;
+        }
+    }
+    $bad_det{$det_id} = 1;
+    
+    # Debugging.
+    foreach $key (keys(%bad_det)) {
+    	print "$key has been flagged as bad.";
+    }
+}
+</%perl>
+<%init>
+use Digest::MD5;
+use Data::Dumper;
+use PS::MOPS::Lib qw(mopslib_filt2V);
+
+my $inst = $m->notes('INST');
+my $mc = $inst->getConfig();
+my $v2filt = $mc->{site}->{v2filt};
+
+my $dbname = $inst->dbname;
+my @stamps;
+my $dfile;
+# Hash that contains detections that have been flagged as bad by the MOPS Czar. 
+# This hash will be passed as a parameter to the stampClicked component.
+my %bad_detections;
+
+foreach my $det (@{$dets}) {
+    my $det_id = $det->detId;
+    my $id = sprintf "%010d", $det_id;
+    my $nn = int($det->epoch) - 1;  # TJD to MOPS nn
+    my $dreldir = join('/', 'MD', split '', substr(uc(Digest::MD5::md5_hex($id)), 0, 5));
+    my $creldir = join('/', 'MC', split '', substr(uc(Digest::MD5::md5_hex($id)), 0, 5));
+
+    $dfile = $inst->getEnvironment('VARDIR') . "/stamps/$dreldir/MD-$id.fits";
+    if (!-f $dfile) {
+        my ($dir) = $det_id =~ /(\d)$/;
+#        $dfile = "/home/mops/MOPS_VAR/$dbname/nn/$nn/stamps/$dir/D$det_id.fits";
+        $dfile = "/data/mops13.0/stamp-store/stamps/special-stamps/$dbname-auto/$nn/$dir/D$det_id.fits";
+        if (!-f $dfile) {
+            $dfile = "/data/mops13.0/stamp-store/stamps/special-stamps/$dbname-auto/$nn/D$det_id.fits";
+        }
+    }
+    my $have_dfile = -f $dfile;
+
+    my $cfile = $inst->getEnvironment('VARDIR') . "/stamps/$nn/$det_id.fits";
+    if (!-f $cfile) {
+        $cfile = $inst->getEnvironment('VARDIR') . "/stamps/$creldir/MC-$id.fits";
+    }
+    my $have_cfile = -f $cfile;
+
+    if ($have_dfile) {
+        push @stamps, { diff => $dfile, det => $det };
+    }
+    elsif ($have_cfile) {
+        push @stamps, { chip => $cfile, det => $det };
+    }
+    else {
+        push @stamps, { none => undef, foo => $cfile, det => $det };
+    }
+}
+</%init>

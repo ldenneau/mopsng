@@ -1,0 +1,109 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+=head1 NAME
+
+printfields - Scan STDIN and print enumerated fields
+
+=head1 SYNOPSIS
+
+printfields FIELD1 [FIELD2] [RANGE] < INPUT
+
+  FIELD1,FIELD2 : numbered fields to print (1-based, negative OK)
+  RANGE : range specified, e.g. 1-4
+  --help : show this manpage
+
+=head1 DESCRIPTION
+
+Given whitespace-delimited lines of input, print the fields listed in
+the arguments.  The first field is indexed with "1".  Ranges are
+allowed, e.g. 1-5.
+
+If a non-numeric field is specified, the first line is assumed to be
+a header line containing column names, and the field specifier is
+then treated as a column name to print.
+
+=head1 EXAMPLES
+
+Input file positions.txt contains
+
+  #ID RA_DEG DEC_DEG MODE
+  FOO 10 20 179.OSS
+  BAR 12 22 179.OSS
+
+printfields 2 3 < positions.txt
+
+printfields 2-3 < positions.txt
+
+printfields 2-3,1 < positions.txt
+
+printfields MODE,RA_DEG,DEC_DEG < positions.txt
+
+=cut
+
+
+
+use FileHandle;
+
+my @FIELDS;
+my @FILES;
+
+my %dictfields;
+my @selfields;
+foreach (map { split ',', $_ } @ARGV) {
+    # Handle X-Y spec.
+
+    if (/^(\d+)-(\d+)$/) {
+        push @FIELDS, $1..$2;
+    }
+    # Handle single number.
+    elsif (/^-?\d+$/) {
+        push @FIELDS, $_;
+    }
+    elsif (/\w/) {
+        push @selfields, $_;
+    }
+#    # Assume file name.
+#    else {
+#        push @FILES, $_;
+#    }
+}
+
+push @FILES, '-' unless @FILES;       # default to STDIN
+@FIELDS = map { $_ > 0 ? $_ - 1 : $_ } @FIELDS;     # convert 1-base to 0-base
+
+
+my @F;
+my $n;
+my $f;
+
+for my $fname (@FILES) {
+    my $fh = new FileHandle $fname;
+    while (<$fh>) {
+        if (/^#/) {
+            s/^#//;
+            @F = split /\s+/;
+            $n = 0;
+            for $f (@F) {
+                $dictfields{$f} = $n++;
+            }
+
+            # Check that our selected fields exist.
+            for $f (@selfields) {
+                die "Field $f does not exist.\n" unless exists($dictfields{$f});
+            }
+            print join(' ', @FIELDS, @selfields), "\n" if @selfields;
+            next;
+        }
+        @F = split /\s+/;
+
+        if (@selfields || 1) {
+            print join(" ", @F[@FIELDS], @F[@dictfields{@selfields}]), "\n";
+        }
+        else {
+            print join(" ", @F[@FIELDS]), "\n";
+        }
+    }
+}

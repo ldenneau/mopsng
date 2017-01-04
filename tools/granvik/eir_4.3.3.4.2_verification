@@ -1,0 +1,60 @@
+#!/bin/bash
+ 
+# Verification test for EIR 4.3.3.4.2 (fields read access 2)
+# Mikael Granvik  07/24/2008
+
+USERNAME="granvik"
+STUB="eir_43342_verification"
+TMPDIR="/home/${USERNAME}/tmp"
+INSTANCE_NAME="psmops_granvik_cr_test_SIM"
+DAY=54505
+MYSQLHOST="mops00"
+MYSQLUSER="mops"
+MYSQLPASSWD="mops"
+
+echo "1..1"
+
+# Quick and dirty way of computing real readout speed and size of
+# resulting table:
+source $HOME/bin/mops_env $INSTANCE_NAME
+echo \
+"
+select
+  *
+from 
+  \`fields\`
+where
+  epoch_mjd >= $DAY
+  and epoch_mjd < $DAY+1
+order by
+  ra_deg, dec_deg
+" | \
+time -p mysql -N -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME \
+  > $TMPDIR/eir_4.3.3.4.2_verification.tmp \
+  2> $TMPDIR/eir_4.3.3.4.2_verification_timing.tmp
+tim=`cat $TMPDIR/eir_4.3.3.4.2_verification_timing.tmp`
+tim=${tim/user*/}
+if [[ $1 == "--result" ]]
+    then
+    echo $tim
+fi
+tim=${tim#real}
+echo $tim > $TMPDIR/eir_4.3.3.4.2_verification_timing.tmp
+tim=`cat $TMPDIR/eir_4.3.3.4.2_verification_timing.tmp`
+
+# Compute output time and convert to integer so that poor Bash
+# understands what we want:
+tim=`echo "$tim * 1000.0" | bc`
+tim=${tim/.*/}
+
+# Check whether the all/s criterion is met:
+if (( $tim < "1000" )) ; then
+    echo "ok 1 - ${STUB}"
+else
+    echo "not ok 1 - ${STUB}"
+fi
+
+rm -f $TMPDIR/eir_4.3.3.4.2_verification.tmp \
+  $TMPDIR/eir_4.3.3.4.2_verification_timing.tmp
+
+exit

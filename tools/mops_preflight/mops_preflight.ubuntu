@@ -1,0 +1,354 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+mops_preflight - test MOPS installation
+
+=head1 SYNOPSIS
+
+mops_preflight [options]
+
+  --instance=NAME : preflight MOPS + optional modules used by MOPS instance NAME
+  --testing : preflight MOPS testing environment
+  --help : show this manpage
+
+=head1 DESCRIPTION
+
+mops_preflight examines the runtime environment of a system for existence
+of modules and executables needed to run MOPS.
+
+=cut
+
+use strict;
+use warnings;
+
+use Pod::Usage;
+use Test::More;
+use Getopt::Long;
+
+my $instance;
+my $instance_name;
+my $testing;
+my $export;
+my $help;
+GetOptions(
+    testing => \$testing,
+    export => \$export,
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);                              # opts parse error
+pod2usage(-verbose => 3) if $help;
+
+
+
+use subs qw(
+    find_exe
+    test_import_python
+);
+
+
+our @MOPS_DIRECTORIES = qw(
+    bin
+    config
+    data
+    include
+    lib
+    lsd
+    schema
+    var
+);
+
+
+our @PERL_MODULES = qw(
+    File::Slurp
+    Params::Validate
+    Class::Accessor
+    Log::Log4perl
+    JSON
+    Proc::Daemon
+    Test::MockObject
+    Date::Manip
+    DBI
+    DBD::mysql
+    Astro::Time
+    Astro::SLA
+    Astro::FITS::CFITSIO
+);
+
+
+# PS::MOPS::DataStore::detectability
+# PS::MOPS::JPLEPH
+our @MOPS_PERL_MODULES = qw(
+    PS::MOPS::Constants
+    PS::MOPS::Lib
+    PS::MOPS::MITI
+    PS::MOPS::MPC
+    PS::MOPS::DX
+    PS::MOPS::Config
+
+    PS::MOPS::DC::Build
+    PS::MOPS::DC::Instance
+    PS::MOPS::DC::Runtime
+    PS::MOPS::DC::Iterator
+    PS::MOPS::DC::Config
+    PS::MOPS::DC::SSM
+    PS::MOPS::DC::Shape
+    PS::MOPS::DC::IngestItem
+    PS::MOPS::DC::Field
+    PS::MOPS::DC::Detection
+    PS::MOPS::DC::Tracklet
+    PS::MOPS::DC::Orbit
+    PS::MOPS::DC::DerivedObject
+    PS::MOPS::DC::EONQueue
+    PS::MOPS::DC::MOIDQueue
+    PS::MOPS::DC::Efficiency
+    PS::MOPS::DC::History
+    PS::MOPS::DC::History::Attribution
+    PS::MOPS::DC::History::Precovery
+    PS::MOPS::DC::History::Derivation
+    PS::MOPS::DC::History::Identification
+    PS::MOPS::DC::History::Removal
+    PS::MOPS::DC::History::Link2
+    PS::MOPS::DC::TemplateField
+    PS::MOPS::DC::TemplateInstance
+
+    PS::MOPS::FITS::IPP
+
+    PS::MOPS::LSD
+);
+
+
+#    MOPS.Alerts.AdminClient
+#    MOPS.Alerts.Client
+#    MOPS.Alerts.PubSub
+#    MOPS.Alerts.Publisher
+#    MOPS.Alerts.Support
+#    MOPS.AQueue
+#    MOPS.Attribution
+our @MOPS_PYTHON_MODULES = qw(
+    MOPS.Instance
+    MOPS.Condor.job
+    MOPS.Config
+    MOPS.Constants
+    MOPS.Constants
+    MOPS.DerivedObject
+    MOPS.Detection
+    MOPS.EONQueue
+    MOPS.Exceptions
+    MOPS.Field
+    MOPS.History
+    MOPS.IDManager
+    MOPS.Instance
+    MOPS.LSD.Search
+    MOPS.Lib
+    MOPS.MOIDQueue
+    MOPS.Orbit
+    MOPS.SSM
+    MOPS.Timer
+    MOPS.Tracklet
+    MOPS.TupleTree
+    MOPS.Utilities
+    MOPS.VOEvent.OutputUtils
+    MOPS.VOEvent.ParseUtils
+    MOPS.VOEvent.Templates
+    MOPS.VOEvent.VOEvent
+);
+
+
+our @EXTERNAL_EXES = qw(
+    condor_submit
+    condor_wait
+    oorb
+);
+
+
+# coarseEphem
+our @PIPELINE_EXES = qw(
+    mopper
+    ingest
+    synth
+    coarse coarse_worker 
+    syntheph syntheph_worker
+    tracklet tracklet_worker findTracklets
+    posttracklet
+    panda panda_worker
+    linkod linkod_worker linkTracklets id1 id1a insertNewDerivedObjects
+    eon
+    moid
+    KNOWN_LOCAL
+);
+
+
+our @SUPPORT_TOOLS = qw(
+    analyze_timing
+    buildInstance
+    cal2jd
+    catFields
+    catOrbits
+    condor_runner
+    dx
+    editConfig
+    effFindAvailableTracks
+    effFindLostTracks
+    effLinkTracklets
+    effReport
+    env
+    ephem
+    exportSim
+    extractSim
+    fitsdump
+    fmtorbit
+    insertNewDerivedObjects
+    insertSyntheticFields
+    insertSyntheticOrbits
+    jd2cal
+    killTracklets
+    listogram
+    lsd
+    lt2miti
+    mergeSkycells
+    milani_iod
+    miniPlot
+    miti2dx
+    miti2mpc
+    mitiPlot
+    mopper
+    mops_audit
+    mpcheck
+    mt
+    neodigest
+    digest2
+    nsplit
+    obsTool
+    orbplot
+    patchPostfitResiduals
+    propagateOrbits
+    rsyncnodes
+    sample
+    selectDetracklets
+    submit_stamps
+    sum2orb
+    surv2ds
+    testorb
+    timing
+    trackids2miti
+);
+
+our @ALL_EXES = (@EXTERNAL_EXES, @PIPELINE_EXES, @SUPPORT_TOOLS);
+
+
+# Options.
+
+# Testing system.
+our @TESTING_MODULES = qw(
+    PS::MOPS::Test::Instance
+);
+our @TESTING_EXES = qw(
+);
+
+# Export system.
+our @EXPORT_MODULES = qw(
+    PS::MOPS::ExportLib
+);
+our @EXPORT_EXES = qw(
+);
+
+# Set up our test plan.
+plan tests => (
+    1       # Perl version
+    + 1     # Python version
+    + 1     # $MOPS_HOME
+    + scalar @MOPS_DIRECTORIES
+    + scalar @PERL_MODULES
+    + scalar @MOPS_PERL_MODULES 
+    + scalar @MOPS_PYTHON_MODULES 
+    + scalar @ALL_EXES
+
+    + ($testing ? (
+        scalar @TESTING_MODULES
+        + scalar @TESTING_EXES
+    ) : 0)
+
+    + ($export ? (
+        scalar @EXPORT_MODULES
+        + scalar @EXPORT_EXES
+    ) : 0)
+);
+my $name;
+my $dir;
+
+# Prerequisites.
+ok($] >= 5.008, 'Perl Version >= 5.8');
+ok((`bash -c 'python --version 2>&1'`)[0] =~ /2.[567]/, 'Python Version >= 2.5');
+
+foreach $name (@PERL_MODULES) {
+    use_ok($name);
+}
+
+
+# MOPS Directory layout.
+ok(-x $ENV{MOPS_HOME}, '$MOPS_HOME' . " ($ENV{MOPS_HOME})");
+foreach $dir (@MOPS_DIRECTORIES) {
+    my $mops_dir = "$ENV{MOPS_HOME}/$dir";
+    ok(-d $mops_dir, "$mops_dir exists") or diag("directory $mops_dir does not exist");
+}
+
+
+# MOPS Perl modules.
+foreach $name (@MOPS_PERL_MODULES) {
+    use_ok($name);
+}
+
+
+# MOPS Python modules.
+foreach $name (@MOPS_PYTHON_MODULES) {
+    ok(test_import_python($name), "Python module $name");
+}
+
+
+# Executables.
+foreach my $exe (@ALL_EXES) {
+    ok(find_exe($exe), $exe);       # need to count these for Test::More
+}
+
+# DB connectivity.
+
+# MOPS options:
+#
+# Testing system
+if ($testing) {
+    foreach $name (@TESTING_MODULES) {
+        use_ok($name);
+    }
+}
+
+# Alerts
+# LSD
+# Export
+if ($export) {
+    foreach $name (@EXPORT_MODULES) {
+        use_ok($name);
+    }
+}
+
+# Datastore/IPP
+# Detectability
+# Web interface
+
+
+sub find_exe {
+    # Return whether the specified executable can be found in the search path.
+    my ($exe) = @_;
+    my @dirs = split ':', $ENV{PATH};
+    foreach my $dir (@dirs) {
+        return 1 if -x "$dir/$exe";
+    }
+    return 0;
+}
+
+
+sub test_import_python {
+    my ($module) = @_;
+    return system("python -c 'import $module'") == 0;
+}
+

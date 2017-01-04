@@ -1,0 +1,328 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+mpc_coverage - Submit sky coverage info to Minor Planet Center (MPC)
+
+=head1 SYNOPSIS
+
+mpc_coverage [OPTIONS]
+  
+=head1 DESCRIPTION
+
+The Minor Planet Center (MPC) makes available to the public sky coverage plots obtained
+by surveys searching for Near Earth Objects (NEO). The information used to generate these
+plots is submitted to the MPC by the various surveys.
+
+mpc_sky_coverage will submit to the MPC the sky plots observed by ATLAS on the
+night indicated.
+
+=head1 OPTIONS
+--nn NIGHT --instance DATABASE --to ADDR --cc ADDR
+
+  --nn=STRING 	
+		MOPS night number to submit coverage for. More than one night can be 
+		entered by surrounding the nights in quotes "" and seperating the nights
+		with a space character.
+		i.e. --nn "55406 55678 43212"
+                  
+		If the night number is not specified then the previous nights 
+		observations will be sent by default.
+                          
+  --instance=STRING	
+  		MOPS database to query.
+  		i.e. --instance psmops_atlas_dtph3
+  		
+  		If instance is not specified then the value stored in the 
+  		$MOPS_DBINSTANCE environment variable will be used.
+  
+  --to=STRING
+		Email address to send report to. 
+		i.e. --to dgreen@ifa.hawaii.edu
+		
+		If this option is not specified, then the email will be sent to 
+		skycov@cfa.harvard.edu at the Minor Planet Center.
+        
+                         
+  --cc=STRING
+		Email address to carbon copy to
+=cut
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Astro::Time;
+use Pod::Usage;
+use POSIX qw(floor);
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+
+use subs qw(
+    do_field
+    _fmt
+    _ffmt
+);
+
+# Variables to store program arguments.
+my $instance_name;
+my $nn;
+my $cc;
+my $to;
+my $maildebug;
+my $help;
+
+
+# HACKY THINGS that need to be fixed.
+my $BRIGHT_LIMITING_MAG = 18.3;
+my $DARK_LIMITING_MAG = 19.5;                   # wire from exp DB to MOPS
+my $ATLAS_MINEXP = 4;                           # get from config & processing
+
+# Define options used
+GetOptions(
+    'instance:s' => \$instance_name,
+    'nn:s' => \$nn,
+    'to:s' => \$to,
+    'cc:s' => \$cc,
+    'debug' => \$maildebug,
+     help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+#pod2usage(-msg => '--nn NIGHTNUM not specified') unless $nn;
+
+# Get a handle to the database containing observation data to be submitted.
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+$instance_name = $inst->dbname; # rewrite if obtained from default
+
+my $mops_config = $inst->getConfig();
+my $dbh = $inst->dbh();
+my $sql;
+my $href;
+
+# If night number is not specified then send the previous night's observations.  
+# The night number is calculated by converting the current date/time to a modified
+# julian date, taking the floor of the value, and subtracting 1. 
+unless ($nn) {
+	$nn = floor(Astro::Time::now2mjd()) -1;	
+}
+for my $night (split /\s+/, $nn) {
+	my @fields;
+	my $field_iter;
+	my $field;
+
+	# Query fields table for all records that have the specified night number and
+	# and store the returned field objects in the fields array
+	$field_iter = modcf_retrieve($inst, nn => $night);
+	while ($field = $field_iter->next()) {
+    	push @fields, $field;
+	}
+
+	# Short circuit for loop if there are no records for the specified night number.
+	if ($#fields < 0) {
+		print "Night #$night does not contain any reportable observations.\n";
+		next;
+	}
+
+	# Group the returned field objects by parent id.
+	my %tuples;
+	my $parent_id;
+	foreach $field (@fields) {
+    	$parent_id = $field->parentId || $field->fieldId; 
+    	push @{$tuples{$parent_id}}, $field;
+	}
+
+	# ATLAS field is 28 sq deg in a square field ~5.2 deg on a side.
+	# field of view with an area of 7 square degrees, however the MPC wants us to  
+	# report our field of view in rectangular coordinates. In order to do this   
+	# I have provided values for $size_ra and $size_dec that correspond to a square 
+	# with an area of ~2 square degrees.
+	my $size_ra = 5.2;
+	my $size_dec = 5.2;
+
+	# Convert MJD of observation to format required by MPC 
+	my ($day, $month, $year, $ut) = Astro::Time::mjd2cal($fields[0]{'epoch'});
+	$day = '0' . $day if $day < 10; 	  # Make sure that day is two characters
+	$month = '0' . $month if $month < 10; # Make sure that month is two characters
+	my $date_ut = $year . $month . $day;
+
+	# Get the MPC code.
+	my $observatory = $fields[0]{'obscode'};
+
+	# Determine the limiting magnitude.  This should be propagated into MOPS
+        # from ATLAS exposure DB, but for now we will hard-code.
+	my $lim_mag = 18.3;       # moon, bad DFM, eventually 20 at dark time
+
+	# Generate the body of the MPC submission.
+	my $mpc_body = "";
+	foreach $parent_id (keys %tuples) {
+		# Only include tuples where there are at least three observations
+		# for a specific ra, dec on the night. Less observations are not enough
+		# to reliably determine the orbits of NEOs
+		if ($#{$tuples{$parent_id}} + 1 >= $ATLAS_MINEXP){
+			my %mpc_record = ( ra => ${$tuples{$parent_id}}[0]{'ra'},
+						dec=> ${$tuples{$parent_id}}[0]{'dec'},
+						size_ra => $size_ra,
+						size_dec => $size_dec,
+					    mag=> get_magnitude($tuples{$parent_id}) 				
+			);
+			$mpc_body .= "$mpc_record{ra}, $mpc_record{dec}, $mpc_record{size_ra}, $mpc_record{size_dec}, $mpc_record{mag}\n";
+		}			  
+	}
+
+	# Check to see if the body contains any records. If it doesn't then 
+	# short circuit the for loop.
+	unless ($mpc_body) {
+		print "Night #$night does not contain any reportable quads\n";
+		next;
+	}
+	 
+	# Terminate body section with a blank line
+	$mpc_body .= "\n";
+
+	# Generate header section of MPC submission
+	my %template_fields = ( 
+			source => $observatory,
+			date => $date_ut,
+			ra => $size_ra,
+			declination => $size_dec,
+			magnitude => $lim_mag,
+			name => "${instance_name}_${nn}");
+	my $header = fill_template(<<EOH, \%template_fields);
+NEO SEARCH FIELD CENTERS
+SOURCE: %%source%%
+DATE: %%date%%
+FIELD SIZE RA: %%ra%%
+FIELD SIZE DEC: %%declination%%
+LIMITING MAGNITUDE: %%magnitude%%
+FILENAME: %%name%%
+EOH
+
+	# Submit report to MPC. The format of the report submited is described
+	# at http://www.minorplanetcenter.org/iau/info/Coverage.html
+	my $message = $header . $mpc_body;
+	my $subject = "T05 Sky Coverage";
+	$to = 'skycov@cfa.harvard.edu atlas-ops@ifa.hawaii.edu' unless $to; #Default addres to MPC unless specified on command line
+#	$to = 'denneau@hawaii.edu' unless $to; #Default addres to MPC unless specified on command line
+	send_mail($to, $subject, $message, $cc);
+
+	# Indicate that report was sent.
+	print "MPC report sent for night number $night on $instance_name database.\n";
+}
+
+#-------------------------------------------------------------------------------
+# SUBROUTINE DEFINITIONS
+#-------------------------------------------------------------------------------
+
+#------------------------------------------------------------------------------- 
+# Name: 		fill_template
+# Parameters:	$text		-	String containing template to be 
+#								processed.
+#
+#				%variables	-	Hash containing values to be placed in the 
+#								template.
+#
+# Returns:		$text		- 	filled in template.
+#
+# Description:	This function reads in a parameterized template from an external
+#				file and fills in the template using the values stored in the 
+#				variables hash. Parameters in the template are enclosed in 
+#               double percent signs %%. i.e. %%date%%
+#				This function was stolen from the second edition of the Perl
+#				Cookbook.  
+#-------------------------------------------------------------------------------
+sub fill_template {
+    my ($text, $fillings) = @_; # Retrieve parameters.
+                      
+    # replace quoted words with value in %$fillings hash
+    $text =~ s{ %% ( .*? ) %% }
+              { exists( $fillings->{$1} )
+                      ? $fillings->{$1}
+                      : ""
+              }gsex;
+    return $text;
+}
+
+#------------------------------------------------------------------------------- 
+# Name: 		get_magnitude
+# Parameters:	@quad		-	Array containing the oberservations in a quad.
+#
+# Returns:		$magnitude	- 	Limiting magnitude for quad.
+#
+# Description:	This function determines the limiting magnitude for the set of
+#               observations that make up a quad.
+#-------------------------------------------------------------------------------
+sub get_magnitude {
+    my ($quad_ref) = @_; # Retrieve parameters.
+    my $mag = -1000;
+    my $field;
+;
+    # Examine reported magnitude for each quad if present and return the largest
+    # magnitude.
+    foreach $field(@$quad_ref) {
+		$mag = $field->limitingMag if($field->limitingMag && ($mag < $field->limitingMag));
+    }
+
+    # Fudge this by 0.5, quads vs. single-exposure.
+    return $mag - 0.5 if($mag != -1000);
+     
+    # If $mag is undefined then none of the observations specified a
+    # limiting magnitude. Check to see if the y filter was used and if it 
+    # was return a limiting magnitude of 19.5
+	foreach $field (@$quad_ref) {
+		# Set magnitude to 19.5 if the y filter was used.
+		return 19.5 if(lc($field->filter) eq 'y');
+    }
+    
+    # The y filter was not used so return a limiting magnitude of 22.
+#    return 22;
+    return $BRIGHT_LIMITING_MAG;
+#    return $DARK_LIMITING_MAG;
+}
+
+# ------------------------------------------------------------------------------
+# Name: 		send_mail
+# Parameters:	$to		-	Address(es) to send email to. Multiple addesses are
+#							separated by white space. 
+#
+#				$subject-	Subject of email
+#
+#				$body	-	Body of email message.
+#
+#				$cc		- 	Addess(es) to carbon copy.
+#
+# Returns:		nil		
+#
+# Description:	This function sends an email containing the body provided to 
+#				the addresses indicated using the default mailer. 
+#-------------------------------------------------------------------------------	
+sub send_mail {
+	use Net::SMTP;
+
+	# get supplied parameters
+	my ($to, $subject, $body, $cc) = @_; 
+  	# specify from address
+  	my $from = "from: \"ATLAS-MOPS\" <denneau\@hawaii.edu>\n";
+  	# specify smtp server to use and open connection to it.
+  	my $smtp_server = "hale.ifa.hawaii.edu";
+  	my $smtp = Net::SMTP->new($smtp_server,
+  					Timeout => 60,
+  					Debug   => $maildebug);
+	# tell smtp server where to send mail  					
+  	$smtp->mail($from);
+  	$smtp->to((split /\s+/, $to), { SkipBad => 1}); # handle multiple addresses
+  	$smtp->cc((split /\s+/, $cc), { SkipBad => 1}) if $cc;
+  	$to = "to: $to\n";
+  	$cc = "cc: $cc\n" if $cc;
+
+  	$subject = "subject: $subject\n";	    
+	$smtp->data;
+	$smtp->datasend($to);
+	$smtp->datasend($cc) if $cc;
+	$smtp->datasend($subject);
+  	$smtp->datasend($body);
+  	$smtp->dataend;
+  	$smtp->quit          # complete the message and send it
+      or die "couldn't submit report to MPC: $!\n";
+}

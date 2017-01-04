@@ -1,0 +1,204 @@
+#!/usr/bin/env python
+"""
+Parse output from new output of OpSim (5_72, etc) simulations and insert the appropriate
+entries in the fields table of a user specified database.
+
+The input data is a flat ascii file of the format
+* The first line is a header.
+* Each other line is in TAB separated columns.
+
+The columns are
+00 obsHistID      ignored
+01 sessionID      ignored
+02 propID         ignored
+03 fieldID        ignored
+04 filter         char(1), used a filter_id
+05 seqnNum        ignored
+06 subseq         ignored
+07 pairNum        ignored
+08 expDate        ignored
+09 expMJD         MJD of the start of exposure (10)
+10 expTime        exposure time in seconds (11)
+11 slewTime       ignored
+12 slewDist       ignored
+13 rotSkyPos      ignored
+14 rotTelPos      ignored
+15 fldVisits      ignored
+16 fldInt         ignored
+17 fldFltrInt     ignored
+18 propRank       ignored
+19 finRank        ignored
+20 maxSeeing      ignored
+21 rawSeeing      ignored
+22 seeing         ignored
+23 xparency       ignored
+24 cldSeeing      ignored
+25 airmass        ignored
+26 VskyBright     ignored
+27 filtSky        ignored
+28 fieldRA        RA of FoV center (radians)  (29)
+29 fieldDec       Dec of FoV center (radians)  (30)
+30 lst            ignored
+31 altitude       ignored
+32 azimuth        ignored
+33 dist2Moon      ignored
+34 moonRA         ignored
+35 moonDec        ignored
+36 moonAlt        ignored
+37 moonPhase      ignored
+38 sunAlt         ignored
+39 sunAz          ignored
+40 phaseAngle     ignored
+41 rScatter       ignored
+42 mieScatter     ignored
+43 moonIllum      ignored
+44 moonBright     ignored
+45 darkBright     ignored
+46 5sigma         ignored
+47 perry_skybrightness ignored
+48 5sigma_ps           ignored
+
+One complication is that if a given field was deemed useful to N propIDs, then
+it wil be listed in teh input file N times, one per propID. In these cases, only
+the first entry will be used. All subsequent ones will be ignored.
+"""
+import MOPS.Field
+import MOPS.Instance
+from MOPS.Constants import DEG_PER_RAD as RAD2DEG
+
+# Constants
+MJD_OFFSET = 4383                       # Offset to bring the dates to 2006
+
+
+
+
+def insertFields(instance, fileNames):
+    """
+    Given a MOPS instance and a list of file names, parse each file for field
+    specifications and insert each of them into the MOPS instance.
+
+    Each file is assumed to be in cronos.92 format (described above).
+    """
+    exposures = {}                      # [mjd: [ra, dec, mjd, expTime, filter]}
+
+    # Fetch the OBSCODE from the config file.
+    obscode = str(instance.config['site']['obscode'])
+
+    # Fetch the limiting mag from the config file
+    limitingMag = float(instance.config['site']['limiting_mag'])
+    # Lynne - update this to fetch limiting mag from exposure
+    
+    
+    for fileName in fileNames:
+        exposures.update(_parseFile(fileName, obscode, limitingMag))
+    # <-- end for
+
+    return(_insertFields(instance, exposures))
+
+
+def _parseFile(fileName, obscode, limitingMag):
+    """
+    Extract fieldRA, fieldDec, expDate, expTime, filter from fileName (in
+    cronos.92 format) and return a dictory of the type
+        {'mjd': [ra, dec, mjd, expTime, filter]}
+    The idea behind the use of a dictionary is to ignore extra entries for the
+    same exposure (based on the fact that this telescope cannot observer >1
+    fields at the time).
+    """
+    res = {}   # {'mjd': [ra, dec, mjd, expTime, filter]}
+    f = file(fileName)
+    line = f.readline()                 # SKIP the header.
+    line = f.readline().strip()
+    counter = 0
+    while(line):
+        (obsHistID, sessionID, propID, fieldID, filter, seqnNum, subseq, 
+         pairNum, expDate, expMJD, expTime, slewTime, slewDist, rotSkyPos, 
+         rotTelPos, fldVisits, fldInt, fldFltrInt, propRank, finRank, 
+         maxSeeing, rawSeeing, seeing, xparency, cldSeeing, airmass, 
+         VskyBright, filtSky, fieldRA, fieldDec, lst, altitude, azimuth, 
+         dist2Moon, moonRA, moonDec, moonAlt, moonPhase, sunAlt, sunAz, 
+         phaseAngle, rScatter, mieScatter, moonIllum, moonBright, darkBright, 
+         five_sigma, perry_skybrightness, five_sigma_ps) = line.split()
+        if(not res.has_key(expMJD)):
+            res[expMJD] = [float(expMJD) + MJD_OFFSET,  # MJD
+                           float(fieldRA) * RAD2DEG,    # RA
+                           float(fieldDec) * RAD2DEG,   # Dec
+                           int(expTime),                # ExpTime
+                           filter,                      # filter
+                           obscode,
+                           limitingMag]
+        # <-- end if
+        counter = counter+1
+        # Read the next line.
+        line = f.readline().strip()
+    # <-- end while
+    print "Read %f lines" % (counter)
+    return(res)
+
+
+def _insertFields(instance, exposures):
+    """
+    Given a list of exposures, add the corresponding entries in the fields
+    table. Exposures is a dictionary of the form
+        {'mjd': [ra, dec, mjd, expTime, filter]}
+    """
+    cursor = instance.get_dbh().cursor()
+    
+    # Turn autocommit off.
+    # instance.get_dbh().disableAutocommit()
+
+    # create the Field instances.
+    fields = [MOPS.Field.Field.new(*e) for e in exposures.values()]
+
+    # Inser the fields.
+    err = map(lambda f: f.insert(instance.get_dbh()), fields)
+
+    # Commit the transaction.
+    instance.get_dbh().commit()
+    return
+
+
+
+
+if(__name__ == '__main__'):
+    import glob
+    import optparse
+    import os
+
+
+    # Constants
+    USAGE = """\
+Usage: insertLSSTFields.py --rootdir=<survey files root directory> \
+[--instance_name=<name of the MOPS DB instance>]"""
+
+
+    # Parse command line input.
+    parser = optparse.OptionParser(USAGE)
+    parser.add_option('--rootdir',
+                      dest='root_dir',
+                      type='string',
+                      help="look for data files in this directory.")
+    parser.add_option('--instance_name',
+                      dest='instance_name',
+                      type='string',
+                      help="name of the MOPS DB instance.")
+    (options, args) = parser.parse_args()
+
+    # Make sure that we have a root_dir value.
+    if(not options.root_dir or not os.path.exists(options.root_dir)):
+        parser.error('Missing root_dir!')
+    # <-- end if
+
+    # Get a hold of the current MOPS instance.
+    # try:
+    instance = MOPS.Instance.Instance(dbname=options.instance_name or
+                                          os.environ['MOPS_DBINSTANCE'])
+    # except:
+    if(not instance):
+        parser.error('Cannot determine instance name.')
+    # <-- end try
+    
+    # Get all the files inside root_dir and pass them to the main routine.
+    insertFields(instance=instance,
+                 fileNames=glob.glob(os.path.join(options.root_dir, '*')))
+# <-- end if

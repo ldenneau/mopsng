@@ -1,0 +1,124 @@
+#!/usr/bin/env perl
+
+=pod
+
+=head1 NAME
+
+makeTracklet - manufacture a tracklet by hand given some detection IDs
+
+=head1 SYNOPSIS
+
+makeTracklet DET_ID1 DET_ID2 ...
+
+  DET_IDn : detection IDs (without leading "D")
+  --help : show man page
+
+=head1 DESCRIPTION
+
+Constructs a MOPS tracklet object given the detection IDs.
+
+=cut
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+use File::Slurp;
+use FileHandle;
+use Params::Validate;
+
+use Astro::SLA;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::SSM;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::GCR;
+
+
+our $nosubmit = 0;
+
+
+# Globals.
+my $debug;
+my $t0 = time;                          # for timing
+
+my $inst;
+my $instance_name;
+my $nn;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+my $dbh = $inst->dbh;
+my $sth = $dbh->prepare(<<"SQL") or die $dbh->errstr;
+select det_id from detections where object_name=?
+SQL
+
+while (my @det_ids = get_detids()) {
+    # Workaround for two-detection tracklets.
+    my @dets = map { modcd_retrieve($inst, detId => $_) } @det_ids;
+    my $gcr_arcsec = @dets == 2 ? 0 : PS::MOPS::GCR::compute_gcr(\@dets);
+
+    my $tracklet = PS::MOPS::DC::Tracklet->new(
+        $inst,
+        detections => \@dets,
+        classification => 'N',
+        gcr_arcsec => $gcr_arcsec,
+        digest => 0,
+    ) or $mops_logger->logdie("can't create tracklet using detections " . join(' ', @det_ids));
+
+    $tracklet->insert() or $mops_logger->logdie("can't insert tracklet");
+    printf STDERR "Created tracklet ID %s, v_tot=%.2f deg/day, digest=%.1f\n", $tracklet->trackletId, $tracklet->vTot, $tracklet->digest;
+}
+exit;
+
+
+sub get_detids {
+    my $line = <STDIN>;
+    chomp $line;
+    my @o = split '=', $line;
+    my @det_ids;
+    for my $detid (@o) {
+        $sth->execute($detid) or die $sth->errstr;
+        push @det_ids, $sth->fetchrow_array;
+    }
+    return @det_ids;
+}
+
+
+sub get_digest {
+    # Invoke the neodigest script and scrape out the digest.
+    my ($tid) = @_;
+    my $digest = 0;
+    my $cmd = join(' ', 'neodigest', $inst->dbname, 'T' . $tid);
+    my @foo = `$cmd`;
+    if (@foo) {
+        chomp @foo;
+        foreach my $line (@foo) {
+            if ($line =~ /^T$tid/) {
+                $digest = (split /\s+/, $line)[-1];
+                last;
+            }
+        }
+        if (!defined($digest)) {
+            print STDERR "Didn't see NEO output from neodigest.\n";
+            $digest = 0;
+        }
+    }
+    else {
+        print STDERR "Got empty output from neodigest.\n";
+    }
+    return $digest;
+}

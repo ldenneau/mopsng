@@ -1,0 +1,540 @@
+========================================================
+   A PROPOSED DATA EXCHANGE STANDARD FOR PAN-STARRS
+   $Id: DATA_EXCHANGE_STANDARD.txt 1328 2006-09-14 19:39:59Z denneau $
+========================================================
+
+Compiled by: Andrea Milani, Honolulu 25 July 2006, version 5
+
+Discussed with: L. Denneau, F. Pierfederici, R. Jedicke
+========================================================
+
+Purpose: define a standard for data exchange between Pan-STARRS and the
+outside world in the form of flat files. Examples: exchange with MPC, LSST,
+NEODyS and JPL; distribution of catalogs to astronomers; input into
+planetarium programs; requests for follow up.
+
+This low level format will be later incorporated in a structured format,
+presumably a XML format: there will be a parser combining these flat files
+into an XML structure and one unpacking the XML into files with appropriate
+names. In this way an announcement/job request can be sent either as a tarball
+with many files or as a single XML file (possibly compressed).
+
+========================================================
+1. LIST OF DATA TYPES
+========================================================
+
+The basic data types are only 10:
+
+1) DETECTION
+2) ORBIT
+3) COVARIANCE
+4) RESIDUAL
+5) METRICS
+6) IDENT_HEADER 
+7) POINTER_TRACKLET
+8) POINTER_IDENTIFICATION
+9) EPHEMERIS
+10) FRAME
+
+The first 9 are defined here, and a data exchange standard format is
+described.
+
+The composite data types are at the moment 
+
+1) TRACKLET
+2) IDENTIFICATION
+3) REQUEST_OBS
+4) SCHEDULE
+
+but this list could easily grow.  Composite data types are obtained by
+combining the basic ones, with some syntactical rules. The data products (of
+MOPS) are generated as data types, with some syntactical rules.
+
+General rules: each file can contain multiple objects of the same type,
+preceded by lines of column headings (for single line formats) or anyway
+explaining the content (for multiline formats).  In each line the only
+separator used is a string of blanks (no tabs). The optional arguments can be
+replaced by blanks. A comment line, preceded by !, can be safely skipped in
+reading. The headings lines are preceded by !!, thus they can be skipped but
+can also be used as check.
+
+Composite data types are obtained with multiple files, sharing the same 
+[jobname] with different suffixes, [jobname].suffix. To simplify transmission
+and checking, composite data types have also a file [jobname].file_list
+containing a list of the files [jobname].xxx enclosed. A tarball could contain
+multiple and different composite data types, distinguished by the jobname (an
+arbitrary string of letters and numbers, possibly also including the = sign). 
+
+The purpose of such a simple format is to read/write from FORTRAN/C, but also
+to use with operating system grep, sort, sed, etc. Interface routines to
+handle I/O of these data from programs in Fortran 77/95 and from C will be
+provided as free software (e.g., the Fortran will be distributed with OrbFit;
+the C by MOPS).
+
+========================================================
+2 BASIC DATA TYPES
+========================================================
+
+
+2.1 Detections
+==============
+
+DETECTION={OID, TIME, OBS_TYPE, RA, DEC, APPMAG, FILTER, OBSERVATORY, RMS_RA,
+           RMS_DEC, RMS_MAG, S2N, [Secret_name]}
+ 
+where the OID (unique identifier) has a different interpretation depending
+upon the case: for raw detections and orphans, the OID is a DETECTION_OID and
+must be unique for each line; for tracklets it is the TRACKLET_OID and is
+repeated on each line.
+
+OBS_TY=O for an optical observation. Problem: a format for radar data is
+necessary, to be able to fit the PS data together with JPL radar astrometry.
+
+TIME of the observations is MJD UTC in days.
+
+RA, DEC are right ascension and declination in deg, RMS_RA, RMS_DEC in arcsec
+are the accuracies estimated by the observer for RA*COS(DEC) and for DEC,
+respectively (two equal values mean a circle on the tangent plane to the
+celestial sphere).
+
+APPMAG is the apparent magnitude, FILTER specifies the band (R, V, AB, etc.).
+
+RMS_MAG (in magnitudes) is the formal uncertainty, it must never be used for
+weighting due to lightcurve. S2N is the signal to noise ratio of the
+individual detection.
+
+OBSERVATORY is the 3 characters observatory identifier. 
+
+Secret_name (for simulation purposes only) is the name of the object in the
+Solar System Model used to generate the detection; the code NULL is used for a
+false detection; left blank for real data.
+
+This is a one-line format, optional element given last, similar to the one
+already in use for simulations. The file name is [jobname].detection or
+[jobname].orphan for individual detections.
+
+Problem; correlation between RA and DEC may result from the astrometric
+solution.  This problem should be severe only for strongly trailed images.
+
+2.2 Orbits 
+==========
+
+ORBIT= {q, e, I, Omega, argperi, t_p, H, G, t_0, ID_OID, [INDEX, N_PAR, MOID]}
+
+The first six numbers are "cometary" elements, where the perihelion q is in
+AU, the eccentricity e is a pure number, I (inclination), Omega (longitude of
+node) and arcperi (argoment of pericenter) are in deg, t_p (perihelion time)
+is MJD TDT.
+
+The epoch time t_0 is in MJD TDT.  
+
+H is the absolute magnitude, to be computed in the V scale, in magnitudes; G
+is the opposition effect coefficient (defaults to 0.15).
+
+ID_OID is the identification code (see below under IDENTIFICATION). INDEX is
+an optional integer indicating the order in the list of orbits for the same
+identification, defaults to 1.
+
+N_PAR is the number of parameters fitted, can be 4,5 for constrained
+solutions, 6 for nominal orbit, 0 for preliminary orbit; defaults to 6.
+
+MOID, in AU, is optional (to select PHAs). 
+
+One line format, optionals last, file name [jobname].orbit.
+
+2.3 Covariance
+==============
+
+COVARIANCE={ID_OID, INDEX, COVAR_MATR, NORMAL_MATR, [RMS], [EIG], [WEAK]}
+
+where ID_ OID, INDEX must be the ones of the corresponding orbit.
+
+COVAR_MATR and NORMAL_MATR are 6x6 matrices given in lower triangular
+form (only elements c(i,k) with i.ge.k are written with index i increasing
+first).
+
+RMS, EIG, WEAK are optional 6-vectors helping in assessing the quality of the
+orbit (Standard deviations for each element, Eigenvalues of the covariance
+matrix, Eigenvector corresponding to the largest eigenvalue.)
+
+This is necessarily a multiline format, using keywords, e.g., as in the OrbFit
+ML format the keywords are COV, NOR, !RMS, !EIG, !WEA (optionals with comment
+character). File name [jobname].covariance.
+
+2.4 Residuals
+=============
+
+RESIDUAL={OID, TIME, IDSTA, WEIGHT_RA, WEIGHT_DEC, WEIGHT_APMAG, RES_RA,
+          RES_DEC, RES_MAG, CHI, SEL_AST, SEL_MAG, [CORR_MOD]}
+
+where OID, TIME, IDSTA coincide with those of the corresponding DETECTION
+(WARNING: when two tracklets share one detection, the duplicate is removed 
+in the residuals, thus some TRACKLET_OID may appear only once!). 
+
+WEIGHT_RA, WEIGHT_DEC (in arcsec), WEIGHT_APMAG (in magnitudes) are the RMS
+used for weighing (not necessarily the same as the RMS_RA etc. of the
+tracklet: based upon post-fit RMS, not a priori accuracy). WEIGHT_RA refers to
+the residual in RA*COS(DEC).
+
+RES_RA is the residual in RA multiplied by COS(DEC), in arcsec. 
+RES_DEC is the residual in DEC, arcsec. RES_MAG is the residual in appmag,
+in magnitudes.
+
+CHI is the parameters used in the statistical test to decide if the two
+residuals have been used or rejected in the orbit fit (SEL_AST>0 if
+used). SEl_MAG>0 if APPMAG has been included in the absolute magnitude fit.
+
+CORR_MOD is string with the file name for a station-dependent model of the
+time correlation of the residuals, see Carpino et al. (2003).
+
+One line format, file name [jobname].residual.
+
+Problem: in OrbFit internally  RES_RA in output is multiplied by
+COS(DEC), WEIGHT_RA is not. To be solved at the interface level.
+
+Problem: correlation between RA and DEC, if present in the astrometric
+solution, should be used; this is possible only if this information is
+contained in the detection format.
+
+2.5 Metrics
+===========
+
+METRICS={RMS, RMSH, N_REJECTIONS, [SPAN1, SPAN2, .....]}
+
+where RMS is the weighted RMS of the astrometric residuals, RMSH is the
+weighted RMS of the photometric residuals, N_REJECTIONS is the number of
+outlier rejections (which do not contribute to the RMS of the fit), and the
+other optional metrics are, e.g., the span of the residuals as measured by a
+linear regression on the data of the last tracklet added.
+
+One line format, file name [jobname].metrics. 
+
+Problem: this type of data is subject to change with experience, thus the
+column headings are especially important.
+
+2.6 Identification headers
+==========================
+
+IDENT_HEADER={ID_OID, NID, TRACKLET_OIDs, OP_CODE, COUNTERS, [PARAMETERS]}
+
+ID_OID is a unique identifier for the identification, that is for a set of
+tracklets (supposedly belonging to a single physical object); it may be
+composed encoding NID and TR_OIDs, e.g., A=B=C[=...], or otherwise.  NID is
+the number of tracklets identified.
+
+OP_CODE is a character code for a claim/request such as: DISCOVERY,
+COMPLETION, KNOWN_OBJ, WRONG_ID, POSSIBLEID, FOLLOW_UP, REQUEST_OBSERVATION,
+REQUEST_PRELIM, REQUEST_ORBIT, REQUEST_PRECOVERY (these opcodes are explained
+below, others may be invented later).
+
+COUNTERS={N_OBS, N_SOLUTIONS,  N_NIGHTS,  ARC_TYPE}
+
+are integers giving the no. of observations available (including the rejected
+ones), the number of alternate solutions for which the
+orbits/covariance/metrics are given, the number of separate nights of
+observations, the arc type (Milani et al. 2006).
+
+PARAMETERS is a set of 4 real parameters, used with the REQ_ORPHAN
+OP_CODE (see 5.2).
+ 
+One line format, file name [jobname].ident_header when belongs to an
+IDENTIFICATION; other names can be used when used in different context, e.g.,
+[jobname].request when it belongs to a REQUEST.
+
+2.7 Pointers from detections to tracklets
+=========================================
+
+The output of the FindTracklet type algorithms is a list of pointers
+
+POINTER_TRACKLET={(DETECTION_OID -> TRACLET_OID)s}
+
+One line format, two columns, file name [jobname].pointer_tracklet.
+
+This format is normally used to export simulations in a form
+
+SIMULATION={DETECTIONs, POINTER_TRACKLETs}
+
+which is the easy to convert to a TRACKLETs file and an ORPHANs file, with the
+optional generation of an OVERLAPPING_TRACKLETS file (for tracklet management).
+
+With real data, the bulk of the data will not be exported in this way, but
+some subsets may be exported, e.g., for OrbFit runs operating on the
+UNIDENTIFIED detections to squeeze out the last identifications.
+
+2.8 Pointers from tracklets to identifications
+==============================================
+
+The output of an identification algorithm is generally represented by the
+IDENT_HEADER data type, that is a one-to-many relation between the
+identification and the tracklets. The type is
+
+POINTER_IDENTIFICATION={(TRACKLET_OID -> ID_OID)s}
+
+to represent the inverse map (which should be many-to-one, with exceptions for
+the POSSIBLID opcode, in which case tracklets can be shared).  
+
+At the moment we have no example of usage, but it is a convenient way to store
+the results of proposed linkages before an orbit is computed, thus before a
+formal IDENTIFICATION can be produced.
+
+One line format, two columns, file name [jobname].pointer_identification.
+
+2.9 Ephemerides
+===============
+
+A prediction for the observable position of an object for which orbit(s) are
+available, with indications of the expected uncertainties.
+
+EPHEMERIS={ID_OID, TIME, ATTRIBUTABLE, APPMAG, RMSVAL, CORREL, RMSMAG)
+
+TIME of the observations is MJD UTC in days.
+
+ATTRIBUTABLE={RA, DEC, RADOT, DECDOT} 
+
+with RA, DEC the position in deg, RADOT, DECDOT the angular velocities in
+deg/day.
+
+APPMAG is the apparent magnitude (in V), RMSMAG the formal standard deviation
+(WARNING: the observer needs to leave margins for lightcurve).
+
+RMSVAL ia 4-vector of standard deviations for the 4 components of the
+attributable.
+
+CORREL is the correlation matrix, a lower triangular 4x4 matrix, 6 numbers
+between -1 and +1, row index growing first.  
+
+One line format, file name [jobname].ephemeris
+
+2.10 FRAME
+==========
+
+Metadata associated to one image, format to be defined, should include time,
+center, image corners, filter, limiting magnitude, exposure duration,
+seeing and other meteo data, estimate of the fill factor, etc. Not
+specifically for MOPS, to be defined by the PS project.
+ 
+3. COMPOSITE DATA TYPES
+=======================
+
+Composite data types are obtained by combining some of the basic ones. The
+plural indicates there is a list of this type.
+
+3.1 Tracklets
+=============
+
+TRACKLET={DETECTIONs}
+
+no header needed, by convention if the OID is the same in multiple lines it is
+the TRACKLET_OID, the tracklet unique name. For TRACKLET_OID it is recommended
+to use no more than 9 characters alphanumeric. The tracklet ends when the OID
+changes. File name should be [jobname].tracklet.
+
+
+3.2 Identifications
+===================
+
+Note this is called a "derived object" in Panstarrese.
+
+IDENTIFICATION={IDENT_HEADER, ORBITs, COVARIANCEs, METRICs,
+                RESIDUALs, TRACKLETs}
+
+The OP_CODE should be one of the following: DISCOVERY,
+COMPLETION, KNOWN_OBJ, POSSIBLEID; when the OP_CODE is WRONG_ID
+the IDENT_HEADER is sent alone (the data are replaced by those of the
+new identifications which have contradicted the removed one).
+
+File name should be [jobname].identification
+
+3.3 Request for observations
+============================
+
+IT contains the basic data to uniquely select an object, and the predictions
+for a time series of potential observing times.
+
+REQUEST_OBS={IDENT_HEAD, EPHEMERs}
+
+with the OP_CODE REQUEST_OBSERVATION.  File name should be
+[jobname].request_obs
+
+3.4 Schedule of observations performed
+======================================
+
+To make known the fields imaged in the previous nights, a schedule can be
+exported. In principle, a schedule can be planned for the future, although
+this is unlikley to be exported. 
+
+SCHEDULE={FRAMEs}
+
+4. DATA PRODUCTS
+================
+
+The Pan-STARRS MOPS export data products shall be of the following 
+categories:
+
+1) DISCOVERY
+2) PRIORITY
+3) ATTRIB_KNOWN
+4) ID_CORRECTION
+5) UNIDENTIFIED
+6) FOLLOW_UP
+7) SKY_COVERAGE
+
+4.1 Discovery claims
+====================
+
+Discovery Claims: a DataBase (DB) of identifications, normalized in the most
+strict sense (neither discordancies nor alternative orbit solutions are
+allowed; nominal least squares orbits only), each one qualifying as a
+Discovery, that is Arcs of Type >2; in practice, ids with at least 3
+tracklets at opposition and at least 4 at the sweet spots.
+
+The data to claim a discovery are of type IDENTIFICATION with the following
+constraints: in the IDENT_HEADER, OP_CODE=DISCOVERY, ARC_TYPE>2, N_SOL=1; only
+one ORBIT, with N_PAR=6 and only one METRIC with "good" values, passing some
+Quality Assurance standard.
+ 
+4.2 Priority claim 
+==================
+
+Priority Claims: a DB of identifications which is normalized in the weak
+sense, that is discordancies (between ids with the same number of nights) and
+alternate orbit solutions (as in the sweet spots) are allowed, each one
+qualifying for Priority if and when the Discovery is completed by some follow
+up. In practice, most of these are Arcs of Type 2 (mostly 2-nighters, plus
+3-nighters TNO), but also discordant Type 3 at opposition and Type 3 with
+double solutions at the sweet spots.
+
+The data to present an incomplete discovery, to be completed by others,
+are of type IDENTIFICATION with, in the IDENT_HEADER, OP_CODE=POSSIBLEID.
+
+4.3 Attribution to previously known object
+==========================================
+
+Observations of known objects: a DB of tracklets with Attribution to some
+objects already Discovered (by PS and by others). In some cases this completes
+a Priority Claim to a Discovery claim, and this has to be specified.
+
+The data to propose an attribution to a known object are of type
+IDENTIFICATION with  OP_CODE=KNOWN_OBJ or COMPLETION in the IDENT_HEADER. 
+
+4.4 Correction of a previous identification
+===========================================
+
+Wrong ids: a DB of retractations, that is some previous identifications later
+found to be wrong. This happens as a result of new observations, resulting in
+an identification which is discordant from one already submitted and superior
+(e.g., more tracklets identified).
+
+The corrections to previous identifications are of type IDENT_HEAD, with
+OP_CODE=WRONG_ID.
+
+4.5 Unidentified tracklets
+==========================
+
+Unidentified tracklets: a DB of Too Short Arcs, that is tracklets or possibly
+identifications among tracklets of the same night, but also 2-night ids of
+TNOs, for which no identification with other tracklets has been possible and
+the Arc Type is still 1 (no significant curvature, no meaningful orbit).
+
+The unidentified tracklets file is of type TRACKLETs, that is lines
+of DETECTIONS with changes in TRACKLET_OID indicating a new tracklet.
+
+4.6 Requests for follow up
+==========================
+
+For interesting objects which have an incomplete orbit, a request for follow
+up could be sent to an observer, or broadcast (e.g., to MPML). In this case
+the data type is REQUEST_OBS with the OP_CODE=FOLLOW_UP. As an alternative,
+the future PS-DyS site could be used to provide the same data with a
+user-friendly web interface.
+
+4.7 Sky coverage report
+=======================
+
+Metadata for all the frames used for MOPS have to be exported, to allow an
+assessment of observational biases and also requests to PS for precovery.  The
+data type is SCHEDULE. This can be implemented through the Published Science
+Products System.
+
+5. OTHER EXCHANGES OF DATA
+==========================
+
+This is a preliminary list of other cases of data exchange, mostly internal,
+that is with PS partners; e.g., to exchange between MOPS software, OrbFit
+software and LSST software.  Later they could become useful also for external
+exchange. 
+
+
+5.1 Preliminary/final orbit request and return
+==============================================
+
+ORBIT_REQUEST={IDENT_HEADER, TRACKLETs}
+
+where the tracklets should be 3 (else some rule has to be specified to select
+3; to be investigated). In IDENT_HEADER, the OP_CODE could be either
+REQ_PRELIM (preliminary orbit only) or REQ_ORBIT (also differential correction
+requested).
+
+The return data are of type IDENTIFICATION. COVARIANCEs are missing
+in case differential corrections are not required; in the ORBITs the
+parameters INDEX and N_PAR are compulsory.
+
+5.2 Candidate orphan request and return
+=======================================
+
+The immediate usage is for 'orphan request', that is to find DETECTIONs
+which have not been assembled into TRACKLETs because either the second
+observation is missing (due to fill factor <1) or the two (or more) DETECTIONS 
+have low S2N. The same format could also be used to ask for a precovery by PS
+by an external orbit computer; this service is not expected to be available
+at the beginning of operations of PS, but should be implemented later.
+
+PRECOVERY_REQUEST={IDENTIFICATION}
+
+where in the IDENT_HEADER the OP_CODE should be REQUEST_PRECOVERY. Two types of
+requests are possible, the one for a tracklet and the one for a single
+detection. The PARAMETERS optional field is compulsory:
+
+PARAMETERS={CHI_TRACK, S2N_TRACK, CHI_SINGLE, S2N_SINGLE}
+
+where the real numbers are the chi value (square root of the identification
+penalty parameter K) and the signal to noise ratio for each of the two cases.
+If only the tracklets are required, the two values referring to singles are
+zero, and viceversa.
+
+The IDENT_HEADER file is called [jobname].precovery_request.
+
+The answer is
+
+PRECOVERY={IDENT_HEADER, TRACKLETs}
+
+where IDENT_HEADER is the same of the request. Note that for singles the
+answer contains tracklets with only one observation, nevertheless the OID must
+be a TRACKLET_OID (that is, a 1-detection tracklet needs to be generated).
+
+5.3 Protocol for requests
+=========================
+
+In the two cases discussed in 5.1-5.2, and maybe in many others to be defined
+later, the data are exchanged between two actors, such as two entities of the
+PS consortium (in the future also externally). The request has to be organized
+as follows:
+
+[jobname].in.file_list
+[jobname].in.xxx
+[jobname].in.yyy
+....
+[jobname].in.zzz
+
+Then the corresponding answer should be:
+
+[jobname].out.file_list
+[jobname].out.xxx
+[jobname].out.yyy
+....
+[jobname].out.zzz
+
+In this way a single tarball can contain multiple requests, even of different
+nature, also a mixture of requests and answers without ambiguity.
+
+

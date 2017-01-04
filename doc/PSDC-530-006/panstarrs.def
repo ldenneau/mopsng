@@ -1,0 +1,166 @@
+% -*- latex -*-
+
+%-------------------------------------------------------------
+% Pan-STARRS Notation
+% -------------------
+% LaTeX variables (cntl sequences) for entities significant to Pan-STARRS.
+   \newcommand{\PS}{Pan-STARRS}
+   \newcommand\Object{\ensuremath{f}}                % an object
+   \newcommand\ObjectSet{\ensuremath{\mathbf{f}}}    % a set of objects
+   \newcommand\Telescope{\ensuremath{T}}             % a telescope
+   \newcommand\TelescopeSet{\ensuremath{T}}          % a set of telescopes
+   \newcommand\Image{\ensuremath{\varphi}}           % an image
+   \newcommand\ImageSet{\ensuremath{\varphi}}        % a set of images
+   \newcommand\ImageFT{\ensuremath{\hat{\varphi}}}   % Fourier transform of an image
+   \newcommand\psf{psf}                              % abreviation for point spread function (to appear in sentences)
+   \newcommand\PSF{\ensuremath{g}}                   % math symbol for psf (to appear in math expressions)
+   \newcommand\PSFSet{\ensuremath{\mathbf{g}}}       % a set of psf's
+   \newcommand\PSFFT{\ensuremath{G}}                 % Fourier transform of a psf
+   \newcommand\otf{otf}                              % abreviation for optical transfer function
+   \newcommand\PixelScale{\ensuremath{s_p}}          % pixel scale
+   \newcommand\WarpDegree{\ensuremath{D_w}}          % degree of warp transform polynomial
+   \newcommand\ota{ota}                              % abbreviation for an orthogonal transfer array (to appear in sentences)
+   \newcommand\OTA{\ensuremath{A}}                   % math symbol for ota
+   \newcommand\imcat{{\tt imcat}}                    % reference to Kaiser's imcat software
+   \newcommand\AngularPitch{\ensuremath{p_{\text{\scriptsize pixel}}}}   % angular pitch of a pixel (e.g. 0.3 arcsec)
+
+   \def\degree{\hbox{$^\circ$}}
+   \def\arcmin{\hbox{$^\prime$}}
+   \def\arcsec{\hbox{$^{\prime\prime}$}}
+
+%
+% Typsetting documentation
+%
+% \code{...} sets code in \tt and escapes most special characters.  Doesn't
+% handle {} correctly, but \CODE.anything but period. does (actually, you
+% may use any character as a delimiter).
+%
+% Designed for a word or two of code inline; use
+% \begin{verbatim}...\end{verbatim} for longer blocks
+%
+
+\def\uncatcodespecials{\def\do##1{\catcode`##1=12}\dospecials}%
+{\catcode`\`=\active\gdef`{\relax\lq}}% this line inhibits Spanish 
+                                      % ligatures ?` and !` of \tt font
+\def\setupc@de % see TeX Book, p. 381
+    {\tt %
+     \spaceskip=0pt \xspaceskip=0pt % just in case...
+     \catcode`\`=\active
+     \uncatcodespecials \obeyspaces
+     \catcode`\{=1\catcode`\}=2
+    }%
+\def\SETUPC@DE % see TeX Book, p. 381
+    {\tt %
+     \spaceskip=0pt \xspaceskip=0pt % just in case...
+     \catcode`\`=\active
+     \uncatcodespecials \obeyspaces
+    }%
+
+\def\d@code#1{#1\endgroup}%
+\def\D@CODE#1{\def\next##1#1{##1\endgroup}\next}%
+
+\def\code{\begingroup\setupc@de\d@code}%
+\def\CODE{\begingroup\SETUPC@DE\D@CODE}%
+
+\newcommand\note[1]{\textbf{\color{red}#1}}
+%\newcommand\tbd[1]{\textbf{\color{red}#1 (TBD)}}
+%\newcommand\tbr[1]{\textbf{\color{blue}#1 (TBR)}}
+\newcommand\TBD[1]{\par\tbd{#1}\par}
+\newcommand\comment[1]{\footnote{{\color{red}#1}}}
+
+\newcommand{\file}[1]{\textit{#1}}%
+
+%------------------------------------------------------------------------------
+%-------------------------------------------------------------
+% General Math Notation
+% ---------------------
+% -Algebra & Analysis------------
+   \newcommand\Z{\ensuremath{\mathbb{Z}}}                   % integers
+   \newcommand\N{\ensuremath{\mathbb{N}}}                   % natural numbers
+   \newcommand\R{\ensuremath{\mathbb{R}}}                   % real numbers 
+   \newcommand\C{\ensuremath{\mathbb{C}}}                   % complex numbers 
+   \newcommand\rel{\ensuremath{\mathcal{R}}}                % a general relation
+   \newcommand\Group{\ensuremath{\langle G,* \rangle}}      % a group
+   \newcommand\Ring{\ensuremath{\langle R,+,\cdot \rangle}} % a ring
+   \newcommand\F{\ensuremath{\mathbf{F}}}                   % a field
+   \newcommand\Fn{\ensuremath{\mathbf{F}^n}}                % a field in n dimensions
+   \newcommand\FN{\ensuremath{\mathbf{F}^N}}                % a field in N dimensions
+   \newcommand\ztwo{\ensuremath{\mathbb{Z}_2}}              % Cyclic groups (rings)
+   \newcommand\zthree{\ensuremath{\mathbb{Z}_3}}
+   \newcommand\zfour{\ensuremath{\mathbb{Z}_4}}
+   \newcommand\Real{\mbox{Re}}                              % real part (alternatively: \newcommand\Real{\Re}})
+   \newcommand\Imag{\mbox{Im}}                              % imaginary part (alt.: \newcommand\Real{\Re}})
+   \newcommand\integral{\ensuremath{\int_{-\infty}^{\infty}}} % integral 
+
+% -Operator Theory-----------------
+   \newcommand\Per{\ensuremath{\operatorname{Per}}}
+   \newcommand\pv{\ensuremath{\operatorname{pv}}}
+   \newcommand\T{\ensuremath{\operatorname{T}}}
+   \newcommand\W{\ensuremath{\operatorname{W}}}
+   \newcommand\Hilbert{\ensuremath{\mathcal{H}}}
+   \newcommand\Hone{\ensuremath{\mathcal{H}_1}}
+   \newcommand\Htwo{\ensuremath{\mathcal{H}_2}}
+   \newcommand\Banach{\ensuremath{\mathcal{B}(\Hilbert,\Hilbert)}}
+   \newcommand\Banachonetwo{\ensuremath{\mathcal{B}(\Hone,\Htwo)}}
+   \newcommand\Banachtwoone{\ensuremath{\mathcal{B}(\Htwo,\Hone)}}
+   \newcommand\Lone{\ensuremath{L^1}}
+   \newcommand\Ltwo{\ensuremath{L^2}}
+   \newcommand\ltwo{\ensuremath{\ell^2}}
+   \newcommand\LoneR{\ensuremath{L^1(\mathbb{R})}}
+   \newcommand\LtwoR{\ensuremath{L^2(\mathbb{R})}}
+   \newcommand\ltwoR{\ensuremath{\ell^2(\mathbb{R})}}
+% -Vector Spaces---------------------
+   \newcommand\basis{\ensuremath{\mathcal{B}}}
+   \newcommand\Span{\ensuremath{\text{span}}}
+   \newcommand\Null{\ensuremath{\mathcal{N}}}
+   \newcommand\Range{\ensuremath{\mathcal{R}}}   
+   \newcommand\Krylov{\ensuremath{\mathcal{K}}}
+   \newcommand\bx{\ensuremath{\mathbf{x}}}      % the vector x = (x_0, x_1, ...)
+   \newcommand\by{\ensuremath{\mathbf{y}}}      % the vector y = (y_0, y_1, ...)
+% -Harmonic Analysis-----------------
+   \newcommand\FT{\ensuremath{\mathcal{F}}}         % Fourier transform
+   \newcommand\invFT{\ensuremath{\mathcal{F}^{-1}}} % inverse Fourier transform
+
+% -Statistics------------------------
+   \newcommand\OutcomeSpace{\ensuremath{\Omega}}    % Outcome Space
+   \newcommand\SampleSpaceX{\ensuremath{\frak{X}}}  % Sample Space X
+   \newcommand\SampleSpaceY{\ensuremath{\frak{Y}}}  % Sample Space Y
+   \newcommand\SampleMeanX{\overline{x}}            % Sample mean in X  = sum_i x_i / n
+
+%-------------------------------------------------------------
+% Object Oriented Design Notation
+% ---------------------
+  \newcommand\SkyObjectSetList{{\tt SkyObjectSetList}}  % List of sets of sky objects
+  \newcommand\SkyObjectSet{{\tt SkyObjectSet}}          % set of sky objects
+  \newcommand\SkyObject{{\tt SkyObject}}             % sky object
+  \newcommand\SkyLocation{{\tt SkyLocation}}            % sky coordinate (RA,DEC) 
+  \newcommand\DetectorLocation{{\tt DetectorLocation}}  % detector coordinate (x,y)
+  \newcommand\SkyGeometryTransform{{\tt SkyGeometryTransform}} % transforamtion from detector to sky location
+  \newcommand\SkyFluxTransform{{\tt SkyFluxTransform}}  % transforamtion from detector flux to real flux
+
+%------------------------------
+% Language/Grammar
+%----------
+% Latin (see LaTeX Companion, p. 50)
+   \newcommand{\eg}{e.g.,\space}            % for example (latin: {\it exempli gratia})
+   \newcommand{\ie}{i.e.,\space}            % that is     (latin: {\it id est})
+   \newcommand{\etc}{etc.\@\space}          % etcetera    (latin: {\it et cetera})
+
+% doxygen elements
+\newenvironment{CompactList}
+{\begin{list}{}{
+  \setlength{\leftmargin}{0.5cm}
+  \setlength{\itemsep}{0pt}
+  \setlength{\parsep}{0pt}
+  \setlength{\topsep}{0pt}
+  \renewcommand{\makelabel}{}}}
+{\end{list}}
+\newenvironment{CompactItemize}
+{
+  \begin{itemize}
+  \setlength{\itemsep}{-3pt}
+  \setlength{\parsep}{0pt}
+  \setlength{\topsep}{0pt}
+  \setlength{\partopsep}{0pt}
+}
+{\end{itemize}}

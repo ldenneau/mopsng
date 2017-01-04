@@ -1,0 +1,102 @@
+
+2003 August 26
+Robert Jedicke
+
+The files fakemb.[0-9].1m each contain one million orbits. 
+The total ensemble of ten million orbits roughly mimics the
+orbit (a,e,i,w,O) and absolute magnitude (H) distribution of
+Main Belt objects accessible to PanSTARRS.  These are objects
+with minimum V-magnitude at opposition of <24.5.
+
+There are minor problems with this data set.  Particularly
+the H-distribution of the ensemble does not perfectly match
+the H-distribution of the brighter known MB objects.  This is
+an artifact of the manner in which I created the
+H-distribution.  I don't think it's important to most
+studies.
+
+The dataset was created using RJ's CreateFakeMB routine.
+
+Columns are:
+
+id a e i O w M H MOID POpik
+
+The last two columns are currently set to zero.
+
+The id within each file is the base-62 (0-9,a-z,A-Z) number
+of the entry starting at 0 and left-padded with zeros.
+
+
+
+2003 December 16
+Robert Jedicke
+
+The files fakemb.[1-10].1m each contain one million orbits. 
+The total ensemble of ten million orbits roughly mimics the
+orbit (a,e,i,w,O) and absolute magnitude (H) distribution of
+Main Belt objects accessible to PanSTARRS.  These are objects
+with minimum V-magnitude at opposition of <24.5.
+
+There are minor problems with this data set.  Particularly
+the H-distribution of the ensemble does not perfectly match
+the H-distribution of the brighter known MB objects.  This is
+an artifact of the manner in which I created the
+H-distribution.  I don't think it's important to most
+studies.
+
+The dataset was created using RJ's CreateFakeMB routine.
+
+Columns are:
+
+id a e i O w M H MOID POpik
+
+The last two columns are currently set to zero.
+
+The id within file fakemb.N.1m is N00000 (with N in base-62)
+plus the base-62 (0-9,a-z,A-Z) number (line)
+of the entry starting at 0.  So the 11th object
+in file N=10 yields an ID of a0000b.
+
+
+
+2004 March 15
+Robert Jedicke
+
+The files fakemb.[1-10].1m each contain one million orbits. 
+The total ensemble of ten million orbits roughly mimics the
+orbit (a,e,i,w,O) and absolute magnitude (H) distribution of
+Main Belt objects accessible to PanSTARRS.  These are objects
+with minimum V-magnitude at opposition of <24.5.
+
+There are minor problems with this data set.  Particularly
+the H-distribution of the ensemble does not perfectly match
+the H-distribution of the brighter known MB objects.  This is
+an artifact of the manner in which I created the
+H-distribution.  I don't think it's important to most
+studies.
+
+The dataset was created using RJ's CreateFakeMB routine.
+
+Columns are:
+
+id a e i O w M H MOID POpik
+
+The last two columns are currently set to zero.
+id= see below
+a = semi-major axis (AU)
+e = eccentricity
+i = inclination (deg)
+O = longitude of ascending node (deg)
+w = longitude of perihelion (deg)
+M = anomaly at epoch (deg)
+MOID = Minimum Orbital Impact Distance (AU)
+POpik = Opik collision probability with Earth
+
+The id within file fakemb.N.1m is N00000 (with N in base-62)
+plus the base-62 (0-9,a-z,A-Z) number (line)
+of the entry starting at 0.  So the 11th object
+in file N=10 yields an ID of a0000b.
+
+The Epoch of all orbits was MJD=52860.0.
+
+

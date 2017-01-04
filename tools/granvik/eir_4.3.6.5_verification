@@ -1,0 +1,50 @@
+#!/bin/bash
+ 
+# Verification test for EIR 4.3.6.5 (do read access)
+# Mikael Granvik  07/24/2008
+
+USERNAME="granvik"
+STUB="eir_4365_verification"
+INSTANCE_NAME="psmops_granvik_cr_test_SIM"
+TMPDIR="/home/${USERNAME}/tmp"
+MYSQLHOST="mops00"
+MYSQLUSER="mops"
+MYSQLPASSWD="mops"
+
+echo "1..1"
+
+# Quick and dirty way of computing real readout speed and size of
+# table:
+source $HOME/bin/mops_env $INSTANCE_NAME
+echo \
+"
+select * from derivedobjects left join orbits using (orbit_id)
+" | \
+time -p mysql -N -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME > \
+  $TMPDIR/eir_4.3.6.5_verification.tmp 2> \
+  $TMPDIR/eir_4.3.6.5_verification_timing.tmp
+tim=`cat $TMPDIR/eir_4.3.6.5_verification_timing.tmp`
+tim=${tim/user*/}
+tim=${tim#real}
+lines=`grep -c '' $TMPDIR/eir_4.3.6.5_verification.tmp`
+
+# Compute output speed and convert to integer so that poor Bash
+# understands what we want:
+speed=`echo "$lines / $tim" | bc`
+speed=${speed/.*/}
+
+if [[ $1 == "--result" ]]
+    then
+    echo $speed
+fi
+
+# Check whether the 1000/s criterion is met:
+if (( $speed > "1000" )) ; then
+    echo "ok 1 - ${STUB}"
+else
+    echo "not ok 1 - ${STUB}"
+fi
+
+rm -f $TMPDIR/eir_4.3.6.5_verification.tmp \
+      $TMPDIR/eir_4.3.6.5_verification_timing.tmp
+exit

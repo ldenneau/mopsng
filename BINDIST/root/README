@@ -1,0 +1,69 @@
+DESCRIPTION
+
+This is an experimental MOPS binary distribution.  It contains a complete
+operating environment necessary to run a MOPS simulation.
+
+
+REQUIREMENTS
+
+Your system must conform to the following:
+
+* Intel/AMD Linux 2.6 or later kernel (any recent RHEL/Fedora, Gentoo, Ubuntu)
+* Perl 5.6.8 or later
+* Python 2.4 or later
+* Mysql 4.1 or 5
+
+In addition, the following Perl and Python modules must be installed on
+your system:
+
+Params::Validate
+File::Slurp
+Config::Scoped
+Class::Accessor
+Astro::SLA (requires C SLALIB)
+Proc::Daemon
+MySQLdb (python)
+
+
+INSTRUCTIONS
+
+1.  Download the tarball.
+
+2.  Create a user 'mops' that will run the simulations.
+
+3.  cd to the mops home directory, then unpack the tarball using
+
+  tar zxcf mops-bindist.tar.gz
+
+4.  Create a ~mops/.psmops_rootpw file that contains the root
+password for your mysql database.  You may choose not to do this,
+but then you must enter the mysql root password when invoking
+buildInstance.
+
+5.  Log in as the mops user.  Then
+
+  + buildInstance --model=1000
+  + insertSyntheticFields --filefilt=2006-11 --objfilt=ess
+  + mopper
+  + effReport --ocnum 84 --type=D | column -t    # derived objects report, OC 84, then format
+
+6.  Enjoy refreshing beverage.
+
+
+KNOWN ISSUES
+
+* The Apache web interface is not yet supported.  Some hacking of apachectl
+is required at the moment to set up the web interface.
+
+* milani_iod is not yet supported in the binary distribution, as OrbFit
+requires some path information to be compiled into its executables.
+We are still evaluating solutions for creating a bniary distribution
+with OrbFit.
+
+* Future versions will not require putting the mysql root password in
+a file.  Instead you will be able to specify it on the command line.
+
+
+SUPPORT
+
+If you have any questions, please contact Larry Denneau, denneau@ifa.hawaii.edu.

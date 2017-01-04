@@ -1,0 +1,577 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+orbitid - extract objects from end-of-night queue and perform orbit identification
+
+=head1 SYNOPSIS
+
+orbitid [options]
+
+  --nodb : don't actually change the database
+  --help : show this manual page
+
+=head1 DESCRIPTION
+
+orbitid uses the OrbitProximity program to compare objects that have
+been placed in the end-of-night (EON) processing queue to historical
+derived objects.  Objects that have "similar" orbital parameters then
+have orbits computed for their combined set of detections, and if the
+new orbit passes muster, the newer object (the one in the queue) is
+merged with the older one.
+
+All unmerged objects in the queue are then passed on to the subsequent
+precovery end-of-night process.  Merged objects are marked as "finished"
+in the queue so that they are retired.
+
+=head1 ALGORITHM
+
+=begin code
+
+  extract orbits of all objects in EON queue ("NEW" orbits)
+  extract orbits all non-child derived objects ("DERIVED" orbits)
+  perform an OrbitProximity operation of NEW orbits against DERIVED objects
+  create a map of NEW orbits and their match lists
+  for each NEW orbit :
+    if it has a match:
+        compute orbits using old and new detections
+        if any orbit is below RMS cutoff:
+          select lowest
+          merge with source DERIVED (new.parent = derived)
+    
+=end code
+
+=cut
+
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Temp qw(tempfile);
+use File::Slurp;
+use Params::Validate;
+use Data::Dumper;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::DX;
+use PS::MOPS::DC::Orbit;
+use PS::MOPS::DC::DerivedObject;
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::History::Identification;
+use PS::MOPS::DC::History;
+use PS::MOPS::DC::Efficiency;
+use PS::MOPS::DC::EONQueue;
+use PS::MOPS::DC::MOIDQueue;
+
+
+use subs qw(
+    build_match_table
+    orb2miti
+    init_od_queue
+    run_od
+);
+
+
+# Globals.
+my $ORBIT_PROXIMITY = 'orbitProximity';
+my $temp_id_template = 'OI0000000';         # B62 template
+my $t0 = time;
+
+
+my $inst;
+my $instance_name;
+my $nodb;
+my $hotwire;        # testing, bypass OrbitProximity and just use files
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    nodb => \$nodb,
+    hotwire => \$hotwire,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+
+# MOPS Configuration.
+my $v2filt = $mops_config->{site}->{v2filt};
+
+my $resid_threshold_arcsec = 
+    $mops_config->{orbitid}->{resid_threshold_arcsec} || .2;
+
+my $diffcor_program = 
+    $mops_config->{orbitid}->{diffcor_program} 
+    || $mops_config->{orbit_determination}->{diffcor_program}
+    || $mops_logger->logdie("can't get diffcor_program");
+
+my $params_str = $mops_config->{orbitid}->{orbit_proximity_args}
+    || "q_thresh 0.10 e_thresh 0.050";
+
+my $data_filename = 'orbitid.data';
+my $query_filename = 'orbitid.query';
+my $match_filename = 'orbitid.match';
+my $out_filename = 'orbitid.out';
+my $todo_href;
+my $cmd;
+if (!$hotwire) {
+    # Get all objects in the queue and build a hash table whose keys are
+    # the derived object IDs of ORBITID candidates.  When we merge one, remove it
+    # from the list.  At the end of this process we will mark the unmerged
+    # ones as ready for the next EON processing stage.
+    my $todo_list = modcq_retrieve($inst, $EONQUEUE_STATUS_NEW);
+    $mops_logger->info(sprintf "ORBITID: found %d objects in queue.", scalar @{$todo_list});
+
+    if (scalar @{$todo_list} == 0) {
+        exit 0;
+    }
+
+
+    foreach my $item (@{$todo_list}) {
+        $todo_href->{$item->derivedobjectId} = $item;       # create key/val pair
+    }
+
+    my $disable_orbitid = $mops_config->{debug}->{disable_orbitid} || 0;
+    if ($disable_orbitid == 1) {
+        foreach my $item (@{$todo_list}) {
+            modcq_update($inst, $item->derivedobjectId, $EONQUEUE_STATUS_IDENTIFIED);
+        }
+        exit 0;
+    }
+    elsif ($disable_orbitid == 2) {
+        # Special code for don't process instead of passthrough
+        $mops_logger->info("Orbit identification disabled; skipping.");
+        exit 0;
+    }
+
+    # Do our stuff here.
+    # Start.  Grab identified (NEW) and unidentified (DERIVED) orbits.
+    my $orbit_i;
+    my $orbit;
+
+
+    my $fh;
+    my $n;
+
+    # Fetch all derived objects and write their orbits to the DATA file.
+    $orbit_i = modco_retrieve($inst, orbitid_data => 1);
+    $fh = new FileHandle ">$data_filename" or $mops_logger->logdie("can't open $data_filename");
+    $n = 0;
+    while ($orbit = $orbit_i->next) {
+        print $fh orb2miti($orbit), "\n";
+        $n++;
+    }
+    close $fh;
+    $mops_logger->info(sprintf "ORBITID: %d DATA orbits", $n);
+
+    $orbit_i = modco_retrieve($inst, orbitid_query => 1);
+    $fh = new FileHandle ">$query_filename" or $mops_logger->logdie("can't open $query_filename");
+    $n = 0;
+    while ($orbit = $orbit_i->next) {
+        print $fh orb2miti($orbit), "\n";
+        $n++;
+    }
+    close $fh;
+    $mops_logger->info(sprintf "ORBITID: %d QUERY orbits", $n);
+
+
+    # Schwing them through OrbitProximity.
+    $cmd = "$ORBIT_PROXIMITY data $data_filename queries $query_filename matchfile $match_filename $params_str >> $out_filename";
+    system($cmd) == 0 or $mops_logger->logdie("$cmd failed");
+}
+
+
+# Build our results table.  This is simply an association of query 
+# orbits with derived ("data") orbits that are close matches to them.
+my $match_n2d_href = build_match_table(
+    data => $data_filename,
+    queries => $query_filename,
+    match => $match_filename,
+);      # build table of new IDs and match lists
+
+
+##print Dumper($match_n2d_href);
+
+
+# Now for each key in the match table, fit orbits for all combinations
+# of the match orbit with matched (parent) orbits.  Take the best one
+# that satisfies our residual requirement and consolidate the orbits
+# and their detections.
+my $query_orbit_name;
+my $data_orbit_name;
+my @merge_list;
+my $od_queue = init_od_queue();     # will hold OD inputs, outputs, state for query-data orbit evals
+
+
+$mops_logger->info(sprintf "ORBITID: %d matches", scalar keys %{$match_n2d_href});
+foreach $query_orbit_name (keys %{$match_n2d_href}) {
+    my $query_obj;               # query derived object
+    my $query_orbit;             # query derived object's orbit from OrbitProximity
+    my @query_orbit_dets;        # query orbit's detections
+
+    $query_obj = modcdo_retrieve($inst, objectName => $query_orbit_name);
+    $mops_logger->logdie("couldn't retrieve query orbit $query_orbit_name") unless $query_obj;
+
+    $query_orbit = modco_retrieve($inst, derivedobjectName => $query_orbit_name) 
+        or die "didn't get orbit for $query_orbit_name";
+    # Get the query orbit's detections.  We need them for each inner iteration,
+    # so just get them here.
+    @query_orbit_dets = $query_obj->fetchDetections()
+        or die "got zero detections for $query_orbit_name";
+
+    foreach $data_orbit_name (@{$match_n2d_href->{$query_orbit_name}}) {
+        next if $data_orbit_name eq $query_orbit_name;   # sanity check for dupes
+
+        my $data_obj = modcdo_retrieve($inst, objectName => $data_orbit_name);
+        if ($data_obj->status eq $DERIVEDOBJECT_STATUS_MERGED) {
+            $mops_logger->info(sprintf "%s already merged.", $data_obj->objectName);
+            last;
+        }
+
+        my $data_orbit = modco_retrieve($inst, derivedobjectName => $data_orbit_name);
+
+        # Queue the orbit determination.
+        queue_od($od_queue, $query_obj, $query_orbit, $data_obj, $data_orbit, @query_orbit_dets);
+    }
+}
+
+
+# Run the batch orbit determination.
+run_od($od_queue);
+
+# Now re-roll our loop, and for each inner iter fetch an OD result computed by batch OD.
+foreach $query_orbit_name (keys %{$match_n2d_href}) {
+
+    my $best;
+    my $eval_orb;
+
+    foreach $data_orbit_name (@{$match_n2d_href->{$query_orbit_name}}) {
+
+        my $result = fetch_results($od_queue, $query_orbit_name, $data_orbit_name);
+        next unless ($result and $result->{ORBIT});
+        $eval_orb = $result->{ORBIT};
+
+        # Was result any good?
+        if ($eval_orb->residual < $resid_threshold_arcsec) {
+            if (!defined($best) or $eval_orb->residual < $best->{ORBIT}->{residual}) {
+                # Current best orbit; save
+                $best = $result;        # contains { MASTER, CHILD, ORBIT keys }
+            }
+        }
+    }
+
+    # If $best_orbit is set, then we have a winner for this query object.  Queue it up
+    # for merge later.
+    if ($best) {
+        push @merge_list, $best;
+    }
+}
+$mops_logger->info(sprintf "ORBITID: %d successful identifications to merge", scalar @merge_list);
+
+exit if $hotwire;
+
+
+# If --nodb, just report findings and bail.
+if ($nodb) {
+    print Dumper(\@merge_list);
+    exit 0;
+}
+
+# Write stuff to database.
+$inst->pushAutocommit(0); # disable DC autocommit
+
+# Merge orbits.
+eval {
+    foreach my $merge_result (@merge_list) {
+        my ($parent_obj, $child_obj, $new_orb) = @{$merge_result}{qw(MASTER CHILD ORBIT)};
+        my ($old_parent_orbit_id) = $parent_obj->orbitId;       # save, orbit will be replaced after merge
+
+        ## EFF save elems_hr orbit
+        ## EFF save ident history
+        $new_orb->insert();
+        $parent_obj->mergeChild($child_obj, $new_orb);
+        $mops_logger->info(sprintf "Identification: %s merged with parent %s", 
+            $child_obj->objectName, $parent_obj->objectName);
+
+        # Update history.
+        my @child_history = grep { $_->eventType eq $EVENT_TYPE_DERIVATION } 
+            @{modch_retrieve($inst, derivedobjectId => $child_obj->derivedobjectId)};
+        
+        die ("got empty field ID for derived object: " . $child_obj->derivedobjectId) unless @child_history;
+        die ("got multiple field IDs for derived object: " . $child_obj->derivedobjectId) if @child_history > 1;
+        my $child_obj_field_id = $child_history[0]->fieldId;
+        
+        my $hist = PS::MOPS::DC::History::Identification->new(
+            $inst,
+            derivedobjectId => $parent_obj->derivedobjectId,
+            fieldId => $child_obj_field_id,         # use target field of child object for identification event
+            orbitId => $new_orb->orbitId,
+            orbitCode => $MOPS_EFF_ORBIT_OK,
+            classification => $parent_obj->classification,
+            ssmId => $parent_obj->ssmId,
+            childobjectId => $child_obj->derivedobjectId,
+            parentOrbitId => $old_parent_orbit_id,
+            childOrbitId => $child_obj->orbitId,
+        );
+        $hist->record;
+
+        # Submit the parent DO to the precovery pipeline...
+        modcq_submit($inst, $parent_obj->derivedobjectId, $hist->eventId, $EONQUEUE_STATUS_IDENTIFIED);
+
+        # MOID queue.
+        PS::MOPS::DC::MOIDQueue->submit($inst, $new_orb->orbitId, $hist->eventId);
+
+        # ...retire the child orbit from further processing.
+        modcq_update($inst, $child_obj->derivedobjectId, $EONQUEUE_STATUS_RETIRED);
+        $mops_logger->info(sprintf "Merged child %s/%s with parent %s/%s",
+            $child_obj->derivedobjectId, 
+            $child_obj->objectName,
+            $parent_obj->derivedobjectId, 
+            $parent_obj->objectName);
+
+        # Removed the merged orbit from the $todo list.
+        delete ${$todo_href}{$child_obj->derivedobjectId};
+    }
+
+
+    # Do an efficiency pass by selecting all non-identified derived objects (query orbits)
+    # that have matching derived objects.  Note that the once we have just merged will
+    # have their status set to 'M', so we will not re-process them.
+    my $lost_identifications_aref = modce_retrieveIdentifiableDerivedObjects($inst);
+    foreach my $pair_aref (@{$lost_identifications_aref}) {
+        my ($child_obj, $parent_obj) = @{$pair_aref};
+        my @child_history = grep { $_->eventType eq $EVENT_TYPE_DERIVATION } 
+            @{modch_retrieve($inst, derivedobjectId => $child_obj->derivedobjectId)};
+
+        die ("got empty field ID for derived object: " . $child_obj->derivedobjectId) unless @child_history;
+        die ("got multiple field IDs for derived object: " . $child_obj->derivedobjectId) if @child_history > 1;
+        my $child_hist = $child_history[0];
+
+        my $hist = PS::MOPS::DC::History::Identification->new(
+            $inst,
+            derivedobjectId => $parent_obj->derivedobjectId,
+            fieldId => $child_hist->fieldId,         # use target field of child object for identification event
+            orbitId => undef,
+            orbitCode => $MOPS_EFF_ORBIT_OK,
+            classification => $MOPS_EFF_UNFOUND,
+            ssmId => $parent_obj->ssmId,
+            childobjectId => $child_obj->derivedobjectId,
+            parentOrbitId => $parent_obj->orbitId,
+            childOrbitId => $child_hist->orbitId,
+        );
+        $hist->record;
+    }
+
+
+    # Now mark remaining non-merged items as ready for the next operation in the queue.
+    # These are the items that still remain in the $todo list; the merged ones will
+    # have been removed earlier.
+    foreach my $item (values %{$todo_href}) {
+        modcq_update($inst, $item->derivedobjectId, $EONQUEUE_STATUS_IDENTIFIED);
+    }
+    $inst->dbh->commit;
+};
+
+if ($@) {
+    $mops_logger->logwarn($@);
+    $inst->dbh->rollback;
+}
+
+$mops_logger->info(
+    mopslib_formatTimingMsg(
+        subsystem => 'ORBITID',
+        time_sec => (time - $t0),
+        nn => 0,
+    )
+);
+
+# Finally, run MOID.
+system('moid', '--file_prefix=ORBITID') == 0 or $mops_logger->logdie('ORBITID/MOID failed');
+
+# Clean up.
+File::Temp::cleanup();      # clean up temp dirs/files
+exit;
+
+
+sub init_od_queue {
+    # Return a hashref containing everything we need to run a batch orbit determination.
+    # We will stream input data to IOD and TRACKS files for mopsdiffcor.
+    my $iod_fname = 'orbitid.iods';
+    my $iod_fh = new FileHandle ">$iod_fname" or die "can't create $iod_fname";
+
+    my $tracks_fname = 'orbitid.tracks'; 
+    my $tracks_fh = new FileHandle ">$tracks_fname" or die "can't create $tracks_fname";
+
+    my $queue_data = {
+        TEMP_COUNTER => 1,          # used to generate temp ID mapping for each OD req
+        IOD_FH => $iod_fh,
+        IOD_FNAME => $iod_fname,
+        TRACKS_FH => $tracks_fh,
+        TRACKS_FNAME => $tracks_fname,
+        MAPPING => {},
+        RESULTS => {},
+    };
+
+    return $queue_data;
+}
+
+
+sub queue_od {
+    # Given a queue object created by init_od_queue(), add the specified data.
+    my ($queue_data, $query_obj, $q_orbit, $data_obj, $data_orbit, @query_orbit_dets) = @_;
+
+    # Create a temp ID mapping for this query-data orbit pair.
+    my $temp_id = mopslib_toB62($queue_data->{TEMP_COUNTER}, $temp_id_template);
+    $queue_data->{TEMP_COUNTER} += 1;
+    my $map_str = $query_obj->objectName . '|' . $data_obj->objectName; # unique str for this pair
+
+    $queue_data->{MAPPING}->{$map_str} = $temp_id;      # look up temp ID from query-data pair
+    $queue_data->{RESULTS}->{$temp_id} = {
+        MASTER => $data_obj,
+        CHILD => $query_obj,
+        ORBIT => undef,
+    };
+
+    # Stream the data to the mopsdiffcor input files.  First write IOD to the IOD file, then
+    # the complete track (detections for both objects) to the tracks file.  Use our temp
+    # ID for the mapping, so that we can relate this track to the query-data orbit pair.
+
+    # 1. IOD.  The data orbit is used as the IOD.
+    my $save_orbit_id = $data_orbit->orbitId;                       # save orig
+    $data_orbit->orbitId($temp_id);                                 # set to temp ID
+    $queue_data->{IOD_FH}->print($data_orbit->serialize(), "\n");   # write to IOD file
+    $data_orbit->orbitId($save_orbit_id);                           # restore
+
+    # 2. Tracks.  Concat all detections, sort by epoch, then write.
+    $queue_data->{TRACKS_FH}->print($PS::MOPS::DX::header_DETECTION, "\n");     # header line
+    my @all_dets = sort { 
+        $a->epoch <=> $b->epoch 
+    } ($data_obj->fetchDetections(), @query_orbit_dets);
+
+    foreach my $det (@all_dets) {
+        $queue_data->{TRACKS_FH}->print(join(" ",
+            $temp_id,                               # our temp ID for OD
+            $det->epoch,
+            'O',
+            $det->ra,
+            $det->dec,
+            mopslib_filt2V($det->mag, $det->filter, $v2filt),
+            $det->filter,
+            $det->obscode,
+            $det->raSigma * 3600,
+            $det->decSigma * 3600,
+            $det->magSigma,
+            $det->s2n,
+            'NA') . "\n"
+        );
+    }
+}
+
+
+sub run_od {
+    # Given a queue object created by init_od_queue(), prep for mopsdiffcor, then
+    # run mopsdiffcor and slurp the results.
+    my ($queue_data) = @_;
+    my $orbits_filename = 'orbitid.orbits';
+
+    # Close files.
+    $queue_data->{IOD_FH}->close();
+    $queue_data->{TRACKS_FH}->close();
+
+    # Run the differential correction.
+    my $cmd = "$diffcor_program --covariance $queue_data->{IOD_FNAME} $queue_data->{TRACKS_FNAME} $orbits_filename > /dev/null 2>&1";
+    my $ret = system $cmd;
+    $mops_logger->logdie("ORBITID diffcor failed: $cmd") unless $ret == 0;
+
+    # Slurp results.  For each line of ORBITS, slurp into an Orbit object and save with its
+    # input record.
+    my $orbits_fh = new FileHandle $orbits_filename or $mops_logger->logdie("can't open $orbits_filename");
+    my $line;
+    my $orb;
+    while ($line = <$orbits_fh>) {
+        $orb = modco_deserialize($inst, $line);                     # create Orbit obj from MIF-OC line
+        $queue_data->{RESULTS}->{$orb->orbitId}->{ORBIT} = $orb;    # save orbit
+    }
+    close $orbits_fh;
+}
+
+
+sub fetch_results {
+    my ($queue_data, $query_name, $data_name) = @_;
+    my $map_id = $query_name . '|' . $data_name;
+    #$mops_logger->logdie("can't lookup mapped ID for $map_id") unless exists(${$queue_data->{MAPPING}}{$map_id});
+    unless (exists(${$queue_data->{MAPPING}}{$map_id})) {
+        $mops_logger->logwarn("can't lookup mapped ID for $map_id.\n");
+        return;
+    }
+    return $queue_data->{RESULTS}->{$queue_data->{MAPPING}->{$map_id}};
+}
+
+
+sub build_match_table {
+    my %args = validate(@_, {
+        data => 1,              # data filename
+        queries => 1,           # queries filename
+        match => 1,             # matches filename
+    });
+
+    # Build a hash table whose keys are IDs of orbits in the queries
+    # file and whose values are lists (ARRAYREFs) of matching IDs
+    # from the data file.
+    my %match_n2d;          # "n2d" -> new to derived
+
+    # For now we have to re-read the entire input files so that we
+    # can fetch stuff by row number, as OrbitProximity does not
+    # report by ID (yet).
+    my @data;
+    my @queries;
+    my $line;
+
+    my $data_fh = new FileHandle;
+    open $data_fh, $args{data} or $mops_logger->logdie("can't open DATA fh $args{data}");
+    while (defined($line = <$data_fh>)) {
+        push @data, [split /\s+/, $line]->[-1];       # push last token (orbit name)
+    }
+    close $data_fh;
+
+    my $queries_fh = new FileHandle;
+    open $queries_fh, $args{queries} or $mops_logger->logdie("can't open QUERIES fh $args{queries}");
+    while (defined($line = <$queries_fh>)) {
+        push @queries, [split /\s+/, $line]->[-1];       # push last token (orbit name)
+    }
+    close $queries_fh;
+    
+    my $match_fh = new FileHandle;
+    my @stuff;
+    open $match_fh, $args{match} or $mops_logger->logdie("can't open MATCH fh $args{match}");
+    while (defined($line = <$match_fh>)) {
+        @stuff = split /\s+/, $line, 2;
+        push @{$match_n2d{@queries[$stuff[0]]}}, @data[$stuff[1]]; # first item=query line no; second=data line no
+    }
+    close $queries_fh;
+    return \%match_n2d;
+}
+
+
+sub orb2miti {
+    # Given the input orbit object, convert to a MITI string suitable as input to
+    # orbitProximity.
+    my ($orb) = @_;
+    return join " ", 
+        $orb->q, 
+        $orb->e,
+        $orb->i,
+        $orb->node,
+        $orb->argPeri,
+        $orb->timePeri,
+        $orb->hV, 
+        $orb->epoch, 
+        $orb->objectName;
+}   
+

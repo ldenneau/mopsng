@@ -1,0 +1,179 @@
+#!/usr/bin/env perl
+# $Id: insertSyntheticOrbits 3948 2010-03-15 22:18:22Z denneau $
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use File::Slurp;
+
+use Astro::Time;
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DX;
+
+
+use subs qw(
+    unpack_epoch
+    mpcorb2des
+);
+
+
+# Astronomical constants; ref http://ssd.jpl.nasa.gov/astro_constants.html
+##my $m_per_AU = 1.49597870691e11;     # m
+##my $GM = 1.32712440018e20;           # m3/s2
+##my $PI = atan2(1, 0) * 2;            # pi
+
+
+## MPC packed converters.
+my $i;
+our $char2month_str = '123456789ABC';
+$i = 1;
+our %char2month = map { $_ => $i++ } split //, $char2month_str;
+
+$i = 1;
+our $char2day_str = '123456789ABCDEFGHIJKLMNOPQRSTUV';
+our %char2day = map { $_ => $i++ } split //, $char2day_str;
+
+
+# Start program here.
+my $quiet;
+my $help;
+my $seen;
+GetOptions(
+    quiet => \$quiet,
+    seen => \$seen,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+pod2usage(2) if not @ARGV;
+
+if ($seen) {
+    print $PS::MOPS::DX::header_ORBIT, "\n";
+}
+
+my $line;
+my @fields;
+while (defined($line = <>)) {
+    if ($line =~ /^----/ or $line =~ /^Object/) {
+        $seen = 1;      # start of data
+        print $PS::MOPS::DX::header_ORBIT, "\n";
+        next;
+    }
+    elsif ($line =~ /^\s*$/) {
+        next;   # blank, skip
+    }
+    next unless $seen;
+
+    chomp $line;
+    @fields = split /\s+/, $line;
+    eval {
+        my $des_line = mpcfields2des(@fields);
+        print $des_line, "\n";
+    };
+    if ($@) {
+        print STDERR "Problem with $line: $@\n";
+    }
+}
+exit;
+
+
+sub mpcfields2des {
+    # Given a split line from MPCORB.DAT, convert to DES.
+    my @fields = @_;
+
+
+    my ($desig, $H, $G, $packed_epoch, $M, $argPeri, $node, $incl, $e, $n, $a) = @fields;
+    my $epoch_mjd = packedepoch2mjd($packed_epoch);
+
+    # Do some conversions.  RJ provides a, not q; and M, not tau.
+    my $a_au = $a;   # semi-major axis in AU
+    my $a_m = $a_au * $METERS_PER_AU;
+
+    my $q = $a_au * (1 - $e);
+    my $tp;
+    if ($M > 180) {
+        $tp = $epoch_mjd - ($M - 360) / $n;
+    }
+    else {
+        $tp = $epoch_mjd - $M / $n;  # tau = epoch - M / n
+    }
+
+    # Now make DES string.
+    my $des_str = join(' ',
+        $desig,
+        'COM',
+        $q,
+        $e,
+        $incl,
+        $node,
+        $argPeri,
+        $tp,
+        $H,
+        $epoch_mjd,
+        1,
+        6,
+        -1,
+        'MOPS'
+    );
+}
+
+
+sub packedepoch2mjd {
+    my ($packed_epoch) = @_;
+
+    # Convert MPC packed dates of the format K107N to an MJD.
+    die "can't suss format of $packed_epoch" unless $packed_epoch =~ /^([IJKL])(\d\d)(\w)(\w)(\d*)$/;
+    my $pcen = $1;
+    my $pyr = $2;
+    my $pmon = $3;
+    my $pday = $4;
+    my $pfrac = $5 || 0;
+
+    my $year = 1800 + (ord($pcen) - ord('I')) * 100 + $pyr;
+    my $mon = $char2month{$pmon} or die "can't convert month $pmon";
+    my $day = $char2day{$pday} or die "can't convert day $pday";
+    my $frac = $pfrac / (10 ** length($pfrac));
+
+    # Convert calendar date to MJD.
+    my $mjd = cal2mjd($day, $mon, $year, $frac);
+    return $mjd;
+}
+
+
+=head1 NAME
+
+mpcorb2des - Program to convert MPC's MPCORB.DAT file to DES format
+
+=head1 SYNOPSIS
+
+mpcorb2des MPCORB.DAT > MPCORB.DES
+
+  --seen : skip the header (sets internal variable $seen)
+
+=head1 DESCRIPTION
+
+The only complicated thing is to convert the packet epoch format and convert mean anomaly
+to time of perihelion.
+
+MPCORB.DAT is formatted:
+
+[Header fluff]
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+00001    3.34  0.12 K107N 113.41048   72.58976   80.39321   10.58682  0.0791382  0.21432817   2.7653485  0 MPO110568  6063  94 1802-2006 0.61 M-v 30h MPCW       0000      (1) Ceres              20061025
+00002    4.13  0.11 K107N  96.14829  310.15090  173.12949   34.84091  0.2309995  0.21353950   2.7721533  0 MPO135420  7253  93 1827-2008 0.59 M-v 28h MPCW       0000      (2) Pallas             20080101
+00003    5.33  0.32 K107N  32.09611  248.10804  169.91138   12.98211  0.2549812  0.22589931   2.6700913  0 MPO135420  6278  91 1824-2008 0.60 M-v 38h MPCW       0000      (3) Juno               20080308
+00004    3.20  0.32 K107N 307.80111  149.83731  103.90970    7.13407  0.0886225  0.27152411   2.3619124  0 MPO135420  6449  82 1827-2007 0.60 M-v 18h MPCW       0000      (4) Vesta              20070808
+00005    6.85  0.15 K107N 239.04556  358.35340  141.64423    5.36884  0.1904177  0.23823543   2.5771032  0 MPO 41498  2178 100 1845-2002 0.56 M-v 38h Goffin     0000      (5) Astraea            20021114
+00006    5.71  0.24 K107N 331.77097  239.35969  138.74019   14.75228  0.2026188  0.26089412   2.4256410  0 MPO135420  5011  81 1848-2008 0.55 M-v 38h MPCW       0007      (6) Hebe               20080222
+00007    5.51  0.15 K107N   4.63161  145.17384  259.66157    5.52346  0.2305487  0.26748589   2.3856247  0 MPO135420  4443  76 1848-2008 0.60 M-v 38h MPCW       0000      (7) Iris               20080308
+00008    6.49  0.28 K107N 309.28594  285.24976  110.95525    5.88820  0.1568436  0.30170750   2.2016350  0 MPO 25662  2438 102 1847-2000 0.54 M-v 38h Goffin     0000      (8) Flora              20001115
+00009    6.28  0.17 K107N 141.42944    6.26642   68.94869    5.57477  0.1223679  0.26737617   2.3862774  0 MPO 25662  2131  96 1822-2001 0.54 M-v 38h Goffin     0000      (9) Metis              20011024
+...
+
+=head1 SEE ALSO
+
+http://www.minorplanetcenter.org/iau/info/MPOrbitFormat.html
+
+=cut

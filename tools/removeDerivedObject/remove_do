@@ -1,0 +1,104 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+remove_do - Flags the indicated derived objects as killed, and updates the 
+            appropriate history tables.
+
+=head1 SYNOPSIS
+
+remove_do [options] [DERIVEDOBJ_IDS]
+
+  DERIVEDOBJ_IDS : list of MOPS derived object IDs to remove
+  --inst : simulation to remove derived objects from
+
+  remove_do --instance psmops_ps1_mdrm137 72904 72906 72910
+
+=head1 DESCRIPTION
+
+Sets the status of indicated derived objects to DERIVEDOBJECT_STATUS_KILLED (K).
+In addition it will update the relevant history tables to reflect the removal
+of the derived object(s)
+
+=cut
+
+use strict;
+use warnings;
+#use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+
+# Just a stub for quick debugging.
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::DerivedObject qw(:all);
+use PS::MOPS::DC::Tracklet;
+use PS::MOPS::DC::History::Removal qw(:all);
+use PS::MOPS::DC::History qw(:all);
+
+# Start program here.
+my $instance_name;
+my $debug;
+my $help;
+GetOptions(
+    'inst=s' => \$instance_name,
+    debug => \$debug,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $logger = $inst->getLogger();
+my $dbh = $inst->dbh;
+
+my @dobj_ids = @ARGV;
+my $dobj;
+my $event;
+my $event_ref;
+
+foreach my $id (@dobj_ids) {
+    # Retrieve the derived object and set its status to killed.
+    $dobj = modcdo_retrieve($inst, derivedobjectId => $id);
+    if ($dobj->status eq $DERIVEDOBJECT_STATUS_KILLED) {
+         next;  #Skip removal if DO has already been removed.
+    }
+    $dobj->status($DERIVEDOBJECT_STATUS_KILLED);
+    $logger->info(sprintf "REMOVE_DO: Set status of derived object %d to %s", 
+                $id,
+                $DERIVEDOBJECT_STATUS_KILLED);
+    
+    # Fetch the most recent modifying event for the derived object and 
+    # save it in the last_event_id
+    my @last_evt = $dbh->selectrow_array(<<"SQL", undef, $id); 
+select event_id 
+from history h 
+where h.derivedobject_id=? and h.classification in ('N', 'C') 
+order by event_id desc 
+limit 1 
+SQL
+
+    # Get the history event associated with the last event id.
+    $event_ref = modch_retrieve($inst, eventId => $last_evt[0]); 
+    
+    # Record removal event in history tables.
+    $event = PS::MOPS::DC::History::Removal->new(
+        $inst,
+        eventType => $EVENT_TYPE_REMOVAL,
+        derivedobjectId => $dobj->derivedobjectId, 
+        orbitId => $dobj->orbitId, 
+        orbitCode => $event_ref->{orbitCode}, 
+        classification => $dobj->classification, 
+        fieldId => $event_ref->{fieldId},                
+        ssmId => $dobj->ssmId,
+        objId => $dobj->derivedobjectId,
+        objType => $TYPE_DERIVED
+    );
+    $event->record;
+        
+    # Set the status of the tracklets that make up the derived object to 
+    # unattributed.
+    my @trks = $dobj->fetchTracklets();
+    foreach my $trk (@trks) {
+        $trk->status($TRACKLET_STATUS_UNATTRIBUTED);
+    }
+}

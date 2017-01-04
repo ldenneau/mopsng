@@ -1,0 +1,27 @@
+#!/bin/sh
+
+
+# Orbits
+wget http://www.minorplanetcenter.net/iau/MPCORB/MPCORB.DAT.gz
+wget http://www.minorplanetcenter.net/iau/MPCORB/CometEls.txt
+#wget http://www.minorplanetcenter.net/iau/Ephemerides/Comets/Soft00Cmt.txt
+wget http://ssd.jpl.nasa.gov/dat/ELEMENTS.COMET
+
+# Observations
+wget http://www.minorplanetcenter.net/iau/ECS/MPCAT-OBS/NumObs.txt.gz
+wget http://www.minorplanetcenter.net/iau/ECS/MPCAT-OBS/UnnObs.txt.gz
+wget http://www.minorplanetcenter.net/iau/ECS/MPCAT-OBS/CmtObs.txt.gz
+
+
+# In theory these files can help associate identifications into the same object.
+# (why can't MPC do this for us?)
+# MPCAT files
+wget http://www.minorplanetcenter.net/iau/ECS/MPCAT/mpn.txt
+wget http://www.minorplanetcenter.net/iau/ECS/MPCAT/mpu.txt
+wget http://www.minorplanetcenter.net/iau/ECS/MPCAT/mpo.txt
+# wget http://www.minorplanetcenter.net/iau/ECS/MPCAT/mp1.txt
+
+# Identifications
+wget http://www.minorplanetcenter.net/iau/ECS/MPCAT/ids.txt
+wget http://www.minorplanetcenter.net/iau/ECS/MPCAT/dbl.txt
+wget http://www.minorplanetcenter.net/iau/ECS/MPCAT/numids.txt

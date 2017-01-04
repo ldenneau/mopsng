@@ -1,0 +1,309 @@
+#!/usr/bin/env python
+
+from __future__ import division
+
+import os
+import sys
+import subprocess
+import math
+import time
+import re
+import numpy
+
+
+DAYS_PER_SECOND = 1.0 / 86400
+SQRT2_DIV_2 = math.sqrt(2) / 2
+debug = 0
+
+
+def debugmsg(msg):
+    if debug:
+        sys.stderr.write(msg + "\n")
+
+
+def msg(msg):
+    sys.stderr.write(msg + "\n")
+
+
+def numbered2desig(name):
+    # Convert numbered asteroid to packed designation.
+    foo = '0123456789ABCDEFGHIJKLMNOPQRST'
+    num = int(name)
+    return foo[int(num / 10000)] + ("%04d" % (num % 10000))
+
+
+def unnumbered2desig(yr, half, second, cycle):
+    # Take a name of the form 2004, M, N, 4 and convert it to
+    # K04M04N.
+    if cycle is None:
+        cycle = 0   # handle cases like 1995XA
+    foo = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+    a = chr(ord('I') + int(int(yr) / 1000)) 
+    b = ("%02d" % (int(yr) % 100)) + half
+    c = (foo[int(int(cycle) / 10)] + str(int(cycle) % 10)) + second
+    return a + b + c
+
+
+def comet2desig(yr, half, frag, num):
+    # Take a name of the form 2004, M, 4 and convert it to
+    # K04M4N.
+    if frag is None:
+        frag = '0'
+    foo = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+    a = chr(ord('I') + int(int(yr) / 1000)) 
+    b = ("%02d" % (int(yr) % 100)) + half
+    c = (foo[int(int(cycle) / 10)] + str(int(cycle) % 10)) + frag.lower()
+    return a + b + c
+
+
+def get_mpec_elems(lines):
+    # Given a string containing an MPEC's HTML contents, scrape orbital elements from it.
+    # For an example MPEC, see view-source:http://www.minorplanetcenter.org/mpec/K10/K10T79.html.
+
+    # Want to return a list of orbit information:
+    # [
+    #   name,
+    #   [ q, e, i, 
+    # ]
+
+    found_ast = False
+    found_comet = False
+
+    for i in range(len(lines)):
+        if re.match(r'Orbital elements:', lines[i]):
+            found_ast = 1
+
+            # Get ID, then place i on Epoch line
+            i += 1
+            id = lines[i][0:30]
+            id = re.sub(r'\s+', '', id)
+            i += 1
+            break
+        if re.match(r'Perihelion', lines[i]):
+            found_comet = 1
+            i -= 1
+
+            # Get ID, then place i on Perihelion line
+            id = lines[i][0:30]
+            id = re.sub(r'\s+', '', id)
+            i += 1
+            break
+    # for
+
+    # We require a very specific sequence following. Probably this will
+    # break for some comets or hyperbolic orbits.
+
+    if found_ast:
+        # Epoch
+        epoch_match = re.match(r'Epoch.*JDT\s+([\d\.]+)', lines[i])
+        if not epoch_match:
+            raise RuntimeError("couldn't get epoch")
+        epoch_mjd = float(epoch_match.group(1)) - 2400000.5     # JD to MJD
+        i += 1
+
+        # Mean anomaly
+        m_match = re.match(r'M\s+([\d\.-]+)', lines[i])
+        if not m_match:
+            raise RuntimeError("couldn't get mean anomaly")
+        M = float(m_match.group(1))
+        i += 1
+
+        # Mean motion, argPeri
+        n_match = re.match(r'n\s+([\d\.-]+)\s+Peri\.\s+([\d\.-]+)', lines[i])
+        if not n_match:
+            raise RuntimeError("couldn't get node and arg peri")
+        n = float(n_match.group(1))
+        arg_peri = float(n_match.group(2))
+        i += 1
+
+        # a, node
+        a_match = re.match(r'a\s*([\d\.]+)\s+Node\s+([\d\.-]+)', lines[i])
+        if not a_match:
+            raise RuntimeError("couldn't get a and node")
+        a = float(a_match.group(1))
+        node = float(a_match.group(2))
+        i += 1
+
+        # e, incl
+        e_match = re.match(r'e\s+([\d\.]+)\s+Incl\.\s+([\d\.-]+)', lines[i])
+        if not e_match:
+            raise RuntimeError("couldn't get e and incl")
+        e = float(e_match.group(1))
+        incl = float(e_match.group(2))
+        i += 1
+
+        # P, H
+        p_match = re.match(r'P\s+([\d\.]+)\s+H\s+([\d\.-]+)', lines[i])
+        if not p_match:
+            raise RuntimeError("couldn't get P and H")
+        p = float(p_match.group(1))
+        h_V = float(p_match.group(2))
+        i += 1
+
+        # Convert M and n to time_peri
+        if e >= 1:
+            raise RuntimeError("got e >= 1: " + str(e) + "\n")
+        q = a * (1 - e)
+        if M > 180:
+            time_peri_mjd = epoch_mjd - (M - 360) / n
+        else:
+            time_peri_mjd = epoch_mjd - M / n
+
+    elif found_comet:
+        # Perihelion, time_peri
+        peri_match = re.match(r'Perihelion.*JD\s+([\d\.]+)', lines[i])
+        if not peri_match:
+            raise RuntimeError("couldn't get perihelion")
+        time_peri_mjd = float(peri_match.group(1)) - 2400000.5     # JD to MJD
+        i += 1
+
+        # Epoch
+        epoch_match = re.match(r'Epoch.*JDT\s+([\d\.]+)', lines[i])
+        if not epoch_match:
+            raise RuntimeError("couldn't get epoch")
+        epoch_mjd = float(epoch_match.group(1)) - 2400000.5     # JD to MJD
+        i += 1
+
+        # Mean anomaly
+        m_match = re.match(r'M\s+([\d\.-]+)', lines[i])
+        if not m_match:
+            raise RuntimeError("couldn't get mean anomaly")
+        M = float(m_match.group(1))
+        i += 1
+
+        # Mean motion, argPeri
+        n_match = re.match(r'n\s+([\d\.-]+)\s+Peri\.\s+([\d\.-]+)', lines[i])
+        if not n_match:
+            raise RuntimeError("couldn't get node and arg peri")
+        n = float(n_match.group(1))
+        arg_peri = float(n_match.group(2))
+        i += 1
+
+        # a, node
+        a_match = re.match(r'a\s*([\d\.]+)\s+Node\s+([\d\.-]+)', lines[i])
+        if not a_match:
+            raise RuntimeError("couldn't get a and node")
+        a = float(a_match.group(1))
+        node = float(a_match.group(2))
+        i += 1
+
+        # e, incl
+        e_match = re.match(r'e\s+([\d\.]+)\s+Incl\.\s+([\d\.-]+)', lines[i])
+        if not e_match:
+            raise RuntimeError("couldn't get e and incl")
+        e = float(e_match.group(1))
+        incl = float(e_match.group(2))
+        i += 1
+
+        # P
+        p_match = re.match(r'P\s+([\d\.]+)', lines[i])
+        if not p_match:
+            raise RuntimeError("couldn't get P")
+        p = float(p_match.group(1))
+        h_V = 10.0  # fake H
+
+        # q
+        q_match = re.search(r'q\s+([\d\.]+)', lines[i])
+        if not q_match:
+            raise RuntimeError("couldn't get q")
+        q = float(q_match.group(1))
+        i += 1
+
+    # <- if
+
+    res = [
+       id,
+       'COM',   # DES item
+       q, e, incl, node, arg_peri, time_peri_mjd,
+       h_V,
+       epoch_mjd,
+       1, 6, -1, 'MOPS'
+    ]
+    return res
+
+
+def fetch_orbit_stuff(filenames):
+    """ 
+    Given a something, return orbit elements from DES-formatted line.  Columns are
+    OID FORMAT q e i Omega argperi t_p H t_0 INDEX N_PAR MOID COMPCODE 
+    If the name looks like an asteroid or coment name, grab that from
+    MPCORB.DES, otherwise assume the something is a file name.
+    """
+
+    list_of_elems = []
+    if not filenames:
+        filenames = ['-']      # stdin
+
+    for filename in filenames:
+        des_elems = None
+
+        desig_match = re.match(r'^([A-Z]\d\d\w+)', filename)
+        numbered_match = re.match(r'^\(?(\d+)\)?$', filename)
+        unnumbered_match = re.match(r'^(\d\d\d\d)([A-Z])([A-Z])(\d*)', filename)
+        comet_match = re.match(r'^(\d\d\d\d)([A-Z])(\d+)(\w?)', filename)
+        desig = None
+
+        # If we're given an MPEC URL, grab it and scrap the orbital elements form it.
+        if filename == '-':
+            contents = sys.stdin.readlines()
+
+        elif re.search(r'\.mpc$', filename):
+            contents = file(filename).readlines()
+
+        elif re.search(r'\.html$', filename):
+            import urllib
+            if not re.match(r'http://', filename):
+                prefix_match = re.match(r'([IJK]\d\d)', filename)
+                if prefix_match:
+                    filename = "http://www.minorplanetcenter.org/mpec/" + prefix_match.group(1) + '/' + filename
+                    sys.stderr.write("Using URL " + filename + ".\n")
+                else:
+                    raise RuntimeError("Can't handle partial MPEC URL " + filename)
+            # endif
+
+            f = urllib.urlopen(filename)
+            contents = f.readlines()
+        # <- if
+
+        try:
+            des_elems = get_mpec_elems(contents)
+        except Exception, e:
+            sys.stderr.write("Couldn't get orbit from " + filename + ": " + str(e) + "\n")
+        list_of_elems.append(des_elems)
+    # for filename
+
+    return list_of_elems
+
+
+if __name__ == '__main__':
+    import optparse
+    import sys
+    
+    
+    # Constants
+    USAGE = """\
+Usage: mpecorb2des [options] THING
+
+  THING : full or partial MPEC URL; MPC designation; or DES file containing orbital elements, if '-' use STDIN
+  --help : show this help page
+ """
+    
+    # Get user input (tracks file) and make sure that it exists.
+    parser = optparse.OptionParser(USAGE)
+    options, args = parser.parse_args()
+
+#    if len(args) < 1:
+#        parser.error('No orbit file specified.')
+
+    # Fetch orbital elements.
+    orbit_stuff = fetch_orbit_stuff(args)
+
+    # Print DES stuff.
+    printed_header = False
+    for o in orbit_stuff:
+        if not printed_header:
+            print "!!OID FORMAT q e i Omega argperi t_p H t_0 INDEX N_PAR MOID COMPCODE"
+            printed_header = True
+        print ' '.join([str(x) for x in o])
+
+# <-- if __name__

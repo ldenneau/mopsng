@@ -1,0 +1,135 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Cwd qw(abs_path getcwd);
+use Pod::Usage;
+use Getopt::Long;
+use File::Temp qw(tempfile);
+use File::Basename;
+
+
+my $IODX_DIR = "$ENV{MOPS_HOME}/bin/iod.x";
+-d $IODX_DIR or die "not a directory: $IODX_DIR";
+my $IODX = "$IODX_DIR/iod.x";
+-x $IODX or die "can't locate $IODX";
+
+my $cmd = 'ggggg';      # five Gaussian iterations
+my $constraints;
+my $out;                # output file (optional)
+my $help;
+GetOptions(
+    'cmd=s' => \$cmd,           # FIND_ORB/iod.x command sequence
+    'constraints=s' => \$constraints,   # FIND_ORB/iod.x -l orbit constraints
+    'out=s' => \$out,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+=pod
+Plan:
+
+* If input is STDIN, write to a temp file
+* Get full path to input file
+* 
+=cut
+
+my $inpfile;
+my $tmpinpfile;     # temp input file
+my $oldwd;
+
+$inpfile = shift;   # might be empty, that's OK
+unless ($inpfile) {
+    # Input file not specified, so slurp STDIN and write to tmp file. 
+    my $tmpfh;
+    ($tmpfh, $tmpinpfile) = tempfile('/tmp/iodxXXXXXX', UNLINK => 1);
+    my @stuff = <STDIN>;    # slurp all STDIN
+    print $tmpfh @stuff;    # copy to tmpinput file
+    close $tmpfh;
+    $inpfile = $tmpinpfile;
+}
+$inpfile = abs_path($inpfile);  # convert to full abs path, need it after chdir
+
+# Invoke iod.x 
+my $res;
+eval {
+    $oldwd = getcwd;    # get current working dir
+    chdir $IODX_DIR or die "can't chdir to $IODX_DIR";  # chg to iod.x home dir
+
+    # Constraints option string.
+    my $constraints_opts = '';
+    if ($constraints) {
+        $constraints_opts = "-l $constraints";
+    }
+
+    open my $iodxfh, "$IODX -t 10 $constraints_opts $inpfile - $cmd|" or die "can't execute $IODX";
+    $res = <$iodxfh>;    # read line of output
+    close $iodxfh;
+    $res ||= "EFAIL\n";   # unknown general error
+};
+
+# Clean up.
+chdir $oldwd or warn "can't restore working dir to $oldwd";
+die $@ if $@;                       # handle eval{} error
+
+# Now output stuff.
+if ($out) {
+    open my $fh, ">$out" or die "can't open $out";
+    print $fh $res;
+    close $fh;
+}
+else {
+    print $res; # pass to STDOUT
+}
+
+=head1 NAME
+
+iod - Wrapper for iod.x (find_orb/dos_find) executable
+
+=head1 SYNOPSIS
+
+iod [--cmd IOD_CMD] [--out OUTFILE] [infile]
+  --cmd IOD_CMD : use IOD_CMD as FIND_ORB command sequence, default 'ggggg'
+    (five Gaussian iterations)
+  --out OUTFILE : write output to OUTFILE instead of STDOUT
+
+Examples:
+
+  iod --cmd gggg < obs_file > iodfile
+  iod infile > iodfile
+  iod --out iodfile < infile
+  iod --out iodfile infile
+
+=head1 DESCRIPTION
+
+This program wraps the execution of the iod.x (derived from FIND_ORB)
+so that the caller does not have to worry about home directory issues.
+The problem is that FIND_ORB needs to run out of its compilation directory
+because it reads many of the files there (and unfortunately writes a
+few as well).
+
+The wrapped version manages changing of directories and creation of
+temporary directories and files if necessary, and routes input from
+STDIN and to STDOUT.
+
+The input file is an MPC-format list of detections or tracks.  Later there
+may be support for additional formats, such as MITI or XML something.
+
+Output is a single line consisting of list of orbital elements,
+as follows:
+
+    Perihelion distance q (AU)
+    Eccentricity e
+    Inclination i (deg)
+    Longitude of ascending node Om (deg)
+    Argument of perihelion w (deg)
+    Time of perihelion (MJD)
+    Epoch (MJD)
+    Residual (?units?)
+
+=head1 BUGS
+
+FIND_ORB writes files into its installation directory, which probably
+precludes multiple instances from running simultaneously on the same
+machine.  Don't do this.

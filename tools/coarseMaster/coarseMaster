@@ -1,0 +1,298 @@
+#!/usr/bin/env python
+"""
+coarseMaster
+
+
+Poor man parallelization. This is throw-away code!
+
+
+Note
+Once coarseEphem starts it reads a ~65 MB JPL file every time it starts. This 
+could be an issue with NFS mounted disks. This requires staggering the calls on
+system that use NFS.
+"""
+import copy
+import os
+import sys
+import tempfile
+import time
+import atexit
+
+import MOPS.Instance
+import MOPS.Condor
+from MOPS.Lib import waitForFiles
+
+
+# Globally-scoped auto-delete filehandle.
+_TEMP_FILEHANDLES = []
+_CLEANUP_FILENAMES = []
+
+
+
+# Constants
+
+
+# Maximum number of bytes to read from a file at once. Set this to 0 to read the
+# whole file into memory.
+READ_BLOCK = 1024 * 1024
+
+# How many seconds/fractions of a secon to wait before starting the next process
+STAGGERING_TIME = 5.
+#STAGGERING_TIME = 2.
+
+
+
+def cleanup():
+    """
+    atexit() handler to remove all files in _CLEANUP_FILENAMES.
+    """
+    for file in _CLEANUP_FILENAMES:
+        if(os.path.exists(file)):
+            os.remove(file)
+
+
+def isTruncated(fileName):
+    """
+    Return True if fileName appears to be truncated, False otherwise. The test
+    to see whethet fileName is truncated or not is to seek to the last char in
+    the file and see if that last char is a '\n' or not. If it is a '\n' then
+    the file is likely not to be truncated.
+    
+    Of course, we cannot be sure.
+    """
+    f = file(fileName)
+    try:
+        f.seek(-1, 2)
+    except:
+        return(False)
+    truncated = f.read() != '\n'
+    f.close()
+    return(truncated)
+
+
+
+def coarseMaster(inst, files, fieldsfile, obscode, delta_mjd, limiting_mag, out, nodelete, sleep,
+                 epoch, verbose):
+    """
+    
+    """
+    # Input file names have the format root.$(Process). Output  file names are
+    # set to root.out.$(Process) (in Condor parlance).
+    
+    # Since we will need to concatenate the output files back into a single one,
+    # we do need to know their names. Luckily, we decide the name ourselves in
+    # the job description instance.
+    localOutFiles = []
+    for localInput in files:
+        (root, index) = localInput.split('.')
+        outFile = '%s.out.%d' %(root, int(index))
+        localOutFiles.append(outFile)
+        _CLEANUP_FILENAMES.append(outFile)
+    # <-- end for
+    
+    # Create a job instance.
+    #LOCAL_MOPS_HOME = os.environ['MOPS_HOME']
+    LOCAL_MOPS_HOME = inst.getEnvironment('HOMEDIR')
+    if not LOCAL_MOPS_HOME:
+        LOCAL_MOPS_HOME = os.environ['MOPS_HOME']
+
+    cmd = os.path.join(LOCAL_MOPS_HOME, 'bin', 'ephem_pipeline.py')       # path on master system
+    job = MOPS.Condor.Job(
+        inst,
+        universe='vanilla',
+        executable=cmd,
+        queue=len(files))
+
+    job.add_arg('--obscode')
+    job.add_arg(str(obscode))
+    job.add_arg('--delta_mjd')
+    job.add_arg(str(delta_mjd))
+    job.add_arg('--limiting_mag')
+    job.add_arg(str(limiting_mag))
+    job.add_arg('--epoch')
+    job.add_arg(str(epoch))
+    job.add_file_arg('%s.$(Process)' %(root))   # coarseEphem input.
+    job.add_file_arg(fieldsfile)                # fieldProximity input.
+    job.add_arg('%s.out.$(Process)' %(root))
+
+#    job.set_stderr_file(os.path.join(inst.getEnvironment('LOGDIR'), 'stderr.$(Process)'))
+#    job.set_stdout_file(os.path.join(inst.getEnvironment('LOGDIR'), 'stdout.$(Process)'))
+    job.set_stderr_file('stderr.%s.$(Process)' % (root,))
+    job.set_stdout_file('stdout.%s.$(Process)' % (root,))
+    job.set_sub_file('%s.condorjob' %(root))
+    job.set_log_file('%s.condorlog' %(root))
+
+    job.transfer_files = True
+    job.initial_dir = os.getcwd()
+
+    # Submit the job and wait until it is done.
+    err = MOPS.Condor.submit(job, removeJobFile=False)
+
+    # Wait for the output files to show up.
+    waitForFiles(localOutFiles)
+    
+    # Concatenate the output files into out.
+    outFile = file(out, 'w')
+    missing = copy.copy(localOutFiles)
+    
+    for localOutFile in localOutFiles:
+        if(os.path.exists(localOutFile)):
+            f = file(localOutFile)
+            data = f.read(READ_BLOCK)
+            while(data):
+                outFile.write(data)
+                data = f.read(READ_BLOCK)
+            #<-- end while
+            f.close()
+            outFile.flush()
+                
+            # Remove the file and pop it from localOutFile
+            # os.remove(localOutFile)
+            missing.remove(localOutFile)
+        # <-- end if
+    # <-- end for
+    sys.stderr.write("Building output file %s.\n" %(out))
+    outFile.close()
+
+    # If we still have some file left, we have a problem: condor transfers
+    # all the files once the jobs are done!
+    if missing:
+        raise RuntimeError("These files are missing: %s." % str(missing))
+    # <-- end if
+    return
+
+
+def checkFileNames(fileNames):
+    """
+    Make sure that the names in fileNames follow the convention
+    name.0
+    name.1
+    name.2
+    ...
+
+    and rename them accordingly if they do not. Return the 'correct' file names.
+    """
+    new = []
+    root = fileNames[0].split('.')[0]
+
+    i = 0
+    for name in fileNames:
+        newName = '%s.%d' %(root, i)
+        if(name != newName):
+#            print(name, newName)
+            os.rename(name, newName)
+            new.append(newName)
+        else:
+            new.append(name)
+        # <-- end if
+        i += 1
+    # <-- end for
+    return(new)
+    
+
+
+
+
+if(__name__ == '__main__'):
+    import optparse
+
+    
+    # Constants
+    USAGE = """\
+usage: coarseMaster --fieldsfile FILENAME --epoch EPOCH 
+    [--obscode=OBS] [--delta_mjd=T] [--limitingMag=MAG] [--sleep=TIME] 
+    nodefile1 nodefile2 ...
+
+  --fieldsfile=FILENAME : file containing field positions for FieldProximity
+  --epoch=EPOCH : EPOCH of ephemeris calculation
+  --obscode=OBS : MPC observatory code, required
+  --delta_mjd=T : +/- time deltas for ephemers, default 1.0
+  --limiting_mag=MAG : limiting mag for filtering observations, default 25.0
+  --sleep=TIME : set sleep duration, in seconds
+  --out=OUTFILE : write output to OUTFILE
+  --nodelete : don't remove input files (delete them by default)
+  nodefile1 nodefile2 ... : nsplitted files containing orbit definitions"""
+    
+    # Get user input (tracks file) and make sure that it exists.
+    parser = optparse.OptionParser(USAGE)
+    parser.add_option('--instance_name',
+                      dest='instance_name',
+                      type='string',
+                      help="MOPS simulation instance name to use")
+    parser.add_option('--split_file',
+                      dest='split_file',
+                      type='string',
+                      help="nsplit output containing job names")
+    parser.add_option('--obscode',
+                      dest='obscode',
+                      type='string',
+                      help="MPC observatory code, required")
+    parser.add_option('--delta_mjd',
+                      dest='delta_mjd',
+                      type='float',
+                      default=1.,
+                      help="+/- time deltas for ephemers. def 1.0")
+    parser.add_option('--limiting_mag',
+                      dest='limiting_mag',
+                      type='float',
+                      default=25.,
+                      help="limiting mag for filtering observations. def 25.0")
+    parser.add_option('--epoch',
+                      dest='epoch',
+                      type='float',
+                      help="EPOCH of ephemeris calculation")
+    parser.add_option('--fieldsfile',
+                      dest='fieldsfile',
+                      help="field definitions for FieldProximity")
+    parser.add_option('--out',
+                      dest='out',
+                      help="write output to OUTFILE")
+    parser.add_option('--nodelete',
+                      dest='nodelete',
+                      action='store_true',
+                      default=False,
+                      help="don't remove input files (delete them by default)")
+    parser.add_option('--sleep',
+                      dest='sleep',
+                      type='float',
+                      default=0.5,
+                      help="set sleep duration, in seconds. def 10")
+    parser.add_option('--verbose',
+                      dest='verbose',
+                      action='store_true',
+                      default=False,
+                      help="increase verbosity level (quiet by default)")
+    
+    # Ger the command line options and also whatever is passed on STDIN.
+    (options, args) = parser.parse_args()
+
+    if args:
+        # Add files specified on cmd line as well.
+        files = args
+    else:
+        if not options.split_file:
+            files = [f.strip() for f in sys.stdin.readlines()]
+        else:
+            files = [f.strip() for f in open(options.split_file).readlines()]
+
+
+    # Set up our operating environment.
+    inst = MOPS.Instance.Instance(dbname=options.instance_name or os.environ['MOPS_DBINSTANCE'])
+    
+    # Make sure that the files have the right naming.
+    files = checkFileNames(files)
+    
+    # Invoke the main routine and then exit.
+    atexit.register(cleanup)
+    sys.exit(coarseMaster(inst,
+      files, 
+      fieldsfile=options.fieldsfile,
+      obscode=options.obscode,
+      delta_mjd=options.delta_mjd,
+      limiting_mag=options.limiting_mag,
+      out=options.out,
+      nodelete=options.nodelete,
+      sleep=options.sleep,
+      epoch=options.epoch,
+      verbose=options.verbose))
+# <-- end if

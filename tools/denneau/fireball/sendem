@@ -1,0 +1,48 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+use Astro::Time;
+use MIME::Lite;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::IPPDB;
+
+
+my $instance_name;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $RECIP = shift @ARGV || 'dclark56@uwo.ca';
+#my $RECIP = 'larryd@pangalactic.com';
+my $IPPDB = '/home/denneau/bin/ippdb';
+my $mjd = int(now2mjd());
+my $FILE = sprintf '/home/denneau/work/fireball/latest.%d.txt', $mjd;
+
+# Send exposures from last night.
+system(qq{echo "select exp_name, dateobs, ra ra_deg, decl dec_deg, exp_time exp_time_sec, left(filter,1) filter, obs_mode, obs_group, comment from rawExp where dateobs > addtime(now(),'-48:00:00') and dateobs < addtime(now(), '-24:00:00') and obs_mode != 'ENGINEERING'" | $IPPDB > $FILE}) == 0 or die "query failed: $?";
+
+my $msg = MIME::Lite->new(
+    From => 'denneau@ifa.hawaii.edu',
+    To => $RECIP,
+    Subject => 'Latest PS1 exposures',
+    Type => 'multipart/mixed',
+);
+
+$msg->attach(
+    Type     => 'text/plain',
+    Path     => $FILE,
+    Filename => (sprintf "latest.%d.txt", $mjd),
+    Disposition => 'attachment'
+);
+
+$msg->send;
+exit;

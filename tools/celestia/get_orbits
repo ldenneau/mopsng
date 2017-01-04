@@ -1,0 +1,8 @@
+#!/bin/sh
+
+wget http://www.minorplanetcenter.net/iau/lists/Apollos.html
+wget http://www.minorplanetcenter.net/iau/lists/Atens.html
+wget http://www.minorplanetcenter.net/iau/lists/Amors.html
+
+grep ^Designation Atens.html > F51
+grep -h -w F51 Apollos.html Atens.html Amors.html >> F51

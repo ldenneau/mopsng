@@ -1,0 +1,116 @@
+#!/usr/bin/env perl
+
+# $Id: dsep 4265 2010-12-22 00:04:36Z denneau $
+# Convert calendar dates to MJD or JD
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Astro::SLA;
+use Pod::Usage;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::MITI;
+
+
+my $radians;
+my $arcsec;
+my $arcmin;
+my $velocity;
+my $help;
+GetOptions(
+    radians => \$radians,
+    arcsec => \$arcsec,
+    arcmin => \$arcmin,
+    velocity => \$velocity,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+
+
+
+sub _inp2miti {
+    return miti_parse($_[0]);
+}
+
+
+my $line;
+my %last;
+my %this;
+my $sep_rad;
+my %res;
+while ($line = <STDIN>) {
+    next if $line =~ /^#/;  # toss comments
+    chomp $line;
+    unless (%last) {
+        %last = _inp2miti($line);
+    }
+    else {
+        %this = _inp2miti($line);
+
+        $sep_rad = slaDsep(
+            $last{RA_DEG} / $DEG_PER_RAD, 
+            $last{DEC_DEG} / $DEG_PER_RAD,
+            $this{RA_DEG} / $DEG_PER_RAD,
+            $this{DEC_DEG} / $DEG_PER_RAD,
+        );
+
+        if ($velocity) {
+            my $dt = ($this{EPOCH_MJD} - $last{EPOCH_MJD}); # delta T in days
+            if ($radians) {
+                $sep_rad /= $dt;
+                printf "%.3f rad/day\n", $sep_rad;
+            }
+            elsif ($arcsec) {
+                $sep_rad /= $dt * 24;
+                printf "%.3f arcsec/hour\n", $sep_rad * $DEG_PER_RAD * 3600, " arcsec/hour\n";
+            }
+            elsif ($arcmin) {
+                $sep_rad /= $dt;
+                printf "%.3f arcmin/day\n", $sep_rad * $DEG_PER_RAD * 60;
+            }
+            else {
+                $sep_rad /= $dt;
+                printf "%.3f deg/day\n", $sep_rad * $DEG_PER_RAD;
+            }
+        }
+        else {
+            if ($radians) {
+                printf "%.3f rad\n", $sep_rad;
+            }
+            elsif ($arcsec) {
+                printf "%.3f arcsec\n", $sep_rad * $DEG_PER_RAD * 3600;
+            }
+            elsif ($arcmin) {
+                printf "%.3f arcmin\n", $sep_rad * $DEG_PER_RAD * 60;
+            }
+            else {
+                printf "%.3f deg\n", $sep_rad * $DEG_PER_RAD;
+            }
+        }
+
+        %last = %this;
+    }
+}
+
+
+
+=head1 NAME
+
+dsep - calculate angular separation between positions
+ 
+=head1 SYNOPSIS
+
+dsep [options] < input
+
+  --radians : output in radians instead of degrees
+  --arcsec : output in arcsec instead of degrees
+
+=head1 DESCRIPTION
+
+dsep calculates angular separation between positions described on successive lines
+of its input.  Positions should be in MOPS MITI detection format.
+
+=cut
+

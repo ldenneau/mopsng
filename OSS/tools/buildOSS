@@ -1,0 +1,206 @@
+#!/usr/bin/perl
+# $Id: buildInstance 5118 2012-09-27 01:53:42Z dgreen $
+# Build a complete MOPS Solar System Simulation.
+
+use strict;
+
+use Pod::Usage;
+use Getopt::Long;
+use Data::Dumper;
+use Carp qw(carp cluck confess croak);
+use Params::Validate qw(:all);
+use Cwd;
+use File::Slurp;
+
+use PS::MOPS::DC::Build;
+use PS::MOPS::DC::Runtime;
+use PS::MOPS::DC::Instance; 
+
+my $name;
+my $remove;
+my $model;
+my $noprompt;
+my $description;
+my $help;
+GetOptions(
+    remove => \$remove,                 # remove instance
+    'model=s' => \$model,
+    'description=s' => \$description,
+    noprompt => \$noprompt,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+$name = shift || $ENV{MOPS_DBINSTANCE} || die "couldn't determine DB name.\n";
+pod2usage(3) unless $name;
+
+my $res;
+my $delay = 4;
+
+if ($remove) {
+    print STDERR "Deleting $name do you wish to continue (Y/N)? ";
+    my $ans = <STDIN>;
+    chomp($ans);
+    if (uc($ans) ne 'Y') {
+        print STDERR "Aborting... $name will not be removed.\n\n";
+        exit;
+    }
+    print STDERR "\n Deleting $name in $delay seconds...\n";
+    sleep $delay;                # give user time to undo!
+
+    $res = modcb_remove(
+        name => $name,
+        quiet => 1,
+    );
+
+    if (!$res) {
+        print STDERR "\nRemoved failed: " . Dumper($res);
+    }
+    else {
+        print STDERR "done.\nMOPS instance $name removed.\n";
+    }
+}
+else {
+    # Verify that database instance does not already exist.
+    my $inst = PS::MOPS::DC::Instance->new(DBNAME => $name); 
+    my $dbh;
+    eval {$dbh = $inst->dbh;};
+    if (defined($dbh) && not(defined($noprompt))) {
+        print STDERR "\nThe simulation $name already exists!!!";
+        print STDERR "\nContinuing will delete the $name simulation!!!";
+        print STDERR "\n\nDo you want to delete $name?(Y/N): ";
+        my $ans = <STDIN>;
+        chomp($ans);
+        if (uc($ans) ne 'Y') {
+            print STDERR "Aborting... $name will not be removed.\n\n";
+            exit;
+        }
+    }
+    # If description has not been supplied, ask for it on command line.
+    if (!$description) {
+        print STDERR "About to create $name.  Please enter a description for it:\n";
+        $description = <STDIN>;
+    }
+
+    print STDERR "Creating $name...\n";
+    sleep $delay;                # give user time to undo!
+
+    $res = build_oss(
+        name => $name,
+        description => $description,
+        noprompt => $noprompt,
+        quiet => 0,
+    );
+
+    if (!$res) {
+        print STDERR "\nBuild failed: " . Dumper($res);
+    }
+    else {
+        print STDERR "\nOSS instance $name created.";
+    }
+}
+
+sub build_oss {
+    my %args = validate(@_, {
+        name => 1,      # name of model, e.g. 'psmops_100'
+        cleanup => 0,   # cleanup if error
+        description => 0, # description of simulation
+        quiet => 0,     # quiet output (only for errors)
+        noprompt => 0,  # don't prompt (dangerous!)
+    });
+
+    croak "invalid \$MOPS_HOME ($ENV{MOPS_HOME})" unless $ENV{MOPS_HOME} && -d $ENV{MOPS_HOME};
+
+    my %res;            # summary of what we did
+    my $INSTANCE_DIR = "$ENV{MOPS_HOME}/var/$args{name}";
+
+    eval {
+        my $mops_backend = PS::MOPS::Config->new('backend');
+        croak "can't get backend config" unless $mops_backend;
+
+        if (-d $INSTANCE_DIR) {
+            print STDERR "Removing old $INSTANCE_DIR\n";
+            _cmd("rm -rf $INSTANCE_DIR");
+        }
+       
+        # Create new instance.
+        $ENV{MOPS_DBINSTANCE} = $args{name};
+        my $oldwd = getcwd();
+        chdir "$ENV{MOPS_HOME}/schema" or croak "can't chdir to $ENV{MOPS_HOME}/schema";
+        
+        my $quiet_str = $args{quiet} ? '--quiet' : '';
+        _cmd("./create_oss $quiet_str $args{name}");
+        chdir $oldwd or croak "can't restore cwd to $oldwd";
+
+        # Update description.
+        _cmd("mkdir -p $INSTANCE_DIR/config");
+        write_file("$INSTANCE_DIR/config/description", $args{description} || $args{name});
+
+        # Update master configuration and description.
+        _cmd("cp $ENV{MOPS_HOME}/config/master.cf $INSTANCE_DIR/config/master.cf");
+
+        # Set up per-instance bin dir for extreme testing.
+        _cmd("mkdir -p $INSTANCE_DIR/bin");
+
+        # Set up log dir.
+        _cmd("mkdir -p $INSTANCE_DIR/log");
+        for my $logfile (qw(mops.log)) {
+            write_file("$INSTANCE_DIR/log/$logfile", "");
+            chmod 0666, "$INSTANCE_DIR/log/$logfile" or croak "can't chdir log file $logfile";
+        }
+
+        # Install config into DB. 
+        _cmd("editConfig --install"); 
+        
+        %res = (name => $args{name}, instance_dir => $INSTANCE_DIR);
+    };
+    if ($@) {
+        warn $@;
+        %res = ();      # empty it
+
+        if ($args{cleanup}) {
+            # Removed directories.
+            if ($INSTANCE_DIR and -d $INSTANCE_DIR) {
+                _cmd("rm -rf $INSTANCE_DIR");
+            }
+        }
+    }
+    return \%res;
+}
+
+sub _cmd {
+    # Run a system command.
+    my ($cmd, %flags) = @_;
+    my $rv;
+    $rv = system($cmd);
+    
+    if ($flags{WARN}) {
+        $rv == 0 or warn "$cmd failed: $?";
+    }
+    else {
+        $rv == 0 or die "$cmd failed: $?";
+    }
+}
+
+=head1 NAME
+
+buildOSS - Creates a database to contain OSS data and suporting files.
+ 
+=head1 SYNOPSIS
+
+buildOSS [options] [NAME]
+
+buildOSS --remove NAME
+
+buildOSS --help
+
+  NAME : name to give to instance, should be prefixed with "oss_"
+  --remove : remove named instance
+  --noprompt : don't prompt before building new instance (will overwrite old instance)
+  --description : verbose description of simulation
+  --help : show usage
+ 
+=head1 DESCRIPTION
+
+Creates an OSS database.
+
+=cut

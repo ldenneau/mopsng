@@ -1,0 +1,8 @@
+#!/bin/sh
+
+while [ 1 ]
+do
+    ./mirror_ipp_mops_lap
+    echo "Done."
+    sleep 120
+done

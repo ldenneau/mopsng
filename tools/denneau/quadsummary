@@ -1,0 +1,58 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+quadsummary - Display summary output before ingesting and processing NEO quad data
+
+=head1 SYNOPSIS
+
+quadsummary CHUNK_NAMES
+
+=head1 DESCRIPTION
+
+Something.
+
+=cut
+
+
+use strict;
+use warnings;
+
+use Pod::Usage;
+use Getopt::Long;
+
+# Just a stub for quick debugging.
+use PS::MOPS::DC::Instance;
+use PS::MOPS::IPPDB;
+
+
+# Start program here.
+my $instance_name;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+my @chunks = @ARGV or pod2usage(-msg => "No chunks specified.");
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => undef);
+my $mc = $inst->getConfig();
+
+my $chunk_match = join(' or ', map { "comment like '$_%'" } @chunks);
+my $dbh = PS::MOPS::IPPDB::dbh();
+my $sql = <<"SQL";
+select substring_index(comment,' ',1) survey_mode, count(*) count
+from rawExp 
+where $chunk_match
+group by survey_mode
+order by survey_mode
+SQL
+
+my $sth = $dbh->prepare($sql) or die $dbh->errstr;
+$sth->execute() or die $sth->errstr;
+
+my $href;
+while ($href = $sth->fetchrow_hashref()) {
+    print join(' ', $href->{survey_mode}, $href->{count}), "\n";
+}

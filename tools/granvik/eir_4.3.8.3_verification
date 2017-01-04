@@ -1,0 +1,100 @@
+#!/bin/bash
+ 
+# Verification test for EIR 4.3.8.3 (tracklets size)
+# Mikael Granvik  07/25/2008
+
+USERNAME="granvik"
+STUB="eir_4383_verification"
+INSTANCE_NAME="psmops_granvik_emptysim"
+NTRACKLETS=10000000000
+MYSQLHOST="mops00"
+MYSQLUSER="mops"
+MYSQLPASSWD="mops"
+
+echo "1..1"
+
+# Initialize empty MOPS DB
+source $HOME/bin/mops_env $INSTANCE_NAME
+buildInstance --description "Empty sim" &> /dev/null
+
+# Remove 'foreign key' fields 'field_id' and 'ssm_id' from table
+# 'tracklets', because they are time consuming to reproduce correctly:
+echo \
+"
+create table tracklets2(
+    tracklet_id bigint not null auto_increment  comment 'Auto-generated internal MOPS tracklet ID',
+    field_id bigint not null                    comment 'Terminating field ID',
+    v_ra real                                   comment 'Average RA velocity deg/day, cos(dec) applied',
+    v_dec real                                  comment 'Average Dec velocity, deg/day)',
+    v_tot real                                  comment 'Average total velocity, deg/day',
+    v_ra_sigma real                             comment 'Uncertainty in RA velocity',
+    v_dec_sigma real                            comment 'Uncertainty in Dec velocity',
+    acc_ra real                                 comment 'Average RA Acceleration, deg/day^2',
+    acc_dec real                                comment 'Average Dec Acceleration, deg/day^2',
+    acc_ra_sigma real                           comment 'Uncertainty in RA acceleration',
+    acc_dec_sigma real                          comment 'Uncertainty in Dec acceleration',
+    ext_epoch real                              comment 'Extrapolated (central) epoch, MJD',
+    ext_ra real                                 comment 'Extrapolated (central) RA, deg',
+    ext_dec real                                comment 'Extrapolated (central) Dec, deg',
+    ext_mag real                                comment 'Extrapolated (central) magnitude',
+    ext_ra_sigma real                           comment 'Uncertainty in extrapolated RA, deg',
+    ext_dec_sigma real                          comment 'Uncertainty in extrapolated Dec, deg',
+    ext_mag_sigma real                          comment 'Uncertainty in extrapolated mag, deg',
+    probability real                            comment 'Likelihood tracklet is real (unused currently)',
+    status char(1)                              comment 'processing status (unfound X, unattributed U, attributed A)',
+    classification char(1)                      comment 'MOPS efficiency classification',
+    ssm_id bigint null                          comment 'Matching SSM ID for clean classifications',
+    primary key(tracklet_id),
+    index(field_id),
+    index(ssm_id),
+    index(classification),
+    index(ext_epoch)
+) type=InnoDB;
+" | mysql -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME
+
+# Write more than 1,000,000 SQL insertion commands to a single string
+str="INSERT INTO tracklets2() VALUES(); "
+a=1
+while (( a <= 1000000 ))
+  do
+  str="$str$str"
+  let a=a*2
+done
+
+# Write the stuff into the table
+b=0
+while (( b <= $NTRACKLETS ))
+  do
+  echo \
+"
+SET AUTOCOMMIT=0;
+$str
+COMMIT;
+" | mysql -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME
+b=$b+$a
+done
+
+# Count rows in table after insertion
+rows=`echo \
+"
+select
+ count(*)
+from
+ tracklets2;
+" | mysql -N -u$MYSQLUSER -p$MYSQLPASSWD -h$MYSQLHOST $INSTANCE_NAME`
+if [[ $1 == "--result" ]]
+    then
+    echo $rows
+fi
+
+# Check whether the size req is met:
+if (( $rows >= $NTRACKLETS )) ; then
+    echo "ok 1 - ${STUB}"
+else
+    echo "not ok 1 - ${STUB}"
+fi
+
+# Delete temporary MOPS DB
+buildInstance --remove $INSTANCE_NAME &> /dev/null
+
+exit

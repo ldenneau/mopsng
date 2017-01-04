@@ -1,0 +1,70 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+
+
+# Options.
+my $inst;
+my $instance_name;
+my $fields_from;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'fields_from=s' => \$fields_from,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+pod2usage(3) unless $fields_from;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_logger = $inst->getLogger;
+my $mops_config = $inst->getConfig;
+
+
+# Field status management.
+my $START_FIELD_STATUS = $FIELD_STATUS_READY;
+my $END_FIELD_STATUS = $FIELD_STATUS_LINKDONE;
+
+my $fh = new FileHandle $fields_from or $mops_logger->logdie("can't create FileHandle for $fields_from");
+my @field_ids = <$fh>;
+chomp @field_ids;
+close $fh;
+
+$mops_logger->info("Marking field IDs: " . join(' ', @field_ids));
+foreach my $id (@field_ids) {
+    if ($id) {
+        my $f = modcf_retrieve($inst, fieldId => $id) or $mops_logger->logdie("can't retrieve field ID $id");
+#        if ($f->status eq $START_FIELD_STATUS) {
+            $f->status($END_FIELD_STATUS);   # mark it!
+#        }
+    }
+}
+
+exit;
+
+
+
+=head1 NAME
+
+tagOrphans - Program to insert MOPS tracklets from FindTracklets output
+
+=head1 SYNOPSIS
+
+tagOrphans --fields_from=FILENAME
+    --help : show this man page
+
+=head1 DESCRIPTION
+
+tagOrphans updates the field processing status for the fields listed by
+ID in FILENAME.  This program is invoked by tuple-wise field processing
+code so that orphan (non-TTI-tuple) fields are marked as processed.
+
+=cut

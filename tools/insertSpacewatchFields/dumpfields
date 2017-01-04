@@ -1,0 +1,84 @@
+#!/usr/bin/env perl
+
+use strict;
+use Date::Manip;
+use Astro::Time;
+
+# Convert Spacewatch field summaries to text tuples of 
+#   FIELD_ID RA_DEG DEC_DEG EPOCH_MJD EXP_S
+# for processing by insertSpacewatchFields.
+
+my $line;
+my $date_str;
+my ($month, $day, $year);
+
+while(defined($line = <STDIN>)) {
+    if ($line =~ /UT DATE:\s+(\w+\s+\d+,\s+\d+)/) {
+        # Start of date line; set our date vars.
+        $date_str = ParseDate($1);
+        ($year, $month, $day) = ($date_str =~ /(\d\d\d\d)(\d\d)(\d\d)/);
+    }
+    elsif ($line =~ m{^\t
+            (\d\d\.\d\d)        # field IDs
+            \s+
+            \d+,\d+,\d+   # three different obs
+            \s+
+        }x) {
+
+        # Generate the filename that will contain the epoch of the field
+        # acquisition.
+        my ($f1) = ($1);
+        my ($t1, $t2, $t3);
+        my ($ra, $dec, $exp_s);
+        my $file1 = "$year.$month.$day.$f1.1";
+        my $file2 = "$year.$month.$day.$f1.2";
+        my $file3 = "$year.$month.$day.$f1.3";
+
+        if (-f "$file1.miti" and -f "$file2.miti" and -f "$file3.miti") {
+            # Get other info.
+            ($ra, $dec, $exp_s, $t1, $t2, $t3) = ($line =~ m{
+                ^\s+
+                \d\d\.\d\d \s+
+                \d+,\d+,\d+ \s+
+                (\d+:\d+:\d+) \s+       # RA
+                ([-+]\d+:\d+:\d+) \s+   # DEC
+                (\d+) \s+               # exposure, sec
+                (\S+) \s+ \S+ \s+       # time, followed by FWHM
+                (\S+) \s+ \S+ \s+       # time, followed by FWHM
+                (\S+) \s+ \S+ \s+       # time, followed by FWHM
+            }x);
+
+            # Now do some conversions.
+            my $ra_deg;
+            my $dec_deg;
+            my ($t1_mjd, $t2_mjd, $t3_mjd);
+            my ($hour, $min, $sec);
+
+            $ra_deg = str2deg($ra, 'H');
+            $dec_deg = str2deg($dec, 'D');
+
+            ($hour, $min, $sec) = ($t1 =~ /(\d+):(\d+):(\d+)/);
+            $t1_mjd = cal2mjd($day, $month, $year, hms2time($hour, $min, $sec));
+
+            ($hour, $min, $sec) = ($t2 =~ /(\d+):(\d+):(\d+)/);
+            $t2_mjd = cal2mjd($day, $month, $year, hms2time($hour, $min, $sec));
+
+            ($hour, $min, $sec) = ($t3 =~ /(\d+):(\d+):(\d+)/);
+            $t3_mjd = cal2mjd($day, $month, $year, hms2time($hour, $min, $sec));
+
+            # Print filename (ID), RA, DEC, epoch, exposure
+            print join("\t", $file1, 
+                sprintf("%.8f", $ra_deg), 
+                sprintf("%.8f", $dec_deg), 
+                sprintf("%.8f", $t1_mjd), $exp_s), "\n";
+            print join("\t", $file2, 
+                sprintf("%.8f", $ra_deg), 
+                sprintf("%.8f", $dec_deg), 
+                sprintf("%.8f", $t2_mjd), $exp_s), "\n";
+            print join("\t", $file3, 
+                sprintf("%.8f", $ra_deg), 
+                sprintf("%.8f", $dec_deg), 
+                sprintf("%.8f", $t3_mjd), $exp_s), "\n";
+        }
+    }
+}

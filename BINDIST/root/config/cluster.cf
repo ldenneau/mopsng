@@ -1,0 +1,12 @@
+# $Id: cluster.cf,v 1.1 2006/03/01 20:11:04 denneau Exp $
+# Cluster node execution environment
+# Parse this file with Config::Parsed or subclass
+home = /home/mops
+coarse_ephem = /home/mops/bin/coarseEphem
+var = /home/mops/var
+nodes = [
+    LOCAL
+]
+hosts = [
+    LOCAL
+]

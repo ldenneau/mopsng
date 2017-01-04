@@ -1,0 +1,9 @@
+#!/bin/bash
+
+# Show header
+findobj --instance psmops_ps1_v6 $1 > /dev/null
+for dbname in psmops_ps1_mdrm152 psmops_ps2_prod7120 psmops_ps1_mdrm137 psmops_ps1_v6; do
+	echo "##### $dbname ######"
+	findobj --instance $dbname $1 2> /dev/null
+done
+

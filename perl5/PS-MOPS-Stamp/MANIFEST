@@ -1,0 +1,6 @@
+Changes
+Makefile.PL
+MANIFEST
+README
+t/PS-MOPS-Stamp.t
+lib/PS/MOPS/Stamp.pm

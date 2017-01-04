@@ -1,0 +1,338 @@
+#! /usr/bin/env perl
+# $Id$
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+use File::Copy;
+use File::Temp;
+use Astro::SLA;
+
+use PS::MOPS::Lib qw(:all);
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::TemplateInstance;
+use PS::MOPS::DC::TemplateField;
+
+use subs qw(
+    open_fields
+    filter_tti_pairs
+    process
+);
+
+
+my @default_de = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+my $default_ds_type = 'DETECTION';         # DS file type
+
+my $help;
+my $inst;
+my $instance_name;
+my $obshist_file;
+my $gmt_offset_hours = -4;
+my $obscode = '807';            # CTIO
+my $limiting_mag = 25;          # LSST
+
+my $pairs;
+my $noinsert;
+my $max_exposure_time = 10800;     # max exposure time allowed for TTI field
+my $filter_replace = 'r';          # replace input filters in simulation
+my $filter_ignore;                 # ignore fields with these filters
+my $survey_name;
+my $survey_desc;
+my $mjd;
+my $start_mjd;
+my $end_mjd;
+my $ocnum_flag;
+my $nn_flag;
+my $mjd_offset = 0;
+
+
+my $survey_id;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'survey_name=s' => \$survey_name,
+    'survey_desc=s' => \$survey_desc,
+    'limiting_mag=f' => \$limiting_mag,
+    'obscode=s' => \$obscode,
+    'gmt_offset_hours=f' => \$gmt_offset_hours,
+    help => \$help,
+    'max_exposure_time=f' => \$max_exposure_time,
+    pairs => \$pairs,
+    noinsert => \$noinsert,
+    'filter_replace=s' => \$filter_replace,
+    'filter_ignore=s' => \$filter_ignore,
+    'mjd=f' => \$mjd,
+    'start_mjd=f' => \$start_mjd,
+    'end_mjd=f' => \$end_mjd,
+    ocnum => \$ocnum_flag,
+    nn => \$nn_flag,
+    'mjd_offset=f' => \$mjd_offset,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-msg => '--survey_name not specified') unless $survey_name;
+pod2usage(-msg => '--limiting_mag not specified') unless $limiting_mag;
+pod2usage(-msg => '--obscode not specified') unless $obscode;
+pod2usage(-msg => '--gmt_offset_hours not specified') unless defined($gmt_offset_hours);
+pod2usage(-verbose => 3) if $help;      # user asked for help
+if (@ARGV == 0) {
+	pod2usage(2);
+	exit;
+}
+$obshist_file = shift;
+die "can't read obshist file $obshist_file" unless -r $obshist_file;
+$survey_name =~ s/^\s+|\s+$//g;     # clean up name
+$inst = PS::MOPS::DC::TemplateInstance->new(
+    GMT_OFFSET_HOURS => $gmt_offset_hours,
+);
+
+
+# Create a new template survey record if necessary.
+$survey_id = $inst->lookupSurveyId($survey_name);
+if (!$survey_id) {
+    print STDERR "Creating survey '$survey_name'.\n";
+    $survey_id = $inst->createSurvey(
+        SURVEY_NAME => $survey_name, 
+        SURVEY_DESC => $survey_desc
+    );
+}
+
+
+# Create table of filters to ingore.
+my %filter_ignore_table;
+if ($filter_ignore) {
+    my @filts = split ',', $filter_ignore;
+    $filter_ignore_table{$_} = 1 foreach @filts;    # set keys in table
+}
+
+# Do it!
+process($obshist_file);
+print STDERR "Done.\n";
+exit;
+
+
+sub open_fields
+{
+	my ($field_file) = @_;
+    my $fh = new FileHandle $field_file or die "Cannot open $field_file";
+    my @fields;
+    my $line;
+
+    # First line contains tab-delimited mysql fields.
+	my $fields_line = <$fh>;
+    chomp $fields_line;
+    my @field_names = split /\s+/, $fields_line;
+    my $go;         # whether to process this field
+    my $field_mjd;
+    my $field_nn;
+    my $field_ocnum;
+
+    while (defined($line = <$fh>)) {
+        chomp $line;
+        my @vals = split /\s+/, $line;
+        my %cols;
+        @cols{@field_names} = @vals;
+
+        $field_mjd = $cols{expMJD}  + $mjd_offset;
+        $field_ocnum = mopslib_mjd2ocnum($field_mjd);
+
+#        last if $field_mjd > $max_mjd;
+        next if $filter_ignore_table{$cols{filter}};
+
+        push @fields, {
+            field_id => $cols{obsHistID}, 
+            epoch_mjd => $field_mjd, 
+            ra_deg => $cols{fieldRA}, 
+            dec_deg => $cols{fieldDec}, 
+            survey_mode => "LST", 
+            time_start => $field_mjd - $cols{expTime} / 86400 / 2,
+            time_stop => $field_mjd + $cols{expTime} / 86400 / 2, 
+            filter_id => ($filter_replace or $cols{filter}), 
+            limiting_mag => $limiting_mag,
+            ra_sigma_deg => 0,
+            dec_sigma_deg => 0,
+            obscode => $obscode, 
+            de1 => 0,
+            de2 => 0,
+            de3 => 0,
+            de4 => 0,
+            de5 => 0,
+            de6 => 0,
+            de7 => 0,
+            de8 => 0,
+            de9 => 0,
+            de10 => 0,
+            ocnum => $field_ocnum, 
+            status => $FIELD_STATUS_INGEST,
+        };
+    }   # while
+    close $fh;
+    my @sorted_fields = sort { $a->{epoch_mjd} <=> $b->{epoch_mjd} } @fields;
+    printf STDERR "Found %d fields.\n", scalar @sorted_fields;
+    return \@sorted_fields;
+}
+
+
+sub _sep_rad {
+    my ($f1, $f2) = @_;
+    return slaDsep(
+        $f1->{ra_deg} / $DEG_PER_RAD, $f1->{dec_deg} / $DEG_PER_RAD,
+        $f2->{ra_deg} / $DEG_PER_RAD, $f2->{dec_deg} / $DEG_PER_RAD,
+    );
+}
+
+
+sub filter_tti_pairs {
+    my @inp_fields = @_;
+    my @paired_fields;
+    my ($f, $f1, $match, $idx);     # field objects
+    my ($exp_mjd, $exp1_mjd);       # exposure times
+
+    my $MAX_EXPOSURE_TIME_MJD = $max_exposure_time / 86400;         # max exposure time in MJD
+    my $ONE_HOUR_MJD = 3600 / 86400;                # one hour in MJD
+    my $MAX_SEP_RAD = 0.1 / $DEG_PER_RAD;           # .1 degree max spatial separation of TTI pair
+
+    while (@inp_fields) {
+        $f = shift @inp_fields;     # get first in list
+
+        $exp_mjd = $f->{time_stop} - $f->{time_start};
+        next if $exp_mjd == 0 or $exp_mjd > $MAX_EXPOSURE_TIME_MJD;    # toss bogus exp time or MD fields
+
+        $idx = 0;
+        $match = undef;
+        foreach $f1 (@inp_fields) {
+            $exp1_mjd = $f1->{time_stop} - $f1->{time_start};
+            if (
+                $f1->{filter_id} eq $f->{filter_id}     # filters must match
+                and $exp1_mjd != 0 
+                and abs($f->{epoch_mjd} - $f1->{epoch_mjd}) > $ONE_HOUR_MJD
+                and (_sep_rad($f, $f1) < $MAX_SEP_RAD)
+            ) {
+                # If we've made it this far, the field is acceptable.  Pair $f and $f1 together, and remove
+                # $f1 from the current list.
+                $match = $f1;
+                last;   # outta here
+            };
+            $idx++;
+        }
+        if ($match) {
+            splice @inp_fields, $idx, 1;        # extract item, compressing list
+            push @paired_fields, $f, $match;
+        }
+    }
+
+    return @paired_fields;
+}
+
+
+sub process
+{
+	my ($src_filename) = @_;
+
+    # Convert src to a filename.
+    die "can't find file $src_filename" unless -f $src_filename;
+	print STDERR "Reading all fields from $src_filename.\n";
+
+	my $fields_list = open_fields($src_filename);
+
+    # Bin our data into nights.  Then for each night, locate TTI pairs.
+    my %seen_fields;            # record of what epoch/RA/DECs we've inserted
+
+    while (@{$fields_list}) {
+        # Now filter so that we have only TTI pairs.
+        my @nightly_fields;
+        my $f;
+        my $nn;
+        $f = shift @{$fields_list};         # first item
+        $nn = mopslib_mjd2nn($f->{epoch_mjd}, $gmt_offset_hours);
+        push @nightly_fields, $f;
+        while (@{$fields_list} and mopslib_mjd2nn($fields_list->[0]->{epoch_mjd}, $gmt_offset_hours) == $nn) {
+            push @nightly_fields, shift @{$fields_list};        # transfer $fields_list->[0] => $nightly_fields
+        }
+
+        # If pairs is specified, filter out only apparent TTI pairs.
+        if ($pairs) {
+            @nightly_fields = filter_tti_pairs(@nightly_fields);
+            printf STDERR "Found %d fields in TTI pairs for night $nn.\n", scalar @nightly_fields;
+        }
+
+        next if $noinsert;
+
+        # Insert into DB.
+        foreach my $field (@nightly_fields) {
+            my $id = $field->{field_id};
+            my $epoch = ($field->{'time_start'} + $field->{'time_stop'}) / 2.0; 
+
+            # Check for duplicates in epoch/ra/dec.
+            my $tok = $epoch . '-' . $field->{ra_deg} . '-' . $field->{dec_deg};
+            if ($seen_fields{$tok}) {
+                print STDERR "Already seen field $tok, skipping.\n";
+                next;
+            }
+            $seen_fields{$tok} = 1;
+
+            my @de = @{$field}{qw(de1 de2 de3 de4 de5 de6 de7 de8 de9 de10)};
+            my $tfield = PS::MOPS::DC::TemplateField->new(
+                $inst,
+                epoch => $epoch,
+                ra => $field->{ra_deg},
+                dec => $field->{dec_deg},
+                raSigma => 0,
+                decSigma => 0,
+                filter => $field->{filter_id},
+                limitingMag => $field->{limiting_mag},
+                obscode => $field->{obscode},
+                timeStart => $field->{time_start},
+                timeStop => $field->{time_stop},
+                de => \@de,
+                surveyMode => $field->{survey_mode},
+                surveyId => $survey_id,
+            );
+            $tfield->insert() or die "problem inserting field";
+        }
+    }
+}
+
+
+=head1 NAME
+
+insert_LSST - Insert fields from LSST obsHist dump into MOPS template fields database
+
+=head1 SYNOPSIS
+
+insert_lsst [options] OBSHIST_FILE
+
+REQUIRED ARGUMENTS:
+
+  OBSHIST_FILE : obshist file from which to get observations 
+  --survey_name NAME : name to assign in DB
+  --survey_desc DESC : description
+  --obscode OBSCODE : set field observatory codes to OBSCODE
+  --gmt_offset_hours=DELTA_T : delta in hours of OBSCODE location to GMT, e.g. Hawaii=-10
+  --limiting_mag MAG : set limiting magnitude, default 22.7 (PS1)
+
+  --max_exposure_time T : don't include fields with exposure time > T sec
+  --pairs : only import fields that constitute TTI pairs
+  --filter_replace FILT : replace all filter values (grizyw) with FILT , default "r"
+  --filter_ignore FILT : ignore fields with filters in FILT (default "z,y")
+  --noinsert : don't insert anything into the database, just scan input file
+  --mjd_offset OFST: add OFST to each field MJD
+  --help : show help page
+
+=head1 DESCRIPTION
+
+Insert LSST ObsHistory database dump from scheduler into MOPS template fields database.
+
+=head1 EXAMPLE
+
+  insert_lsst \
+    --survey_name=DRM1 \
+    --survey_desc='2-year DRM1' \
+    --obscode=566 \
+    --gmt_offset_hours=-10 \
+    --limiting_mag=22.7 \
+    $MOPS_HOME/data/ssm/surveys/LSST/obshist.dump
+
+=cut
+
+__END__

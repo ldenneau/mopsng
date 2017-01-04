@@ -1,0 +1,123 @@
+#! /usr/bin/env perl
+# $Id$
+
+=head1 NAME
+
+fmtorbit - Format MIF-O lines for readability
+
+=head1 SYNOPSIS
+
+fmtorbit [options] [FILENAMES]
+
+  --html : emit HTML instead of text
+
+=head1 DESCRIPTION
+
+For each line of input, format the orbit for readability.
+
+=cut
+
+use warnings;
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+use FileHandle;
+
+use PS::MOPS::Lib qw(:all);
+
+
+use subs qw(
+    format_items
+);
+
+my $COV_FMT_STRING = "%10.3E";
+
+
+my $dec;
+my $help;
+GetOptions(
+    dec => \$dec,
+    help => \$help,
+) or pod2usage(2);                      # opts parse error
+pod2usage(-verbose => 3) if $help;      # user asked for help
+
+if ($dec) {
+    $COV_FMT_STRING = "%10.6f";
+}
+
+my $line;
+my @mif_items;
+while ($line = <>) {
+    chomp $line;
+    @mif_items = split /\s+/, $line;
+    print format_items(@mif_items), "\n";
+}
+
+exit;
+
+
+sub format_items {
+    my @items = @_;
+    my @out;
+
+    # Main elems.
+    push @out, '---------';
+    push @out, "ID: $items[1]";   # ID
+    push @out, '';
+
+    push @out, 'Elements:';
+    push @out, sprintf "q     %9.6f AU", $items[2];
+    push @out, sprintf "e     %9.6f", $items[3];
+    push @out, sprintf "i     %9.6f deg", $items[4];
+    push @out, sprintf "node  %9.3f deg", $items[5];
+    push @out, sprintf "argp  %9.3f deg", $items[6];
+    push @out, sprintf "tp    %9.3f MJD", $items[7];
+    push @out, sprintf "t0    %9.3f MJD", $items[8];
+    push @out, sprintf "hV    %9.3f", $items[9];
+    push @out, '';
+
+    push @out, sprintf "resid %9.3f arcsec", $items[10];
+    push @out, sprintf "arcl  %9.3f d", $items[13];
+    push @out, sprintf "conv  %9s", $items[14];
+    push @out, '';
+
+    if (defined($items[15])) {
+        push @out, 'Covariance:';
+        my @c = (undef, @items[15..(15+21-1)]);
+        my $cov = {
+            0 => [
+                @c[1, 2, 4, 7, 11, 16],
+            ],
+            1 => [
+                @c[2, 3, 5, 8, 12, 17],
+            ],
+            2 => [
+                @c[4, 5, 6, 9, 13, 18],
+            ],
+            3 => [
+                @c[7, 8, 9, 10, 14, 19],
+            ],
+            4 => [
+                @c[11, 12, 13, 14, 15, 20],
+            ],
+            5 => [
+                @c[16, 17, 18, 19, 20, 21],
+            ],
+        };
+        push @out, join(' ', map{sprintf "%10s", $_} qw(EC QR TP OM W IN));
+        push @out, join(' ', 'EC', map {sprintf $COV_FMT_STRING, $_} @{$cov->{0}});
+        push @out, join(' ', 'QR', map {sprintf $COV_FMT_STRING, $_} @{$cov->{1}});
+        push @out, join(' ', 'TP', map {sprintf $COV_FMT_STRING, $_} @{$cov->{2}});
+        push @out, join(' ', 'OM', map {sprintf $COV_FMT_STRING, $_} @{$cov->{3}});
+        push @out, join(' ', 'W ', map {sprintf $COV_FMT_STRING, $_} @{$cov->{4}});
+        push @out, join(' ', 'IN', map {sprintf $COV_FMT_STRING, $_} @{$cov->{5}});
+        push @out, '';
+    }
+    else {
+        push @out, 'No covariance matrix.';
+        push @out, '';
+    }
+
+    return join("\n", @out);
+}

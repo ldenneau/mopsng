@@ -1,0 +1,91 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+my %subtotals;
+my %subsectiontotals;
+
+
+sub _fmt {
+    # Format floating-point number.
+    return sprintf "%.3g", $_[0];
+}
+
+
+sub _fmtpct {
+    # Format fraction as a percentage.
+    return sprintf "%.1f%%", $_[0] * 100;
+}
+
+
+sub _prt {
+    my ($section, $time_sec, $pct, $pad) = @_;
+    $pad ||= '';
+    print $pad, join(' ', $section, _fmt($time_sec), _fmtpct($time_sec / $pct)), "\n";
+}
+
+
+
+# Snake timing data.  Just sum up stuff.
+my ($date, $time, $TIMING, $section, $subsection, $time_sec);
+while (<>) {
+    chomp;                      # strip line ending
+    next unless /TIMING/;       # skip unless a timing log msg
+    my ($date, $time, $TIMING, $section, $time_sec) = split;
+
+    # See if the section is data for a subsection, of the format SECTION-SUBSECTION.  If
+    # so, separate it out.
+    if ($section =~ /-/) {
+        ($section, $subsection) = split '-', $section, 2;
+        if (!exists($subsectiontotals{$section}->{$subsection})) {
+            $subsectiontotals{$section}->{$subsection} = $time_sec;
+        }
+        else {
+            $subsectiontotals{$section}->{$subsection} += $time_sec;
+        }
+    }
+    elsif ($section =~ /\//) {      # same as /-/, but split on slash
+        ($section, $subsection) = split '/', $section, 2;
+        if (!exists($subsectiontotals{$section}->{$subsection})) {
+            $subsectiontotals{$section}->{$subsection} = $time_sec;
+        }
+        else {
+            $subsectiontotals{$section}->{$subsection} += $time_sec;
+        }
+    }
+    else {
+        if (!exists($subtotals{$section})) {
+            $subtotals{$section} = $time_sec;
+        }
+        else {
+            $subtotals{$section} += $time_sec;
+        }
+    }
+}
+
+
+# Print out sums, totals.
+my $total_sec = 0;
+$total_sec += $_ foreach values %subtotals;
+if ($total_sec == 0) {
+    print "Total is zero.\n";
+    exit;
+}
+
+foreach my $key (sort { $subtotals{$b} <=> $subtotals{$a} } keys %subtotals) {
+    _prt($key, $subtotals{$key}, $total_sec);
+
+    # If there are subsection timings for this section, print them here.
+    if (exists(${$subsectiontotals{$key}}{$subsection})) {
+        my $subtotal_sec = 0;
+        $subtotal_sec += $_ foreach values %{$subsectiontotals{$key}};
+        if ($subtotal_sec > 0) {
+            foreach my $key2 (sort { $subsectiontotals{$key}->{$b} <=> $subsectiontotals{$key}->{$a} } keys %{$subsectiontotals{$key}}) {
+                _prt($key2, $subsectiontotals{$key}->{$key2}, $subtotal_sec, '--');
+            }
+        }
+    }
+}
+_prt('TOTAL', $total_sec, $total_sec);
+exit;

@@ -1,0 +1,396 @@
+#!/usr/bin/env perl
+
+die "This program is deprecated.  Use insertSyntheticFields instead\n";
+
+use strict;
+
+use Getopt::Long;
+use File::Slurp;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::Log;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Connection;
+
+
+# List of fields, starting column and length, in .SCH file.
+my %FIELD_SPEC = (
+    LINE_NUM => [0, 6],
+    SLEW_START_MJD => [6, 12],
+    EXPOSURE_START_MJD => [18, 12],
+    UT => [30, 6],
+    OBJECT => [36, 12],
+    RA => [48, 8],
+    DEC => [56, 4],
+    HA => [60, 6],
+    ALT => [66, 4],
+    EXPOSURE_SEC => [70, 9],
+    IDLE_SEC => [79, 6],
+    TYPE => [85, 2],
+    FIELD => [87, 19],
+    DRA => [106, 14],
+    DDEC => [120, 13],
+    USER => [133, 5],
+    RES => [138, 3],
+    SURVEY_MODE => [141, 5],
+    SIZE => [146, 5],
+    FILTER_ID => [151, 7],
+    REQ_ID => [158, 11],
+    FILE => [169, 20],
+);
+
+
+# Options.
+my $noheader = 0;   # if true, don'e write header for flat-file output
+my $insert = 0;		# if true, direct insert into PSMOPS using PS::MOPS::DB::Detections
+my $fields_dir;
+my $help = 0;
+my $debug = 0;
+
+
+# Globals.
+my @default_de = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+my @field_names = qw(
+    EPOCH
+    RA
+    DEC
+    SURVEY_MODE
+    EXPOSURE_START_MJD
+    EXPOSURE_STOP_MJD
+    FILTER_ID
+    LIMITING_MAG
+    RA_SIGMA
+    DEC_SIGMA
+    OBSERVATORY
+    OBJECT
+);
+
+
+sub usage {
+    print STDERR <<"USAGE";
+usage: sch2obs [--noheader] [--insert] [--fields_dir=FIELDS_DIR] file1.sch file2.sch ...
+  --insert : insert fields into DB
+  --fields_dir : directory containing .fields files
+  --noheader : don't write header with flat file output
+USAGE
+
+    exit;
+}
+
+
+sub load_offsets {
+    # Read .fields files containing RA and DEC offsets for SSS objects.
+    # For each day of the year indexed using the string 'MM-DD', store
+    # the object's delta RA and delta DEC.
+    my $path = $_[0];
+    my $offsets = {
+        DRA => {},
+        DDEC => {},
+    };
+
+    my @files;
+    my $dirh;
+    opendir $dirh, $path or die "can't read directory $path";
+    @files = grep { /\.fields$/ } readdir $dirh;
+    closedir $dirh;
+
+    my $file;
+    my $line;
+    my ($object, $dra, $ddec);
+    my $date_spec;
+
+    foreach $file (@files) {
+        # Snag month, day from filename.
+        if ($file =~ /\w\w\w-(\d\d-\d\d)\.fields/) {
+            $date_spec = $1;
+        }
+        else { 
+            warn "can't get month and day from filename $file";
+            next;
+        }
+
+        # Slurp all lines in file.  Format is OBJECT DRA DDEC.
+        my $fh;
+        open $fh, "$path/$file" or warn "can't open $file";
+        while (defined($line = <$fh>)) {
+            chomp $line;
+            $line =~ s/^\s+//;   # trim leading whitespace
+            ($object, $dra, $ddec) = split /\s+/, $line;
+            $offsets->{DRA}->{$date_spec}->{$object} = $dra;
+            $offsets->{DDEC}->{$date_spec}->{$object} = $ddec;
+        }
+        close $fh;
+    }
+
+    return $offsets;
+}
+
+
+
+sub load_offsets1 {
+    # Read specified file(s) containing RA and DEC offsets for SSS objects.
+    my (@files) = @_;
+    my $offsets = {
+        DRA => {},
+        DDEC => {},
+    };
+
+    my $file;
+    my $line;
+    my ($object, $dra, $ddec);
+    my $date_spec;
+
+    foreach $file (@files) {
+        # Snag month, day from filename.
+        if ($file =~ /^\w\w\w-\d\d\d\d-(\d\d-\d\d).positions/) {
+            $date_spec = $1;
+        }
+        else { 
+            warn "can't get month and day from filename $file";
+            next;
+        }
+
+        # Slurp all lines in file.  Format is OBJECT DRA DDEC.
+        my $fh;
+        open $fh, $file or warn "can't open $file";
+        while (defined($line = <$fh>)) {
+            chomp $line;
+            $line =~ s/^\s+//;   # trim leading whitespace
+            ($object, $dra, $ddec) = split /\s+/, $line;
+            $offsets->{DRA}->{$date_spec}->{$object} = $dra;
+            $offsets->{DDEC}->{$date_spec}->{$object} = $ddec;
+        }
+        close $fh;
+    }
+
+    return $offsets;
+}
+
+
+sub snag_fields {
+    # Given a line from SCH file, extract fields into a hash.  Return 
+    # a reference to the hash.
+    my $line = $_[0];
+    my $fields = {};
+    my ($start, $len);
+
+    foreach my $key (keys %FIELD_SPEC) {
+        ($start, $len) = @{$FIELD_SPEC{$key}};
+        $fields->{$key} = substr($line, $start, $len);
+        $fields->{$key} =~ s/^\s+|\s+$//g;   # clean up
+    }
+
+    # Manufacture some fields.
+    $fields->{EXPOSURE_STOP_MJD} = $fields->{EXPOSURE_START_MJD} + $fields->{EXPOSURE_SEC} / $SECONDS_PER_DAY;
+    $fields->{EPOCH} = $fields->{EXPOSURE_START_MJD} + $fields->{EXPOSURE_SEC} / $SECONDS_PER_DAY / 2;
+    $fields->{LIMITING_MAG} = 24.5;
+    $fields->{RA_SIGMA} = 0.0;
+    $fields->{DEC_SIGMA} = 0.0;
+    $fields->{OBSERVATORY} = 568;  # Mauna Kea
+
+    return $fields;
+}
+
+
+sub apply_offsets {
+    my ($fields, $offsets, $date_spec) = @_;
+
+    # Adjust RA and DEC by values in our global table from the fields files.
+    my $ra_new;
+    my $dec_new;
+    my $object = $fields->{OBJECT};
+
+    $ra_new = $offsets->{DRA}->{$date_spec}->{$object};
+    if (!defined($ra_new)) {
+        warn "no offset found for $date_spec, $object";
+    }
+    else {
+        $fields->{RA} = $ra_new;
+    }
+
+    $dec_new = $offsets->{DDEC}->{$date_spec}->{$object};
+    if (!defined($dec_new)) {
+        warn "no offset found for $date_spec, $object";
+    }
+    else {
+        $fields->{DEC} = $dec_new;
+    }
+}
+
+
+sub process_fields {
+    # Given a line from a .SCH file and a table of offsets, process the
+    # line according to user prefs (plain, insert).
+    my $fields = $_[0];
+    my @de = $fields->{DE} || @default_de;  # dummy detection efficiencies if not specified
+
+    if ($insert) {
+        # Insert into DB.
+        my $obs;
+        my $id;
+
+        $id = modcf_insertByValue(
+            epoch => $fields->{EPOCH},
+            ra => $fields->{RA} * 15,   # convert hours to deg
+            dec => $fields->{DEC},
+            surveyMode => $fields->{SURVEY_MODE},
+            timeStart => $fields->{EXPOSURE_START_MJD},
+            timeStop => $fields->{EXPOSURE_STOP_MJD},
+            filter => $fields->{FILTER_ID},
+            limitingMag => $fields->{LIMITING_MAG},
+            raSigma => $fields->{RA_SIGMA},
+            decSigma => $fields->{DEC_SIGMA},
+            observatory => $fields->{OBSERVATORY},
+            de => \@de,
+        );
+        if ($id) {
+            print STDERR "created new field ID $id for object ", $fields->{OBJECT}, "\n";
+        }
+        else {
+            warn "could not insert field for ", $fields->{OBJECT}, "\n";
+        }
+    } 
+    else {
+        # Plain.  Do some cleanup first.
+        my @field_vals = @{$fields}{@field_names};
+        my $key;
+        foreach $key (qw(EPOCH EXPOSURE_START_MJD EXPOSURE_STOP_MJD)) {
+            $fields->{$key} = sprintf "%11.5f", $fields->{$key};
+        }
+        foreach $key (qw(RA RA_SIGMA DEC_SIGMA)) {
+            $fields->{$key} = sprintf "%12.8f", $fields->{$key};
+        }
+        $fields->{DEC} = sprintf "%+12.8f", $fields->{DEC};     # DEC needs +/- format
+
+        print join("\t", @field_vals), "\n";
+    }
+}
+
+
+# Start program here.
+my $result = GetOptions(
+    noheader => \$noheader,
+    insert => \$insert,
+    help => \$help,
+    'fields_dir=s' => \$fields_dir
+);
+
+#usage() if (not @ARGV) or (not $result) or $help;
+usage() if not $result or $help or !@ARGV;
+
+my $offsets;
+if ($fields_dir) {
+    print STDERR "Loading offsets...";
+    $offsets = load_offsets($fields_dir); 
+    print STDERR "done.\n";
+}
+
+my @files = @ARGV;	# copy list of filenames
+my $sch;    # schedule file handle
+
+# Write header.
+if (!$insert and !$noheader) {
+    print join("\t", @field_names), "\n";
+}
+
+if ($insert) {
+    modc_pushAutocommit(0); # disable DC autocommit
+}
+
+foreach my $filename (@files) {
+    print STDERR "Reading $filename.\n";
+    open $sch, $filename or warn "can't open $filename";
+    my @lines = <$sch>;
+    #chomp @lines;  # lines end in \r\n, alas
+    close $sch;
+
+    # Look for offsets file.  If it's there, use it.
+    if (!$fields_dir) {
+        my $offsets_file = $filename;
+        $offsets_file =~ s/\.sch/.positions/;
+        if (-f $offsets_file) {
+            $offsets = load_offsets1($offsets_file);
+        }
+        else {
+            $offsets = undef;   # empty it
+        }
+    }
+    warn "Not using offsets file for $filename.\n" unless $offsets;
+
+    # First 17 lines are header lines.
+    # @todo: examine header lines for consistency.
+    my @headers = splice(@lines, 0, 17);      # toss first 17 lines
+    my @footer = pop @lines;                  # last line has total minutes
+    my $line;       # complete line
+    my $fhash;
+    my $date_spec;
+
+    if ($filename =~ /(\d\d-\d\d)\.sch/) {
+        $date_spec = $1;
+    }
+    else { 
+        warn "can't get month and day from filename $filename";
+        next;
+    }
+
+    foreach $line (@lines) {
+        $line =~ s/[\r\n]+$//;      # toss line terminator
+        $fhash = snag_fields($line);
+        apply_offsets($fhash, $offsets, $date_spec) if $offsets;
+        process_fields($fhash);
+    }
+
+    print STDERR "File ", $filename, " processed.\n";
+}
+
+if ($insert) {
+    modc_commit;
+}
+
+=head1 NAME
+
+sch2obs - Program to process TAO scheduling files
+
+=head1 SYNOPSIS
+
+sch2obs [--insert] [--fields_dir=DIR] file1.sch file2.sch ... > output
+
+=head1 ABSTRACT
+
+sch2obs processes TAO scheduling files into a format suitable for more
+processing, or for insertion into the PSMOPS Oracle 10g instance.  RA
+and DEC values in the .SCH files are updated using higher-precision
+values found in .fields files.
+
+=head1 DESCRIPTION
+
+sch2obs can process files in two ways: flat file output and direct
+DB insertion.
+
+sch2obs takes several parameters and switches:
+
+  -help : show usage
+  --insert : perform direct DB insertion
+  --fields_dir=DIR : obtain updated RA and DEC from .fields files in specified directory DIR, 
+default 'fields'
+
+For flat file output, the fields are tab-delimited, in this order:
+
+    EPOCH
+    RA
+    DEC
+    SURVEY_MODE
+    EXPOSURE_STOP_MJD
+    EXPOSURE_START_MJD
+    FILTER_ID
+    LIMITING_MAG
+    RA_SIGMA
+    DEC_SIGMA
+    OBSERVATORY_CODE
+    OBJECT_ID
+
+=head1 NOTES
+
+LIMITING_MAG is always set to 24.5 for now, as there's no way to obtain it (yet).
+
+=cut

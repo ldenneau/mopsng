@@ -1,0 +1,491 @@
+#!/usr/bin/env perl
+
+use strict;
+
+use Pod::Usage;
+use Getopt::Long;
+use File::Slurp;
+use Carp;
+
+use PS::MOPS::Constants qw(:all);
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+
+
+# List of fields, starting column and length, in .SCH file.
+my %FIELD_SPEC = (
+    LINE_NUM => [0, 6],
+    SLEW_START_MJD => [6, 12],
+    EXPOSURE_START_MJD => [18, 12],
+    UT => [30, 6],
+    OBJECT => [36, 12],
+    RA => [48, 8],
+    DEC => [56, 4],
+    HA => [60, 6],
+    ALT => [66, 4],
+    EXPOSURE_SEC => [70, 9],
+    IDLE_SEC => [79, 6],
+    TYPE => [85, 2],
+    FIELD => [87, 19],
+    DRA => [106, 14],
+    DDEC => [120, 13],
+    USER => [133, 5],
+    RES => [138, 3],
+    SURVEY_MODE => [141, 5],
+    SIZE => [146, 5],
+    FILTER_ID => [151, 7],
+    REQ_ID => [158, 11],
+    FILE => [169, 20],
+);
+
+# Options.
+my $inst;                   # MOPS instance
+my $instance_name;          # override instance name
+my $insert = 1;		        # used to be option; always 1 now
+my $fields_dir;             # where to find field corrections
+my $limiting_mag;
+my $objfilt;                # insert only fields whose TAO object ID match this string
+my $filefilt;               # insert only files matching this spec
+my $filter = 'r';           # observing filter (usually one of grizyw)
+my $rootdir;                # change to this directory before processing files
+my $help = 0;
+my $prevent_duplicate_epochs; # Don't insert fields having existing epochs.
+
+# Default to the most likely rootdir, if it exists.
+my $default_rootdir = "$ENV{MOPS_HOME}/data/ssm/surveys/main";
+if (-d $default_rootdir) {
+    $rootdir = $default_rootdir;
+    print STDERR "Using default rootdir of $rootdir.\n";
+}
+
+# Start program here.
+my $result = GetOptions(
+    'instance=s' => \$instance_name,
+    'limiting_mag=f' => \$limiting_mag,
+    'filter=s' => \$filter,
+    'fields_dir=s' => \$fields_dir,
+    'objfilt=s' => \$objfilt,
+    'filefilt=s' => \$filefilt,
+    'rootdir=s' => \$rootdir,
+    help => \$help,
+    prevent_duplicate_epochs => \$prevent_duplicate_epochs,
+) or pod2usage(2);
+pod2usage(-verbose => 2) if $help;
+$inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig;
+my $mops_logger = $inst->getLogger;
+
+
+# Globals.
+my @default_de = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+my @field_names = qw(
+    EPOCH
+    RA
+    DEC
+    SURVEY_MODE
+    EXPOSURE_START_MJD
+    EXPOSURE_STOP_MJD
+    FILTER_ID
+    LIMITING_MAG
+    RA_SIGMA
+    DEC_SIGMA
+    OBSERVATORY
+    OBJECT
+);
+
+
+sub load_offsets {
+    # Read .fields files containing RA and DEC offsets for SSS objects.
+    # For each day of the year indexed using the string 'MM-DD', store
+    # the object's delta RA and delta DEC.
+    my $path = $_[0];
+    my $offsets = {
+        DRA => {},
+        DDEC => {},
+    };
+
+    my @files;
+    my $dirh;
+    opendir $dirh, $path or die "can't read directory $path";
+    @files = grep { /\.fields$/ } readdir $dirh;
+    closedir $dirh;
+
+    my $file;
+    my $line;
+    my ($object, $dra, $ddec);
+    my $date_spec;
+
+    foreach $file (@files) {
+        # Snag month, day from filename.
+        if ($file =~ /\w\w\w-(\d\d-\d\d)\.fields/) {
+            $date_spec = $1;
+        }
+        else { 
+            warn "can't get month and day from filename $file";
+            next;
+        }
+
+        # Slurp all lines in file.  Format is OBJECT DRA DDEC.
+        my $fh;
+        open $fh, "$path/$file" or warn "can't open $file";
+        while (defined($line = <$fh>)) {
+            chomp $line;
+            $line =~ s/^\s+//;   # trim leading whitespace
+            ($object, $dra, $ddec) = split /\s+/, $line;
+            $offsets->{DRA}->{$date_spec}->{$object} = $dra;
+            $offsets->{DDEC}->{$date_spec}->{$object} = $ddec;
+        }
+        close $fh;
+    }
+
+    return $offsets;
+}
+
+
+
+sub load_offsets1 {
+    # Read specified file(s) containing RA and DEC offsets for SSS objects.
+    my (@files) = @_;
+    my $offsets = {
+        DRA => {},
+        DDEC => {},
+    };
+
+    my $file;
+    my $line;
+    my ($object, $dra, $ddec);
+    my $date_spec;
+
+    foreach $file (@files) {
+        # Snag month, day from filename.
+        if ($file =~ /^\w\w\w-\d\d\d\d-(\d\d-\d\d).positions/) {
+            $date_spec = $1;
+        }
+        else { 
+            warn "can't get month and day from filename $file";
+            next;
+        }
+
+        # Slurp all lines in file.  Format is OBJECT DRA DDEC.
+        my $fh;
+        open $fh, $file or warn "can't open $file";
+        while (defined($line = <$fh>)) {
+            chomp $line;
+            $line =~ s/^\s+//;   # trim leading whitespace
+            ($object, $dra, $ddec) = split /\s+/, $line;
+            $offsets->{DRA}->{$date_spec}->{$object} = $dra;
+            $offsets->{DDEC}->{$date_spec}->{$object} = $ddec;
+        }
+        close $fh;
+    }
+
+    return $offsets;
+}
+
+
+sub snag_fields {
+    # Given a line from SCH file, extract fields into a hash.  Return 
+    # a reference to the hash.
+    my $line = $_[0];
+    my $fields = {};
+    my ($start, $len);
+
+    foreach my $key (keys %FIELD_SPEC) {
+        ($start, $len) = @{$FIELD_SPEC{$key}};
+        $fields->{$key} = substr($line, $start, $len);
+        $fields->{$key} =~ s/^\s+|\s+$//g;   # clean up
+    }
+
+    # Manufacture some fields.
+    $fields->{EXPOSURE_STOP_MJD} = $fields->{EXPOSURE_START_MJD} + $fields->{EXPOSURE_SEC} / $SECONDS_PER_DAY;
+    $fields->{EPOCH} = $fields->{EXPOSURE_START_MJD} + $fields->{EXPOSURE_SEC} / $SECONDS_PER_DAY / 2;
+    $fields->{LIMITING_MAG} = $limiting_mag;
+    $fields->{RA_SIGMA} = 0.0;
+    $fields->{DEC_SIGMA} = 0.0;
+    $fields->{OBSERVATORY} = $mops_config->{site}->{obscode} || die "obscode not specified";  # Mauna Kea
+
+    return $fields;
+}
+
+
+sub apply_offsets {
+    my ($fields, $offsets, $date_spec) = @_;
+
+    # Adjust RA and DEC by values in our global table from the fields files.
+    my $ra_new;
+    my $dec_new;
+    my $object = $fields->{OBJECT};
+
+    $ra_new = $offsets->{DRA}->{$date_spec}->{$object};
+    if (!defined($ra_new)) {
+        warn "no offset found for $date_spec, $object";
+    }
+    else {
+        $fields->{RA} = $ra_new;
+    }
+
+    $dec_new = $offsets->{DDEC}->{$date_spec}->{$object};
+    if (!defined($dec_new)) {
+        warn "no offset found for $date_spec, $object";
+    }
+    else {
+        $fields->{DEC} = $dec_new;
+    }
+}
+
+# If the epoch MJD already exists in the DB then return 1, otherwise 0.
+sub field_epoch_exists {
+    my($epoch)=@_;
+    my $dbh=$inst->dbh();
+    my $sql="select epoch_mjd from `fields` where epoch_mjd=?";
+    my $sth=$dbh->prepare($sql);
+    $sth->execute($epoch);
+    my $row=$sth->fetchrow_arrayref();
+    if($row->[0]){
+        if($row->[0] eq $epoch){ return 1; }
+    }
+    return 0;
+}
+
+sub process_fields {
+    # Given a line from a .SCH file and a table of offsets, process the
+    # line according to user prefs (plain, insert).
+    my $fields = $_[0];
+    my @de = $fields->{DE} || @default_de;  # dummy detection efficiencies if not specified
+
+    if ($insert) {
+        # Insert into DB.
+        my $obs;
+        my $id;
+        my $field;
+
+        $field = PS::MOPS::DC::Field->new(
+            $inst,
+            epoch => $fields->{EPOCH},
+            ra => $fields->{RA} * 15,   # convert hours to deg
+            dec => $fields->{DEC},
+            timeStart => $fields->{EXPOSURE_START_MJD},
+            timeStop => $fields->{EXPOSURE_STOP_MJD},
+            filter => $filter,
+            surveyMode => $fields->{SURVEY_MODE},
+            limitingMag => $fields->{LIMITING_MAG},
+            raSigma => $fields->{RA_SIGMA},
+            decSigma => $fields->{DEC_SIGMA},
+            obscode => $fields->{OBSERVATORY},
+            de => \@de,
+        );
+
+        $id = $field->insert;
+        if ($id) {
+#            printf STDERR "Creating new field $id for object %s (%s)\n", 
+#                $fields->{OBJECT}, $fields->{SURVEY_MODE};
+            print STDERR join(' ', 'FIELD', $field->fieldId, $fields->{OBJECT}, 
+                sprintf('%.8f', $field->epoch),
+                sprintf('%.8f', $field->ra),
+                sprintf('%.8f', $field->dec)), "\n";
+        }
+        else {
+            warn "could not insert field for ", $fields->{OBJECT}, "\n";
+        }
+    } 
+    else {
+        # Plain.  Do some cleanup first.
+        my @field_vals = @{$fields}{@field_names};
+        my $key;
+        foreach $key (qw(EPOCH EXPOSURE_START_MJD EXPOSURE_STOP_MJD)) {
+            $fields->{$key} = sprintf "%11.5f", $fields->{$key};
+        }
+        foreach $key (qw(RA RA_SIGMA DEC_SIGMA)) {
+            $fields->{$key} = sprintf "%12.8f", $fields->{$key};
+        }
+        $fields->{DEC} = sprintf "%+12.8f", $fields->{DEC};     # DEC needs +/- format
+
+        print join("\t", @field_vals), "\n";
+    }
+}
+
+my @files = @ARGV;	# copy list of filenames
+if ($files[0] !~ /fields$/ and $rootdir) {  # .fields => MIF-FS insert
+    chdir $rootdir or die "can't chdir to $rootdir";
+    # If @files is empty, look for .sch files in current directory.
+    unless (@files) {
+        @files = <*.sch>;
+
+        if ($filefilt) {
+#            my $filefilt_str = quotemeta $filefilt;
+            my $filefilt_str = $filefilt;
+            $filefilt_str =~ s/,/|/g;           # convert so we can do 
+            @files = grep { /$filefilt_str/ } @files;
+        }
+    }
+}
+pod2usage(2) if not $result or $help or !@files;
+
+
+# Config.
+$limiting_mag = $mops_config->{site}->{limiting_mag} or die "limiting mag not specified in config";
+
+
+my $offsets;
+if ($fields_dir) {
+    print STDERR "Loading offsets...";
+    $offsets = load_offsets($fields_dir); 
+    print STDERR "done.\n";
+}
+
+my $sch;    # schedule file handle
+
+if ($insert) {
+    $inst->pushAutocommit(0); # disable DC autocommit
+}
+
+foreach my $filename (@files) {
+    print STDERR "Reading $filename.\n";
+    open $sch, $filename or warn "can't open $filename";
+    my @lines = <$sch>;
+    #chomp @lines;  # lines end in \r\n, alas
+    close $sch;
+
+    if ($lines[0] =~ /MIF-FS/) {
+        # MOPS field dump for simtests.
+        do_mif(@lines);
+        next;
+    }
+
+    # Look for offsets file.  If it's there, use it.
+    if (!$fields_dir) {
+        my $offsets_file = $filename;
+        $offsets_file =~ s/\.sch/.positions/;
+        if (-f $offsets_file) {
+            $offsets = load_offsets1($offsets_file);
+        }
+        else {
+            $offsets = undef;   # empty it
+        }
+    }
+    warn "Not using offsets file for $filename.\n" unless $offsets;
+
+    # First 17 lines are header lines.
+    # @todo: examine header lines for consistency.
+    my @headers = splice(@lines, 0, 17);      # toss first 17 lines
+    my @footer = pop @lines;                  # last line has total minutes
+    my $line;       # complete line
+    my $fhash;
+    my $date_spec;
+
+    if ($filename =~ /(\d\d-\d\d)\.sch/) {
+        $date_spec = $1;
+    }
+    else { 
+        warn "can't get month and day from filename $filename";
+        next;
+    }
+
+    my $objfilt_re;
+    if ($objfilt) {
+        $objfilt_re = qr|\Q$objfilt\E|;
+    }
+
+    foreach $line (@lines) {
+        $line =~ s/[\r\n]+$//;      # toss line terminator
+        $fhash = snag_fields($line);
+        if (!$objfilt_re or $fhash->{OBJECT} =~ $objfilt_re) {
+            # Convert TAO object name to PS survey mode.
+            if ($fhash->{OBJECT} =~ /^(\w+)/) {
+                $fhash->{SURVEY_MODE} = substr($1, 0, 3);
+            }
+            else {
+                carp "Funny TAO object name: " . $fhash->{OBJECT};
+            }
+
+            apply_offsets($fhash, $offsets, $date_spec) if $offsets;
+            process_fields($fhash);
+        }
+    }
+
+    print STDERR "File ", $filename, " processed.\n";
+}
+
+if ($insert) {
+    $inst->dbh->commit;
+}
+exit();
+
+
+sub do_mif {
+    my @lines = @_;
+    my @stuff;
+    my %field;
+    foreach my $line (@lines) {
+        next if $line =~ /^#/;      # header
+        @stuff = split /\s+/, $line;
+        @field{qw(
+            fpaId
+            epoch
+            ra
+            dec
+            surveyMode
+            timeStart
+            timeStop
+            filter
+            limitingMag
+            raSigma
+            decSigma
+            obscode
+        )} = @stuff;
+        
+        # Check to see if the epoch already exists in the DB.
+        if(field_epoch_exists($field{epoch})==1 && $prevent_duplicate_epochs==1){
+            print STDERR "Not inserting field because of duplicate epoch_mjd in the DB. (epoch = $field{epoch})\n";
+        }
+        else {
+            my $field = PS::MOPS::DC::Field->new($inst, %field, de => \@default_de);
+            $field->insert();
+        }
+
+    }
+}
+
+
+
+=head1 NAME
+
+insertSyntheticFields - Program to process TAO scheduling files
+
+=head1 SYNOPSIS
+
+insertSyntheticFields [options] file1.sch file2.sch 
+
+  --rootdir DIR : look for .sch files in this directory
+  --objfilt STRING : insert only fields whose TAO object ID match STRING; e.g. mss, ess, oph, opl
+  --filefilt STRING : insert only .sch files that contain STRING in their names, multiple separated by comma OK
+  --filter F : set filter for all fields to F, where F is one of grizyV
+  --help : show usage
+  --fields_dir=DIR : obtain updated RA and DEC from .fields files in specified directory DIR, default '../fields'
+
+=head1 DESCRIPTION
+
+insertSyntheticFields processes TAO scheduling files for insertion into
+the current PSMOPS instance.  RA and DEC values in the .SCH files are
+updated using higher-precision values found in .fields files.
+
+For flat file output, the fields are tab-delimited, in this order:
+
+    EPOCH
+    RA
+    DEC
+    SURVEY_MODE
+    EXPOSURE_STOP_MJD
+    EXPOSURE_START_MJD
+    FILTER_ID
+    LIMITING_MAG
+    RA_SIGMA
+    DEC_SIGMA
+    OBSERVATORY
+    OBJECT_ID
+
+=head1 NOTES
+
+LIMITING_MAG is always set to 24.5 for now, as there's no way to obtain it (yet).
+
+=cut

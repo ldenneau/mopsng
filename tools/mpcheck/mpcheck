@@ -1,0 +1,261 @@
+#!/usr/bin/env perl
+# Take MPC detections on stdin and submit to MPChecker.
+
+use strict;
+use warnings;
+
+use FileHandle;
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+
+use PS::MOPS::MITI;
+use PS::MOPS::MPC qw(:all);
+#use URI::Escape;
+
+use HTTP::Request::Common qw(POST);
+use LWP::UserAgent;
+use Astro::Time;
+
+
+use subs qw(filter_pre);
+use subs qw(filter_brief);
+
+
+# Options
+my $mag_limit = 22;
+my $radius_arcmin = 5;          # arcmin
+my $epoch_mjd;                  # date of interest
+my $ra_deg;
+my $dec_deg;
+my $obscode;
+my $insert_html;                # insert special form HTML in output
+my $object_name;                # required for HTML injection
+my $filter;
+my $brief;
+my $help;
+GetOptions(
+    'epoch_mjd=f' => \$epoch_mjd,
+    'obscode=s' => \$obscode,
+    'ra_deg=f' => \$ra_deg,
+    'dec_deg=f' => \$dec_deg,
+    'mag_limit=f' => \$mag_limit,
+    'radius_arcmin=f' => \$radius_arcmin,
+    insert_html => \$insert_html,
+    'object_name=s' => \$object_name,
+    filter => \$filter,
+    brief => \$brief,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my %form;
+if (defined($epoch_mjd)) {
+    die "--obscode is required if --epoch_mjd specified" unless $obscode;
+    die "--ra_deg is required if --epoch_mjd specified" unless defined($ra_deg);
+    die "--dec_deg is required if --epoch_mjd specified" unless defined($dec_deg);
+
+    # Convert date to year/month/day.
+    my ($day, $month, $year, $utfraction) = Astro::Time::mjd2cal($epoch_mjd);
+
+    # Convert RA/dec to sexagesimal.
+    my $ra_sx =  Astro::Time::turn2str(Astro::Time::deg2turn($ra_deg), 'H', 4, ' ');
+    my $dec_sx =  Astro::Time::turn2str(Astro::Time::deg2turn($dec_deg), 'D', 4, ' ');
+
+    # MPC requires leading hours/degrees to be two digits if < 10.
+    $ra_sx =~ s/^(\d )/0$1/;
+    $dec_sx =~ s/^([+-]?)(\d:)/${1}0${2}/;
+
+    %form = (
+        which => 'pos',
+        TextArea => '',
+        radius => $radius_arcmin,       # arcmin
+        limit => $mag_limit,            # limiting mag
+        'sort' => 'd',                  # sort by increasing distance
+        ra => $ra_sx,
+        decl => $dec_sx,
+        mot => 'd',                     # motion in deg/day
+        tmot => 't',                    # total (not separate RA/Dec) motions
+        pdes => 'u',                    # output designations in unpacked form
+        needed => 'n',                  # numbered objects only
+        ps => 'n',                      # don't include planets and irregular outer satellites
+        type => 'p',                    # plain HTML
+#        type => 'm',                   # MPES-aware (whatever that is)
+    );
+    $form{year} = $year;
+    $form{month} = sprintf "%02d", $month;
+    $form{day} = $day + $utfraction;
+    $form{oc} = $obscode;
+}
+else {
+    # Read detections from STDIN.
+    my @detections = <>;
+    chomp @detections;
+
+    %form = (
+        year => 2007,
+        month => '01',
+        day => 18.10,
+        which => 'obs',
+    #    TextArea => $detections[0],
+        TextArea => join("\r\n", @detections),
+        radius => $radius_arcmin,       # arcmin
+        limit => $mag_limit,            # limiting mag
+        oc => 691,
+        'sort' => 'd',                  # sort by increasing distance
+        ra => '',
+        decl => '',
+        mot => 'd',
+        tmot => 's',
+        pdes => 'u',
+        needed => 'f',
+        ps => 'n',
+        type => 'p',
+    );
+}
+
+my $url = 'http://www.minorplanetcenter.net/cgi-bin/mpcheck.cgi';
+my $ua = LWP::UserAgent->new(timeout => 600);
+$ua->agent("Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.8.1.1) Gecko/20061208 Firefox/2.0.0.1");
+my $response = $ua->post(
+    $url,
+    \%form,
+);
+my $html = $response->content;
+if (!$brief && $insert_html && $object_name) {
+    my $stuff = <<"STUFF";
+<body>
+<form action="mpcheck.html" method="POST">
+<input type="hidden" name="objectName" value="$object_name">
+V = <input name="mag_limit" value="$mag_limit"> 
+Radius (arcmin) = <input name="radius_arcmin" value="$radius_arcmin">
+<input type="submit" value="Resubmit">
+</form>
+<p>
+STUFF
+    $html =~ s/<body>/$stuff/i;
+}
+
+# If --filter is set, reduce the output to
+# asteroid_number name ra_deg dec_deg h_V
+if ($filter) {
+    $html = filter_pre($html);
+}
+elsif ($brief) {
+    $html = filter_brief($html);
+}
+
+print $html;
+exit;
+
+
+sub parse_line {
+    my $line = $_[0];
+    my $number_and_name = substr($line, 0, 24);
+    my $ra_str = substr($line, 25, 10);
+    my $dec_str = substr($line, 36, 10);
+    my $mag_str = substr($line, 47, 5);
+
+    # Clean up stuff.
+    if ($number_and_name =~ /^\s*\((\d+)\) (.*)/) {
+        my $number = $1;
+        my $name = $2;
+        $name =~ s/\s*//g;
+        my $ra_deg = turn2deg(str2turn($ra_str, 'H'));
+        my $dec_deg = turn2deg(str2turn($dec_str, 'D'));
+        return join(' ', $number, $name, $ra_deg, $dec_deg, $mag_str);
+    }
+    else {
+        return '';
+    }
+}
+
+
+sub filter_pre {
+    # Filter interesting stuff from MPChecker output.  This is totally dependent
+    # on our reverse-engineered understanding of their output format; if the format
+    # changes, then things become broken.
+    my $html = $_[0];
+    my @results;
+    if ($html =~ m|<pre>(.*)</pre>|s) {
+        my @lines = split /\n/, $1;
+        foreach my $line (@lines) {
+            if ($line =~ /^\s*\(\d+\)/) {       # looks like asteroid number
+                push @results, parse_line($line);
+            }
+        }
+    }
+
+    return join("\n", grep { $_ } @results) . "\n";
+}
+
+
+sub filter_brief {
+    # Filter uninteresting stuff from MPChecker output.  This is totally dependent
+    # on our reverse-engineered understanding of their output format; if the format
+    # changes, then things become broken.
+    my $html = $_[0];
+    my @results;
+    @results = ($html =~ m|<pre>(.*?)</pre>|sg);
+    my @obs;
+    my @res;
+    my @header;
+    my $seen_header1 = 0;
+    my $seen_header2 = 0;
+
+
+    foreach my $r (map { split /[\r\n]+/ } @results) {
+        $r =~ s/^\s+$//;  # strip blank lines
+        next unless $r;
+        $r =~ s/<a.*//;         # strip "Further Obs" link
+
+        # Strip redundant occurrences of the table header from the MPC output.
+        if ($r =~ /Offsets/) {
+            if (!$seen_header1) {
+                push @header, $r;
+                $seen_header1 = 1;
+            }
+            next;
+        }
+        elsif ($r =~ /Comment/) {
+            if (!$seen_header2) {
+                push @header, $r;
+                $seen_header2 = 1;
+            }
+            else {
+                push @res, '';
+            }
+            next;
+        }
+        elsif ($r =~ /MOPS/) {
+            push @obs, $r;
+        }
+        elsif ($r =~ /\d/) {
+            push @res, $r;
+        }
+        elsif ($r =~ /cmt/) {
+            push @res, $r;
+        }
+    }
+    return "<small><pre>\r\n" . join("\r\n", @obs, '', @header, '', @res) . "\r\n</pre>\n";
+}
+
+
+=head1 NAME
+
+mpcheck - Submit MPC-formatted detections (from miti2mpc --mpcheck) to MP checker WWW service.
+
+=head1 SYNOPSIS
+
+mpcheck --epoch_mjd=EPOCH [options] < detections
+
+  --epoch_mjd EPOCH : date of interest, required
+  --obscode OBSCODE : use specified observatory code
+  --mag_limit : V-magitude limit for search
+  --radius_arcmin : radius to search, in arcminutes
+
+=head1 DESCRIPTION
+
+Coming.
+
+=cut

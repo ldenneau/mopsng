@@ -1,0 +1,186 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+create_detectability_fileset - Create a MOPS detectability queries from SYNTHEPH files
+
+=head1 SYNOPSIS
+
+create_detectability_fileset [options] NN FILE1 FILE2 ...
+
+  --instance=INSTANCE_NAME : specify simulation to use
+  --product=PRODUCT_NAME : datastore product name to use, default 'mops-detectability-requests'
+  --register : register fileset in datastore using register_detectability_fileset afterwards
+  --help : show this manpage
+
+  NN : night number we are processing, for labeling datastore filesets
+  FILE1 FILE2 ... : input MIF-SYNTH files
+
+=head1 DESCRIPTION
+
+Create MOPS detectability queries using the specified set
+of files.  For each file, create a corresponding file in the
+mops-detectability-query fileset.  We will use a matching script called
+process_detectability_response2 that reads the sponses and writes out
+modified MIF-SYNTH files with each detection's status (potentially)
+modified.
+
+=cut
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+
+use PS::MOPS::DC::Instance;
+use PS::MOPS::DC::Field;
+use PS::MOPS::DC::Detection;
+use PS::MOPS::Detectability;
+
+
+# Globals.
+my $register_cmd = 'register_fileset';
+
+
+my $instance_name;
+my $product = 'mops-detectability-requests';
+my $register;
+my $help;
+GetOptions(
+    'instance=s' => \$instance_name,
+    'product=s' => \$product,
+    register => \$register,
+    help => \$help,
+) or pod2usage(2);
+pod2usage(-verbose => 3) if $help;
+
+my $inst = PS::MOPS::DC::Instance->new(DBNAME => $instance_name);
+my $mops_config = $inst->getConfig();
+my $mops_logger = $inst->getLogger();
+my $nn = shift or die "no NN specified";
+
+my @files = @ARGV;
+
+if (!@files) {
+    $mops_logger->info("No files to process for night $nn");
+    exit;
+}
+
+
+my $fileset = $inst->dbname . ".$nn";
+my $ds_dir = "$ENV{MOPS_HOME}/ds/dsroot/$product";
+my $fs_dir = "$ds_dir/$fileset";
+
+if (!-d $fs_dir) {
+    if (-e $fs_dir) {
+        $mops_logger->logdie("not a directory: $fs_dir");
+    }
+    mkdir($fs_dir) or $mops_logger->logdie("can't create fileset dir $fs_dir");
+}
+
+
+my $cwd = getcwd;
+#chdir $fs_dir or $mops_logger->logdie("can't chdir to $fs_dir");
+
+foreach my $file (@files) {
+    my ($root, $file_num);
+    if ($file =~ /^(.*)\.(\d+)$/) {
+        ($root, $file_num) = ($1, $2);
+    }
+    else {
+        $mops_logger->logdie("strange file name: $file");
+    }
+    my ($field_id, $detref) = load_file($file);
+    my $field = modcf_retrieve($inst, fieldId => $field_id)
+        or $mops_logger->logdie("can't retrieve field $field_id");
+
+    PS::MOPS::Detectability::write_request(
+        $inst, 
+        {   
+            dir => $fs_dir,
+#            fieldId => $field->fieldId,
+            fieldId => $file_num,
+            nn => $field->nn,
+            QUERY_ID => (sprintf "%.6f.", $field->epoch) . $file_num,
+            FPA_ID => $field->fpaId,
+            'MJD-OBS' => $field->epoch,
+            FILTER => $field->filter,
+            OBSCODE => $field->obscode,
+            STAGE => 'diff',            # default for now
+        },
+        $detref,
+    );
+
+    print STDERR ".";
+};
+
+print STDERR "\n", sprintf "%d files created in fileset.\n", scalar @files;
+
+if ($register) {
+    system(
+        $register_cmd, 
+        '--add',
+        "--type=mops_detectability_query",
+        "--product=$product",
+        "--fileset=$fileset",
+    ) == 0 or $mops_logger->logdie("register for $fileset failed");
+}
+
+# Now if we have been requested to wait for the result, do so.  Note that the current IPP
+# implementation puts the responses at the $product level, one per QUERY_ID instead of
+# per fileset.
+
+chdir $cwd;
+exit;
+
+
+sub load_file {
+    # Read MIF-SYNTH detections from file into a list of MOPS Detection objects.
+    my ($file) = @_;
+    my $fh = new FileHandle $file or $mops_logger->logdie("can't open file $file");
+    my $line;
+    my %det_args;
+    my @dets;
+    my $det;
+    my $dummy;
+    my $field_id;
+
+    # First line hackishly should contain field ID.
+    $line = <$fh>;
+    $mops_logger->logdie("first line must hackishly contain field ID")
+        unless $line =~ /^#\s*FIELD_ID\s+(\d+)\s*$/;
+    $field_id = $1;
+
+    while ($line = <$fh>) {
+        next if $line =~ /^(#|!)/;  # looks like comment, skip
+
+        ($dummy, @det_args{qw(
+            detId
+            ra
+            dec
+            epoch
+            mag
+            refMag
+            filter
+            isSynthetic
+            detNum
+            status
+            s2n
+            raSigma
+            decSigma
+            magSigma
+            orient_deg
+            length_deg
+            objectName
+            fieldId
+            obscode
+        )}) = split /\s+/, $line;
+
+        $det = PS::MOPS::DC::Detection->new($inst, %det_args);
+        push @dets, $det;
+    }
+    $fh->close();
+    return ($field_id, \@dets);
+}

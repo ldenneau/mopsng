@@ -1,0 +1,15 @@
+# Runs OpenOrb ranging on a set of detections and produces a list of compatible orbits
+# including their likelihood.
+
+
+# Ranging
+mt --xd $OID > detections.des
+oorb --task=ranging --conf=oorb.conf.neo_probability --obs-in=detections.des --orb-out=orbits.orb
+oorb --conf=oorb.conf.neo_probability --task=classification --orb-in=orbits.orb
+oorb --conf=oorb.conf.neo_probability --task=classification_apriori --orb-in=orbits.orb
+
+# Ephemerides
+oorb --conf=oorb.conf.fou --task=fou --orb-in=orbits.orb --code=F65 --timespan=3 --step=.04
+
+# Put local time in .fou file.
+perl -ape 'next if /^#/; ($foo) = `jd2cal --time $F[0]`; chomp $foo; s/^(\S+)/$1 $foo/' < F65-fou.txt > F65-fou2.txt

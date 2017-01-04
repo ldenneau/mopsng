@@ -1,0 +1,216 @@
+#!/usr/bin/env python
+
+"""
+Scan the specified ONS file and emit files, one for each tracklet,
+that satisfy some filtering criteria:
+
+    OBSCODE in 703, 691, G96, F51
+    mag < 17 (or whatever)
+    velocity < 0.7 deg/day
+    +/- 40 deg from opposition
+
+"""
+
+import os, sys, math, time, re
+import optparse
+import slalib
+import MPC
+
+from pprint import pprint
+
+
+# For SLALIB.
+SUN = 0
+
+# Allowed obscodes.
+OBSCODES = ['703', 'G96', '691', 'F51']
+
+# Observations must be brighter than this mag.
+#MAG_THRESH = 17
+MAG_THRESH = 19     # testing
+
+
+class Detection(object):
+    def __init__(self, det_id, obscode, epoch_mjd, ra_deg, dec_deg, filt, mag, sol_deg=None):
+        self.id = det_id
+        self.obscode = obscode
+        self.epoch_mjd = epoch_mjd
+        self.ra_deg = ra_deg
+        self.dec_deg = dec_deg
+        self.filt = filt
+        self.mag = mag
+        self.sol_deg = sol_deg
+
+    def __repr__(self):
+        return "%s %12.5f %9.5f %9.5f %5.2f%c %9.5f" % (
+            self.obscode,
+            self.epoch_mjd,
+            self.ra_deg,
+            self.dec_deg,
+            (self.mag or 0.0),
+            (self.filt or ' '),
+            (self.sol_deg or 0.0)
+        )
+
+
+class Tracklet(object):
+    def __init__(self, tid):
+        self.id = tid
+        self.obscode = None
+        self.mag = None
+        self.filt = None
+        self.pa_deg = None
+        self.spv_dd = None
+        self.detections = []
+
+    def __repr__(self):
+        return ("%s: %s SPV_dd=%.2f PA=%.2f\n" % (self.id, self.obscode, (self.spv_dd or 0.0), (self.pa_deg or 0.0))) + ''.join(["  %s\n" % str(x) for x in self.detections])
+
+    def add_det(self, det):
+        self.detections.append(det)
+        if det.mag is not None:
+            if self.mag is None or det.mag < self.mag:      # keep brightest
+                self.mag = det.mag
+                self.filt = det.filt
+            # <- if
+        self.obscode = det.obscode
+        # <- if
+
+    def get_dt(self):
+        return self.detections[-1].epoch_mjd - self.detections[0].epoch_mjd
+
+    def compute_derived(self):
+        self.detections.sort(cmp=lambda a, b: cmp(a.epoch_mjd, b.epoch_mjd))
+        for det in self.detections:
+            if det.mag is None:
+                det.mag = self.mag
+                det.filt = self.filt
+            # <- if
+
+            # Compute solar elongation.
+            sta_long_rad = 0
+            sta_lat_rad = 0
+            sun_ra_rad, sun_dec_rad, sun_diam = slalib.sla_rdplan(det.epoch_mjd, SUN, sta_long_rad, sta_lat_rad)
+            sun_ecl_rad, sun_ecb_rad = slalib.sla_eqecl(sun_ra_rad, sun_dec_rad, det.epoch_mjd)
+            det_ecl_rad, det_ecb_rad = slalib.sla_eqecl(math.radians(det.ra_deg), math.radians(det.dec_deg), det.epoch_mjd)
+
+            # Solar elongation is difference in ecliptic longitude.
+            det.sol_deg = math.fabs(math.degrees(sun_ecl_rad - det_ecl_rad))
+            if det.sol_deg < 0:
+                det.sol_deg += 360
+        # <- for
+
+        if len(self.detections) > 1:
+            # Compute v_tot
+            first_ra_rad = math.radians(self.detections[0].ra_deg)
+            first_dec_rad = math.radians(self.detections[0].dec_deg)
+            last_ra_rad = math.radians(self.detections[-1].ra_deg)
+            last_dec_rad = math.radians(self.detections[-1].dec_deg)
+            delta = math.degrees(slalib.sla_dsep(first_ra_rad, first_dec_rad, last_ra_rad, last_dec_rad))
+
+            dt = self.get_dt()
+            if dt != 0:
+                self.spv_dd = delta / dt;
+                self.pa_deg = math.degrees(slalib.sla_dbear(first_ra_rad, first_dec_rad, last_ra_rad, last_dec_rad))
+        # <- if
+
+
+def emitif(trk):
+#    if trk.get_dt() != 0 and len(trk.detections) > 1 and (det.sol_deg > 140 and det.sol_deg < 220) and trk.mag < 22 and trk.spv_dd < 0.7:
+    det = trk.detections[0]
+    if re.match(r'^\w+$', trk.id) and trk.mag is not None and trk.get_dt() != 0 and len(trk.detections) > 1 and (det.sol_deg > 140 and det.sol_deg < 220) and trk.mag < MAG_THRESH and trk.spv_dd < 0.7:
+        fname = trk.id + ".obs"
+        f = file(fname, "w")
+        for det in trk.detections:
+            f.write("%s %.6f %.5f %.5f %.1f %c %s %.1f %.1f %.3f\n" % (
+                trk.id,
+                det.epoch_mjd,
+                det.ra_deg,
+                det.dec_deg,
+                det.mag,
+                det.filt,
+                det.obscode,
+                trk.pa_deg,
+                det.sol_deg,
+                trk.spv_dd
+            ))
+        # <- for
+        sys.stderr.write("Wrote " + fname  + "\n")
+
+
+if __name__ == "__main__":
+    # Constants
+    USAGE = """\
+Usage: filterons FILENAME
+
+  FILENAME : ONS file to scan
+ """
+
+    # Get user input (tracks file) and make sure that it exists.
+    parser = optparse.OptionParser(USAGE)
+#    parser.add_option("--help",
+#                      action="store_true",
+#                      dest="ipp",
+#                      default=False)
+    options, args = parser.parse_args()
+    if len(args) < 1:
+        parser.error('No input file specified.')
+
+    # Loop through the lines in the file.  Each time we hit the
+    # end of a tracklet (new tracklet, EOF), run some stuff
+    # on the just-completed tracklet and emit it if it satisfies
+    # our rules.
+
+    # Want to build structures that look like:
+    # {
+    #   dets : [
+    #      epoch_mjd : E,
+    #      ra_deg : R,
+    #      dec_deg : DEC,
+    #      mag : H,
+    #      filter : F,
+    #      sol_deg : solar elongation,
+    #   ],
+    #   mag : H,
+    #   spv_dd : V,
+    #   pa_deg : PA,
+    #   obscode : OBS,
+    # }
+    all_trks = {}
+    last_id = None
+    trk = None
+    num = 0
+    for line in file(sys.argv[1]).xreadlines():
+        try:
+            stuff = MPC.mpc2dict(line)
+        except ValueError, e:
+            sys.stderr.write("Problem converting line: " + line)
+            continue
+
+        if stuff['obscode'] not in OBSCODES:
+            continue
+
+        tid = stuff['id'].strip()
+
+        if last_id is None or tid != last_id:
+            # Clean up prev.
+            if trk:
+                trk.compute_derived()
+                emitif(trk)
+
+            # Now create new current tracklet.
+            trk = Tracklet(tid)
+
+        det = Detection(tid, stuff['obscode'], stuff['epoch_mjd'], stuff['ra_deg'], stuff['dec_deg'], stuff['filt'], stuff['mag'])
+        trk.add_det(det)
+        last_id = tid
+        num += 1
+#        if num % 100000 == 0:
+#            sys.stderr.write('.')
+    # <- for line
+
+    trk.compute_derived() 
+    emitif(trk)
+#    sys.stderr.write('\n')
+
+

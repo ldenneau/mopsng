@@ -1,0 +1,26 @@
+PS/MOPS/Ephem version 0.01
+==========================
+
+PS::MOPS::Ephem provides generic ephemeris services for PS::MOPS
+applications.  An ephemeris can be calculated from a PSMOPS objectName
+or objectID, or from a complete set of orbital parameters and ephemeris
+time.
+
+The orbital parameters are passed internally to JPL's SSD_1 ephemeris
+module.
+
+INSTALLATION
+
+To install this module type the following:
+
+   perl Makefile.PL
+   make
+   make test
+   make install
+
+COPYRIGHT AND LICENCE
+
+Copyright (C) 2005 Larry Denneau, Jr., Institute for Astronomy, University of Hawaii.
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself.
