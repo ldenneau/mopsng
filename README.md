@@ -13,7 +13,7 @@ the NEOWISE survey, the ATLAS Project and LSST.
 
 An excruciatingly thorough description of the Pan-STARRS Moving Object Processing System can be found in [Denneau et al. (2013)](https://arxiv.org/abs/1302.7281).
 
-MOPS uses synthetic asteroid populations for its simulations.  [Grav et al.](http://adsabs.harvard.edu/abs/2011PASP..123..423G) produced a full-scale synthetic solar system for early Pan-STARRS simulations.
+MOPS uses synthetic asteroid populations for its simulations.  [Grav et al. (2011)](http://adsabs.harvard.edu/abs/2011PASP..123..423G) produced a full-scale synthetic solar system for early Pan-STARRS simulations.
 
 ## AUTHORS
 
