@@ -11,8 +11,10 @@ the NEOWISE survey, the ATLAS Project and LSST.
 
 ## REFERENCES
 
-A full description of the Pan-STARRS can be found in [Denneau et al. (2013)](https://arxiv.org/abs/1302.7281).
+An excruciatingly thorough description of the Pan-STARRS Moving Object Processing System can be found in [Denneau et al. (2013)](https://arxiv.org/abs/1302.7281).
 
-## AUTHOR
+MOPS uses synthetic asteroid populations for its simulations.  [Grav et al.](http://adsabs.harvard.edu/abs/2011PASP..123..423G) produced a full-scale synthetic solar system for early Pan-STARRS simulations.
 
-Larry Denneau, denneau@hawaii.edu; The Pan-STARRS MOPS Team (R. Jedicke, S. Chastel, T.Grav, D. Chang, D. Green)
+## AUTHORS
+
+Larry Denneau, denneau@hawaii.edu; The Pan-STARRS MOPS Team (R. Jedicke, S. Chastel, T.Grav, D. Chang, D. Green, M. Granvik); The LSST Solar System Team (L. Jones, T. Axelrod, J. Myers).
