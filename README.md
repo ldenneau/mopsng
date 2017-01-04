@@ -1,4 +1,4 @@
-# mopsng - Next-genearation Moving Object Processing System
+# mopsng - Next-generation Moving Object Processing System
 
 ## DESCRIPTION
 
